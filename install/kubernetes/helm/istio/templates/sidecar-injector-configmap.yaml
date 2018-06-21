@@ -97,10 +97,10 @@ data:
         - --zipkinAddress
         - {{ "[[ .ProxyConfig.ZipkinAddress ]]" }}
         - --connectTimeout
-        - {{ "[[ formatDuration .ProxyConfig.ConnectTimeout ]]" }}      
+        - {{ "[[ formatDuration .ProxyConfig.ConnectTimeout ]]" }}
       {{- if .Values.global.proxy.envoyStatsd.enabled }}
         - --statsdUdpAddress
-        - {{ "[[ .ProxyConfig.StatsdUdpAddress ]]" }}
+        - {{ .Values.global.proxy.envoyStatsd.host }}:{{ .Values.global.proxy.envoyStatsd.port }}
       {{- end }}
         - --proxyAdminPort
         - {{ "[[ .ProxyConfig.ProxyAdminPort ]]" }}
@@ -123,6 +123,11 @@ data:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.hostIP
         - name: ISTIO_META_INTERCEPTION_MODE
           value: {{ "[[ or (index .ObjectMeta.Annotations \"sidecar.istio.io/interceptionMode\") .ProxyConfig.InterceptionMode.String ]]" }}
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
