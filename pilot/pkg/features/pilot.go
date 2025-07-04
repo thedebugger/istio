@@ -289,6 +289,10 @@ var (
 		"If set to false, Istio will not watch for the ca-crl.pem file in the /etc/cacerts directory "+
 			"and will not distribute CRL data to namespaces for proxies to consume.",
 	).Get()
+
+	FilterServicesByVirtualService = env.Register("PILOT_FILTER_SERVICES_BY_VIRTUAL_SERVICE", false,
+		"If enabled, sidecar proxies will only discover services that are referenced as destinations in VirtualServices. "+
+			"If no VirtualService is defined, no services will be exposed. This is an experimental feature that changes the default discovery behavior.").Get()
 )
 
 // UnsafeFeaturesEnabled returns true if any unsafe features are enabled.

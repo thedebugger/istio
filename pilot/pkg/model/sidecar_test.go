@@ -17,6 +17,7 @@ package model
 import (
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -3584,6 +3585,168 @@ func TestComputeWildcardHostVirtualServiceIndex(t *testing.T) {
 			index := computeWildcardHostVirtualServiceIndex(tt.virtualServices, tt.services)
 			if !reflect.DeepEqual(tt.expectedIndex, index) {
 				t.Errorf("Expected index %v, got %v", tt.expectedIndex, index)
+			}
+		})
+	}
+}
+
+func TestFilterServicesByVirtualService(t *testing.T) {
+	const (
+		svcHost1 = "svc1.default.svc.cluster.local"
+		svcHost2 = "svc2.default.svc.cluster.local"
+		svcHost3 = "svc3.default.svc.cluster.local"
+	)
+
+	services := []*Service{
+		{
+			Hostname: host.Name(svcHost1),
+			Attributes: ServiceAttributes{
+				Namespace: "default",
+				Name:     "svc1",
+			},
+			Ports: PortList{
+				{Name: "http", Port: 80, Protocol: "HTTP"},
+			},
+		},
+		{
+			Hostname: host.Name(svcHost2),
+			Attributes: ServiceAttributes{
+				Namespace: "default", 
+				Name:     "svc2",
+			},
+			Ports: PortList{
+				{Name: "http", Port: 80, Protocol: "HTTP"},
+			},
+		},
+		{
+			Hostname: host.Name(svcHost3),
+			Attributes: ServiceAttributes{
+				Namespace: "default",
+				Name:     "svc3",
+			},
+			Ports: PortList{
+				{Name: "http", Port: 80, Protocol: "HTTP"},
+			},
+		},
+	}
+
+	// Create a virtual service that only references svc1 and svc2
+	virtualService := config.Config{
+		Meta: config.Meta{
+			Name:      "test-vs",
+			Namespace: "default",
+		},
+		Spec: &networking.VirtualService{
+			Hosts: []string{svcHost1},
+			Http: []*networking.HTTPRoute{
+				{
+					Route: []*networking.HTTPRouteDestination{
+						{
+							Destination: &networking.Destination{
+								Host: svcHost1,
+							},
+						},
+						{
+							Destination: &networking.Destination{
+								Host: svcHost2,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name                             string
+		filterServicesByVirtualService   bool
+		hasVirtualServices               bool
+		expectedServices                 []string
+	}{
+		{
+			name:                           "Feature disabled - should include all services",
+			filterServicesByVirtualService: false,
+			hasVirtualServices:             true,
+			expectedServices:               []string{svcHost1, svcHost2, svcHost3},
+		},
+		{
+			name:                           "Feature enabled - should only include services referenced in VS",
+			filterServicesByVirtualService: true,
+			hasVirtualServices:             true,
+			expectedServices:               []string{svcHost1, svcHost2},
+		},
+		{
+			name:                           "Feature enabled, no VirtualServices - should include no services",
+			filterServicesByVirtualService: true,
+			hasVirtualServices:             false,
+			expectedServices:               []string{},
+		},
+		{
+			name:                           "Feature disabled, no VirtualServices - should include all services",
+			filterServicesByVirtualService: false,
+			hasVirtualServices:             false,
+			expectedServices:               []string{svcHost1, svcHost2, svcHost3},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set the feature flag
+			originalFlag := features.FilterServicesByVirtualService
+			features.FilterServicesByVirtualService = tt.filterServicesByVirtualService
+			defer func() {
+				features.FilterServicesByVirtualService = originalFlag
+			}()
+
+			// Create test environment
+			ps := NewPushContext()
+			ps.ServiceIndex = newServiceIndex()
+			
+			// Initialize required fields to avoid nil pointer dereference
+			ps.Mesh = &v1alpha1.MeshConfig{
+				RootNamespace: "istio-system",
+			}
+			
+			// Add services to the service index
+			for _, svc := range services {
+				ps.ServiceIndex.public = append(ps.ServiceIndex.public, svc)
+				if ps.ServiceIndex.HostnameAndNamespace[svc.Hostname] == nil {
+					ps.ServiceIndex.HostnameAndNamespace[svc.Hostname] = make(map[string]*Service)
+				}
+				ps.ServiceIndex.HostnameAndNamespace[svc.Hostname]["default"] = svc
+			}
+
+			// Add virtual service to the index if specified
+			ps.virtualServiceIndex = newVirtualServiceIndex()
+			if tt.hasVirtualServices {
+				ps.virtualServiceIndex.publicByGateway = map[string][]config.Config{
+					constants.IstioMeshGateway: {virtualService},
+				}
+			}
+
+			// Initialize destination rule index to avoid nil pointer dereference
+			ps.destinationRuleIndex = newDestinationRuleIndex()
+
+			// Create sidecar scope
+			scope := DefaultSidecarScopeForNamespace(ps, "default")
+
+			// Initialize the scope if lazy evaluation is enabled
+			if features.EnableLazySidecarEvaluation {
+				scope.initFunc()
+			}
+
+			// Verify services
+			actualServices := scope.Services()
+			actualServiceNames := make([]string, len(actualServices))
+			for i, svc := range actualServices {
+				actualServiceNames[i] = string(svc.Hostname)
+			}
+
+			sort.Strings(tt.expectedServices)
+			sort.Strings(actualServiceNames)
+
+			if !reflect.DeepEqual(actualServiceNames, tt.expectedServices) {
+				t.Errorf("Expected services %v, got %v", tt.expectedServices, actualServiceNames)
 			}
 		})
 	}

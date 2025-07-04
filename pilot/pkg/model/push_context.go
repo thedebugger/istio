@@ -2607,3 +2607,43 @@ func (ps *PushContext) ServicesForWaypoint(key WaypointKey) []ServiceInfo {
 func (ps *PushContext) ServicesWithWaypoint(key string) []ServiceWaypointInfo {
 	return ps.ambientIndex.ServicesWithWaypoint(key)
 }
+
+// getServicesReferencedInVirtualServices returns only services that are referenced as destinations
+// in virtual services visible to the given namespace. This is used when the 
+// FilterServicesByVirtualService feature flag is enabled.
+func (ps *PushContext) getServicesReferencedInVirtualServices(configNamespace string) []*Service {
+	// Get all virtual services visible to this namespace
+	virtualServices := ps.VirtualServicesForGateway(configNamespace, constants.IstioMeshGateway)
+	
+	// If no virtual services, return empty list (core behavior change when flag is enabled)
+	if len(virtualServices) == 0 {
+		return []*Service{}
+	}
+	
+	// Extract destination hosts from all virtual services
+	referencedHosts := sets.New[string]()
+	for _, vs := range virtualServices {
+		v := vs.Spec.(*networking.VirtualService)
+		for host := range virtualServiceDestinations(v) {
+			referencedHosts.Insert(host)
+		}
+	}
+	
+	// If no destinations referenced, return empty list
+	if len(referencedHosts) == 0 {
+		return []*Service{}
+	}
+	
+	// Find services for the referenced hosts
+	var services []*Service
+	allExportedServices := ps.servicesExportedToNamespace(configNamespace)
+	
+	for _, service := range allExportedServices {
+		// Check if this service hostname matches any referenced destination
+		if referencedHosts.Contains(string(service.Hostname)) {
+			services = append(services, service)
+		}
+	}
+	
+	return services
+}
