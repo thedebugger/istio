@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"istio.io/api/annotation"
@@ -40,8 +39,8 @@ import (
 	"istio.io/istio/pkg/kube/labels"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/model"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/security"
-	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/version"
 )
@@ -101,21 +100,35 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 	metadataDiscovery := cfg.Metadata.MetadataDiscovery
 	if strings.HasPrefix(cfg.ID, "waypoint~") {
 		xdsType = "DELTA_GRPC"
-		metadataDiscovery = true
+		metadataDiscovery = ptr.Of(model.StringBool(true))
 	}
 
+	var mDiscovery bool
+	if metadataDiscovery != nil && *metadataDiscovery {
+		mDiscovery = true
+	}
+	if mDiscovery && xdsType == "GRPC" {
+		log.Warnf("disabling metadata discovery; not supported on SotW XDS")
+		// Not supported on legacy SotW protocol
+		mDiscovery = false
+	}
+	customSDSPath := ""
+	if _, f := cfg.RawMetadata[security.CredentialFileMetaDataName]; f {
+		customSDSPath = security.FileCredentialNameSocketPath
+	}
 	opts = append(opts,
 		option.NodeID(cfg.ID),
 		option.NodeType(cfg.ID),
 		option.PilotSubjectAltName(cfg.Metadata.PilotSubjectAltName),
 		option.OutlierLogPath(cfg.Metadata.OutlierLogPath),
+		option.CustomFileSDSPath(customSDSPath),
 		option.ApplicationLogJSON(cfg.LogAsJSON),
 		option.DiscoveryHost(discHost),
 		option.Metadata(cfg.Metadata),
 		option.XdsType(xdsType),
-		option.MetadataDiscovery(bool(metadataDiscovery)),
+		option.MetadataDiscovery(mDiscovery),
 		option.MetricsLocalhostAccessOnly(cfg.Metadata.ProxyConfig.ProxyMetadata),
-		option.DeferredClusterCreation(features.EnableDeferredClusterCreation))
+	)
 
 	// Add GCPProjectNumber to access in bootstrap template.
 	md := cfg.Metadata.PlatformMetadata
@@ -135,6 +148,8 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 			}
 		}
 	}
+
+	opts = append(opts, option.WorkloadIdentitySocketFile(cfg.Metadata.WorkloadIdentitySocketFile))
 
 	// Support passing extra info from node environment as metadata
 	opts = append(opts, getNodeMetadataOptions(cfg.Node, cfg.CompliancePolicy)...)
@@ -184,6 +199,10 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
 				option.Wildcard(option.WildcardIPv4),
 				option.DNSLookupFamily(option.DNSLookupFamilyIPv4))
 		}
+	}
+
+	if features.EnvoyStatusPortEnableProxyProtocol {
+		opts = append(opts, option.EnvoyStatusPortEnableProxyProtocol(true))
 	}
 
 	proxyOpts, err := getProxyConfigOptions(cfg.Metadata)
@@ -284,13 +303,13 @@ func getStatsOptions(meta *model.BootstrapNodeMetadata) []option.Instance {
 				return buckets[i].Match.Prefix < buckets[j].Match.Prefix
 			})
 		} else {
-			log.Warnf("Failed to unmarshal histogram buckets: %v", bucketsAnno, err)
+			log.Warnf("Failed to unmarshal histogram buckets %v: %v", bucketsAnno, err)
 		}
 	}
 
 	var compression string
-	// TODO: move annotation to api repo
-	if statsCompression, ok := meta.Annotations["sidecar.istio.io/statsCompression"]; ok && envoyWellKnownCompressorLibrary.Contains(statsCompression) {
+	if statsCompression, ok := meta.Annotations[annotation.SidecarStatsCompression.Name]; ok &&
+		envoyWellKnownCompressorLibrary.Contains(statsCompression) {
 		compression = statsCompression
 	}
 
@@ -459,10 +478,6 @@ func getProxyConfigOptions(metadata *model.BootstrapNodeMetadata) ([]option.Inst
 				option.StackDriverMaxAnnotations(getInt64ValueOrDefault(tracer.Stackdriver.MaxNumberOfAnnotations, 200)),
 				option.StackDriverMaxAttributes(getInt64ValueOrDefault(tracer.Stackdriver.MaxNumberOfAttributes, 200)),
 				option.StackDriverMaxEvents(getInt64ValueOrDefault(tracer.Stackdriver.MaxNumberOfMessageEvents, 200)))
-		case *meshAPI.Tracing_OpenCensusAgent_:
-			c := tracer.OpenCensusAgent.Context
-			opts = append(opts, option.OpenCensusAgentAddress(tracer.OpenCensusAgent.Address),
-				option.OpenCensusAgentContexts(c))
 		}
 
 		opts = append(opts, option.TracingTLS(config.Tracing.TlsSettings, metadata, isH2))
@@ -569,13 +584,16 @@ type MetadataOptions struct {
 	ProxyConfig                 *meshAPI.ProxyConfig
 	PilotSubjectAltName         []string
 	CredentialSocketExists      bool
+	CustomCredentialsFileExists bool
 	XDSRootCert                 string
 	OutlierLogPath              string
 	annotationFilePath          string
 	EnvoyStatusPort             int
 	EnvoyPrometheusPort         int
 	ExitOnZeroActiveConnections bool
-	MetadataDiscovery           bool
+	MetadataDiscovery           *bool
+	EnvoySkipDeprecatedLogs     bool
+	WorkloadIdentitySocketFile  string
 }
 
 const (
@@ -631,7 +649,14 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 	meta.EnvoyStatusPort = options.EnvoyStatusPort
 	meta.EnvoyPrometheusPort = options.EnvoyPrometheusPort
 	meta.ExitOnZeroActiveConnections = model.StringBool(options.ExitOnZeroActiveConnections)
-	meta.MetadataDiscovery = model.StringBool(options.MetadataDiscovery)
+	if options.MetadataDiscovery == nil {
+		meta.MetadataDiscovery = nil
+	} else {
+		meta.MetadataDiscovery = ptr.Of(model.StringBool(*options.MetadataDiscovery))
+	}
+	meta.EnvoySkipDeprecatedLogs = model.StringBool(options.EnvoySkipDeprecatedLogs)
+
+	meta.WorkloadIdentitySocketFile = options.WorkloadIdentitySocketFile
 
 	meta.ProxyConfig = (*model.NodeMetaProxyConfig)(options.ProxyConfig)
 
@@ -700,6 +725,15 @@ func GetNodeMetaData(options MetadataOptions) (*model.Node, error) {
 	if options.CredentialSocketExists {
 		untypedMeta[security.CredentialMetaDataName] = "true"
 	}
+	if options.CustomCredentialsFileExists {
+		untypedMeta[security.CredentialFileMetaDataName] = "true"
+	}
+
+	if meta.MetadataDiscovery == nil {
+		// If it's disabled, set it if ambient is enabled
+		meta.MetadataDiscovery = ptr.Of(meta.EnableHBONE)
+		log.Debugf("metadata discovery is disabled, setting it to %s based on if ambient HBONE is enabled", meta.EnableHBONE)
+	}
 
 	return &model.Node{
 		ID:          options.ID,
@@ -714,62 +748,6 @@ func SetIstioVersion(meta *model.BootstrapNodeMetadata) *model.BootstrapNodeMeta
 		meta.IstioVersion = version.Info.Version
 	}
 	return meta
-}
-
-// ConvertNodeToXDSNode creates an Envoy node descriptor from Istio node descriptor.
-func ConvertNodeToXDSNode(node *model.Node) *core.Node {
-	// First pass translates typed metadata
-	js, err := json.Marshal(node.Metadata)
-	if err != nil {
-		log.Warnf("Failed to marshal node metadata to JSON %#v: %v", node.Metadata, err)
-	}
-	pbst := &structpb.Struct{}
-	if err = protomarshal.Unmarshal(js, pbst); err != nil {
-		log.Warnf("Failed to unmarshal node metadata from JSON %#v: %v", node.Metadata, err)
-	}
-	// Second pass translates untyped metadata for "unknown" fields
-	for k, v := range node.RawMetadata {
-		if _, f := pbst.Fields[k]; !f {
-			fjs, err := json.Marshal(v)
-			if err != nil {
-				log.Warnf("Failed to marshal field metadata to JSON %#v: %v", k, err)
-			}
-			pbv := &structpb.Value{}
-			if err = protomarshal.Unmarshal(fjs, pbv); err != nil {
-				log.Warnf("Failed to unmarshal field metadata from JSON %#v: %v", k, err)
-			}
-			pbst.Fields[k] = pbv
-		}
-	}
-	return &core.Node{
-		Id:       node.ID,
-		Cluster:  getServiceCluster(node.Metadata),
-		Locality: node.Locality,
-		Metadata: pbst,
-	}
-}
-
-// ConvertXDSNodeToNode parses Istio node descriptor from an Envoy node descriptor, using only typed metadata.
-func ConvertXDSNodeToNode(node *core.Node) *model.Node {
-	b, err := protomarshal.MarshalProtoNames(node.Metadata)
-	if err != nil {
-		log.Warnf("Failed to marshal node metadata to JSON %q: %v", node.Metadata, err)
-	}
-	metadata := &model.BootstrapNodeMetadata{}
-	err = json.Unmarshal(b, metadata)
-	if err != nil {
-		log.Warnf("Failed to unmarshal node metadata from JSON %q: %v", node.Metadata, err)
-	}
-	if metadata.ProxyConfig == nil {
-		metadata.ProxyConfig = &model.NodeMetaProxyConfig{}
-		metadata.ProxyConfig.ClusterName = &meshAPI.ProxyConfig_ServiceCluster{ServiceCluster: node.Cluster}
-	}
-
-	return &model.Node{
-		ID:       node.Id,
-		Locality: node.Locality,
-		Metadata: metadata,
-	}
 }
 
 // Extracts instance labels for the platform into model.NodeMetadata.Labels

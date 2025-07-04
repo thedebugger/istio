@@ -45,14 +45,86 @@ func (e WorkloadGenerator) GenerateDeltas(
 	req *model.PushRequest,
 	w *model.WatchedResource,
 ) (model.Resources, model.DeletedResources, model.XdsLogDetails, bool, error) {
-	updatedAddresses := model.ConfigNameOfKind(req.ConfigsUpdated, kind.Address)
+	addresses := req.AddressesUpdated
 	isReq := req.IsRequest()
-	if len(updatedAddresses) == 0 && len(req.ConfigsUpdated) > 0 {
-		// Nothing changed..
+	if !isReq && len(addresses) == 0 {
+		// Nothing changed...
 		return nil, nil, model.XdsLogDetails{}, false, nil
 	}
 
-	subs := sets.New(w.ResourceNames...)
+	if !w.Wildcard {
+		return e.generateDeltasOndemand(proxy, req, w)
+	}
+
+	reqAddresses := addresses
+	if isReq {
+		reqAddresses = nil
+	}
+	addrs, removed := e.Server.Env.ServiceDiscovery.AddressInformation(reqAddresses)
+	// Note: while "removed" is a weird name for a resource that never existed, this is how the spec works:
+	// https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#id2
+	have := sets.New[string]()
+	resources := make(model.Resources, 0, len(addrs))
+	for _, addr := range addrs {
+		resources = appendAddress(addr, w.TypeUrl, nil, have, resources)
+	}
+
+	if isReq {
+		// If it's a full push, AddressInformation won't have info to compute the full set of removals.
+		// Instead, we need can see what resources are missing that we were subscribe to; those were removed.
+		// During a request, a client will send a subscription request with its current state, so our removals will be:
+		// ZtunnelCurrentResources - IstiodCurrentResources (+ empty `removed`).
+		removed = req.Delta.Subscribed.Difference(have).Merge(removed)
+	}
+
+	// Due to the high resource count in WDS at scale, we elide updating ResourceNames here.
+	// A name will be ~50-100 bytes. So 50k pods would be 5MB per XDS client (plus overheads around GC, sets, fragmentation, etc).
+	// Fortunately, we do not actually need this: the only time we need to know the state in Ztunnel is on reconnection which we handle from
+	// `req.Delta.Subscribed`.
+
+	return resources, removed.UnsortedList(), model.XdsLogDetails{}, true, nil
+}
+
+func appendAddress(addr model.AddressInfo, requestedType string, aliases []string, have sets.Set[string], resources model.Resources) model.Resources {
+	n := addr.ResourceName()
+	have.Insert(n)
+	switch requestedType {
+	case v3.WorkloadType:
+		if addr.GetWorkload() != nil {
+			resources = append(resources, &discovery.Resource{
+				Name:     n,
+				Aliases:  aliases,
+				Resource: protoconv.MessageToAny(addr.GetWorkload()), // TODO: pre-marshal
+			})
+		}
+	case v3.AddressType:
+		proto := addr.Marshaled
+		if proto == nil {
+			proto = protoconv.MessageToAny(addr)
+		}
+
+		resources = append(resources, &discovery.Resource{
+			Name:     n,
+			Aliases:  aliases,
+			Resource: proto,
+		})
+	}
+	return resources
+}
+
+func (e WorkloadGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
+	resources, _, details, _, err := e.GenerateDeltas(proxy, req, w)
+	return resources, details, err
+}
+
+func (e WorkloadGenerator) generateDeltasOndemand(
+	proxy *model.Proxy,
+	req *model.PushRequest,
+	w *model.WatchedResource,
+) (model.Resources, model.DeletedResources, model.XdsLogDetails, bool, error) {
+	isReq := req.IsRequest()
+	subs := w.ResourceNames
+
 	var addresses sets.String
 	if isReq {
 		// this is from request, we only send response for the subscribed address
@@ -60,35 +132,22 @@ func (e WorkloadGenerator) GenerateDeltas(
 		// At t1, a client request B, we only send B and additional resources back to the client, no A here.
 		addresses = req.Delta.Subscribed
 	} else {
-		if w.Wildcard {
-			addresses = updatedAddresses
-		} else {
-			// this is from the external triggers instead of request
-			// send response for all the subscribed intersect with the updated
-			addresses = updatedAddresses.IntersectInPlace(subs)
-		}
+		// this is from the external triggers instead of request
+		// send response for all the subscribed intersect with the updated
+		addresses = req.AddressesUpdated.Intersection(subs)
 	}
 
-	if !w.Wildcard {
-		// We only need this for on-demand. This allows us to subscribe the client to resources they
-		// didn't explicitly request.
-		// For wildcard, they subscribe to everything already.
-		additional := e.Server.Env.ServiceDiscovery.AdditionalPodSubscriptions(proxy, addresses, subs)
-		if addresses == nil {
-			addresses = sets.New[string]()
-		}
+	// We only need this for on-demand. This allows us to subscribe the client to resources they
+	// didn't explicitly request.
+	// For wildcard, they subscribe to everything already.
+	additional := e.Server.Env.ServiceDiscovery.AdditionalPodSubscriptions(proxy, addresses, subs)
+	if addresses == nil {
+		addresses = additional
+	} else {
 		addresses.Merge(additional)
 	}
 
-	// TODO: it is needlessly wasteful to do a full sync just because the rest of Istio thought it was "full"
-	// The rest of Istio xDS types would treat `req.Full && len(req.ConfigsUpdated) == 0` as a need to trigger a "full" push.
-	// This is only an escape hatch for a lack of complete mapping of "Input changed -> Output changed".
-	// WDS does not suffer this limitation, so we could almost safely ignore these.
-	// However, other code will merge "Partial push + Full push -> Full push", so skipping full pushes isn't viable.
-	full := (isReq && w.Wildcard) || (!isReq && req.Full && len(req.ConfigsUpdated) == 0)
-
-	// Nothing to do
-	if len(addresses) == 0 && !full {
+	if len(addresses) == 0 {
 		if isReq {
 			// We need to respond for requests, even if we have nothing to respond with
 			return make(model.Resources, 0), nil, model.XdsLogDetails{}, false, nil
@@ -96,62 +155,23 @@ func (e WorkloadGenerator) GenerateDeltas(
 		// For NOP pushes, no need
 		return nil, nil, model.XdsLogDetails{}, false, nil
 	}
-	resources := make(model.Resources, 0)
-	reqAddresses := addresses
-	if full {
-		reqAddresses = nil
-	}
-	addrs, removed := e.Server.Env.ServiceDiscovery.AddressInformation(reqAddresses)
+	addrs, removed := e.Server.Env.ServiceDiscovery.AddressInformation(addresses)
 	// Note: while "removed" is a weird name for a resource that never existed, this is how the spec works:
 	// https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol#id2
 	have := sets.New[string]()
-	haveAliases := sets.New[string]()
+	resources := make(model.Resources, 0, len(addrs))
 	for _, addr := range addrs {
-		// TODO(@hzxuzhonghu): calculate removed with aliases in `AddressInformation`
 		aliases := addr.Aliases()
 		removed.DeleteAll(aliases...)
-		n := addr.ResourceName()
-		have.Insert(n)
-		haveAliases.InsertAll(aliases...)
-		switch w.TypeUrl {
-		case v3.WorkloadType:
-			if addr.GetWorkload() != nil {
-				resources = append(resources, &discovery.Resource{
-					Name:     n,
-					Aliases:  aliases,
-					Resource: protoconv.MessageToAny(addr.GetWorkload()), // TODO: pre-marshal
-				})
-			}
-		case v3.AddressType:
-			resources = append(resources, &discovery.Resource{
-				Name:     n,
-				Aliases:  aliases,
-				Resource: protoconv.MessageToAny(addr), // TODO: pre-marshal
-			})
-		}
+		resources = appendAddress(addr, w.TypeUrl, aliases, have, resources)
 	}
 
-	if full {
-		// If it's a full push, AddressInformation won't have info to compute the full set of removals.
-		// Instead, we need can see what resources are missing that we were subscribe to; those were removed.
-		removed = subs.Difference(have).Difference(haveAliases).Merge(removed)
-	}
-
-	if !w.Wildcard {
-		// For on-demand, we may have requested a VIP but gotten Pod IPs back. We need to update
-		// the internal book-keeping to subscribe to the Pods, so that we push updates to those Pods.
-		w.ResourceNames = subs.Merge(have).UnsortedList()
-	} else {
-		// For wildcard, we record all resources that have been pushed and not removed
-		// It was to correctly calculate removed resources during full push alongside with specific address removed.
-		w.ResourceNames = subs.Merge(have).Difference(removed).UnsortedList()
-	}
+	proxy.Lock()
+	defer proxy.Unlock()
+	// For on-demand, we may have requested a VIP but gotten Pod IPs back. We need to update
+	// the internal book-keeping to subscribe to the Pods, so that we push updates to those Pods.
+	w.ResourceNames = subs.Merge(have)
 	return resources, removed.UnsortedList(), model.XdsLogDetails{}, true, nil
-}
-
-func (e WorkloadGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
-	resources, _, details, _, err := e.GenerateDeltas(proxy, req, w)
-	return resources, details, err
 }
 
 type WorkloadRBACGenerator struct {
@@ -164,37 +184,23 @@ func (e WorkloadRBACGenerator) GenerateDeltas(
 	w *model.WatchedResource,
 ) (model.Resources, model.DeletedResources, model.XdsLogDetails, bool, error) {
 	var updatedPolicies sets.Set[model.ConfigKey]
-	if len(req.ConfigsUpdated) != 0 {
-		updatedPolicies = model.ConfigsOfKind(req.ConfigsUpdated, kind.AuthorizationPolicy)
-		// Convert the actual Kubernetes PeerAuthentication policies to the synthetic ones
-		// by adding the prefix
-		//
-		// This is needed because the handler that produces the ConfigUpdate blindly sends
-		// the Kubernetes resource names without context of the synthetic Ambient policies
-		// TODO: Split out PeerAuthentication into a separate handler in
-		// https://github.com/istio/istio/blob/master/pilot/pkg/bootstrap/server.go#L882
-		for p := range model.ConfigsOfKind(req.ConfigsUpdated, kind.PeerAuthentication) {
-			updatedPolicies.Insert(model.ConfigKey{
-				Name:      model.GetAmbientPolicyConfigName(p),
-				Namespace: p.Namespace,
-				Kind:      p.Kind,
-			})
-		}
-	}
-	if len(req.ConfigsUpdated) != 0 && len(updatedPolicies) == 0 {
-		// This was a incremental push for a resource we don't watch... skip
-		return nil, nil, model.DefaultXdsLogDetails, false, nil
-	}
-
 	expected := sets.New[string]()
-	if len(updatedPolicies) > 0 {
-		// Partial update. Removes are ones we request but didn't get back when querying the policies
+	if req.Forced {
+		// Full update, expect everything
+		expected.Merge(w.ResourceNames)
+	} else {
+		// The ambient store will send all of these as kind.AuthorizationPolicy, even if generated from PeerAuthentication,
+		// so we can only fetch these ones.
+		updatedPolicies = model.ConfigsOfKind(req.ConfigsUpdated, kind.AuthorizationPolicy)
+
+		if len(updatedPolicies) == 0 {
+			// This was a incremental push for a resource we don't watch... skip
+			return nil, nil, model.DefaultXdsLogDetails, false, nil
+		}
+
 		for k := range updatedPolicies {
 			expected.Insert(k.Namespace + "/" + k.Name)
 		}
-	} else {
-		// Full update, expect everything
-		expected.InsertAll(w.ResourceNames...)
 	}
 
 	resources := make(model.Resources, 0)

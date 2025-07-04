@@ -228,7 +228,7 @@ func (d *deployment) workloadEntryYAML(w *workload) string {
 	version := w.pod.Labels[constants.TestVMVersionLabel]
 
 	return fmt.Sprintf(`
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: WorkloadEntry
 metadata:
   name: %s
@@ -264,8 +264,8 @@ func GenerateDeployment(ctx resource.Context, cfg echo.Config, settings *resourc
 	return tmpl.Execute(deploy, params)
 }
 
-func GenerateService(cfg echo.Config) (string, error) {
-	params := serviceParams(cfg)
+func GenerateService(cfg echo.Config, isOpenShift bool) (string, error) {
+	params := serviceParams(cfg, isOpenShift)
 	return tmpl.Execute(getTemplate(serviceTemplateFile), params)
 }
 
@@ -364,7 +364,7 @@ func deploymentParams(ctx resource.Context, cfg echo.Config, settings *resource.
 			if subset.Labels == nil {
 				subset.Labels = make(map[string]string)
 			}
-			subset.Labels[constants.AmbientUseWaypointLabel] = cfg.WorkloadWaypointProxy
+			subset.Labels[label.IoIstioUseWaypoint.Name] = cfg.WorkloadWaypointProxy
 		}
 	}
 
@@ -394,6 +394,8 @@ func deploymentParams(ctx resource.Context, cfg echo.Config, settings *resource.
 		"WorkloadClass":           cfg.WorkloadClass(),
 		"OverlayIstioProxy":       canCreateIstioProxy(settings.Revisions.Minimum()) && !settings.Ambient,
 		"Ambient":                 settings.Ambient,
+		"BindFamily":              cfg.BindFamily,
+		"OpenShift":               settings.OpenShift,
 	}
 
 	vmIstioHost, vmIstioIP := "", ""
@@ -421,21 +423,24 @@ func deploymentParams(ctx resource.Context, cfg echo.Config, settings *resource.
 	return params, nil
 }
 
-func serviceParams(cfg echo.Config) map[string]any {
+func serviceParams(cfg echo.Config, isOpenShift bool) map[string]any {
 	if cfg.ServiceWaypointProxy != "" {
 		if cfg.ServiceLabels == nil {
 			cfg.ServiceLabels = make(map[string]string)
 		}
-		cfg.ServiceLabels[constants.AmbientUseWaypointLabel] = cfg.ServiceWaypointProxy
+		cfg.ServiceLabels[label.IoIstioUseWaypoint.Name] = cfg.ServiceWaypointProxy
 	}
 	return map[string]any{
-		"Service":        cfg.Service,
-		"Headless":       cfg.Headless,
-		"ServiceAccount": cfg.ServiceAccount,
-		"ServicePorts":   cfg.Ports.GetServicePorts(),
-		"ServiceLabels":  cfg.ServiceLabels,
-		"IPFamilies":     cfg.IPFamilies,
-		"IPFamilyPolicy": cfg.IPFamilyPolicy,
+		"Service":            cfg.Service,
+		"Headless":           cfg.Headless,
+		"ServiceAccount":     cfg.ServiceAccount,
+		"ServicePorts":       cfg.Ports.GetServicePorts(),
+		"ServiceLabels":      cfg.ServiceLabels,
+		"IPFamilies":         cfg.IPFamilies,
+		"IPFamilyPolicy":     cfg.IPFamilyPolicy,
+		"ServiceAnnotations": cfg.ServiceAnnotations,
+		"Namespace":          cfg.Namespace.Name(),
+		"OpenShift":          isOpenShift,
 	}
 }
 
@@ -453,7 +458,7 @@ func createVMConfig(ctx resource.Context, cfg echo.Config) error {
 	}
 
 	wg := tmpl.MustEvaluate(`
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: WorkloadGroup
 metadata:
   name: {{.name}}

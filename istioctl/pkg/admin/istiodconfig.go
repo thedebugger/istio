@@ -36,6 +36,7 @@ import (
 	"istio.io/istio/istioctl/pkg/cli"
 	"istio.io/istio/istioctl/pkg/clioptions"
 	"istio.io/istio/istioctl/pkg/completion"
+	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/log"
 )
 
@@ -120,9 +121,10 @@ type getAllLogLevelsState struct {
 
 func (ga *getAllLogLevelsState) run(out io.Writer) error {
 	type scopeLogLevel struct {
-		ScopeName   string `json:"scope_name"`
-		LogLevel    string `json:"log_level"`
-		Description string `json:"description"`
+		ScopeName       string `json:"scope_name"`
+		LogLevel        string `json:"log_level"`
+		StackTraceLevel string `json:"stack_trace_level"`
+		Description     string `json:"description"`
 	}
 	allScopes, err := ga.client.GetScopes()
 	sort.Slice(allScopes, func(i, j int) bool {
@@ -135,18 +137,19 @@ func (ga *getAllLogLevelsState) run(out io.Writer) error {
 	for _, scope := range allScopes {
 		resultScopeLogLevel = append(resultScopeLogLevel,
 			&scopeLogLevel{
-				ScopeName:   scope.Name,
-				LogLevel:    scope.OutputLevel,
-				Description: scope.Description,
+				ScopeName:       scope.Name,
+				LogLevel:        scope.OutputLevel,
+				StackTraceLevel: scope.StackTraceLevel,
+				Description:     scope.Description,
 			},
 		)
 	}
 	switch ga.outputFormat {
 	case "short":
 		w := new(tabwriter.Writer).Init(out, 0, 8, 3, ' ', 0)
-		_, _ = fmt.Fprintln(w, "ACTIVE SCOPE\tDESCRIPTION\tLOG LEVEL")
+		_, _ = fmt.Fprintln(w, "ACTIVE SCOPE\tDESCRIPTION\tLOG LEVEL\tSTACK TRACE LEVEL")
 		for _, sll := range resultScopeLogLevel {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", sll.ScopeName, sll.Description, sll.LogLevel)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", sll.ScopeName, sll.Description, sll.LogLevel, sll.StackTraceLevel)
 		}
 		return w.Flush()
 	case "json", "yaml":
@@ -371,7 +374,7 @@ func (c *ControlzClient) GetScope(scope string) (*ScopeInfo, error) {
 var (
 	istiodLabelSelector = ""
 	istiodReset         = false
-	validationPattern   = `^\w+:(debug|error|warn|info|debug)`
+	validationPattern   = `^[\w\- ]+:(none|error|warn|info|debug)`
 )
 
 func istiodLogCmd(ctx cli.Context) *cobra.Command {
@@ -479,7 +482,7 @@ func istiodLogCmd(ctx cli.Context) *cobra.Command {
 	}
 	opts.AttachControlPlaneFlags(logCmd)
 	logCmd.PersistentFlags().BoolVar(&istiodReset, "reset", istiodReset, "Reset levels to default value. (info)")
-	logCmd.PersistentFlags().IntVar(&controlzPort, "ctrlz_port", 9876, "ControlZ port")
+	logCmd.PersistentFlags().IntVar(&controlzPort, "ctrlz_port", ctrlz.DefaultControlZPort, "ControlZ port")
 	logCmd.PersistentFlags().StringVar(&outputLogLevel, "level", outputLogLevel,
 		"Comma-separated list of output logging level for scopes in the format of <scope>:<level>[,<scope>:<level>,...]. "+
 			"Possible values for <level>: none, error, warn, info, debug")

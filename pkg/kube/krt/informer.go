@@ -27,6 +27,7 @@ import (
 	"istio.io/istio/pkg/kube/kubetypes"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 )
 
 type informer[I controllers.ComparableObject] struct {
@@ -38,6 +39,8 @@ type informer[I controllers.ComparableObject] struct {
 	eventHandlers *handlers[I]
 	augmentation  func(a any) any
 	synced        chan struct{}
+	baseSyncer    Syncer
+	metadata      Metadata
 }
 
 // nolint: unused // (not true, its to implement an interface)
@@ -50,6 +53,7 @@ func (i *informer[I]) augment(a any) any {
 
 var _ internalCollection[controllers.Object] = &informer[controllers.Object]{}
 
+// nolint: unused // (not true, its to implement an interface)
 func (i *informer[I]) _internalHandler() {}
 
 func (i *informer[I]) Synced() Syncer {
@@ -59,13 +63,20 @@ func (i *informer[I]) Synced() Syncer {
 	}
 }
 
+func (i *informer[I]) HasSynced() bool {
+	return i.baseSyncer.HasSynced()
+}
+
+func (i *informer[I]) WaitUntilSynced(stop <-chan struct{}) bool {
+	return i.baseSyncer.WaitUntilSynced(stop)
+}
+
 // nolint: unused // (not true, its to implement an interface)
-func (i *informer[I]) dump() {
-	i.log.Errorf(">>> BEGIN DUMP")
-	for _, obj := range i.inf.List(metav1.NamespaceAll, klabels.Everything()) {
-		i.log.Errorf("%s/%s", obj.GetNamespace(), obj.GetName())
+func (i *informer[I]) dump() CollectionDump {
+	return CollectionDump{
+		Outputs: eraseMap(slices.GroupUnique(i.inf.List(metav1.NamespaceAll, klabels.Everything()), getTypedKey)),
+		Synced:  i.HasSynced(),
 	}
-	i.log.Errorf("<<< END DUMP")
 }
 
 func (i *informer[I]) name() string {
@@ -82,42 +93,75 @@ func (i *informer[I]) List() []I {
 	return res
 }
 
-func (i *informer[I]) GetKey(k Key[I]) *I {
+func (i *informer[I]) GetKey(k string) *I {
 	// ns, n := splitKeyFunc(string(k))
 	// Internal optimization: we know kclient will eventually lookup "ns/name"
 	// We also have a key in this format.
 	// Rather than split and rejoin it later, just pass it as the name
 	// This is depending on "unstable" implementation details, but we own both libraries and tests would catch any issues.
-	if got := i.inf.Get(string(k), ""); !controllers.IsNil(got) {
+	if got := i.inf.Get(k, ""); !controllers.IsNil(got) {
 		return &got
 	}
 	return nil
 }
 
-func (i *informer[I]) Register(f func(o Event[I])) Syncer {
+func (i *informer[I]) Metadata() Metadata {
+	return i.metadata
+}
+
+func (i *informer[I]) Register(f func(o Event[I])) HandlerRegistration {
 	return registerHandlerAsBatched[I](i, f)
 }
 
-func (i *informer[I]) RegisterBatch(f func(o []Event[I], initialSync bool), runExistingState bool) Syncer {
+func (i *informer[I]) RegisterBatch(f func(o []Event[I]), runExistingState bool) HandlerRegistration {
 	// Note: runExistingState is NOT respected here.
 	// Informer doesn't expose a way to do that. However, due to the runtime model of informers, this isn't a dealbreaker;
 	// the handlers are all called async, so we don't end up with the same deadlocks we would have in the other collection types.
 	// While this is quite kludgy, this is an internal interface so its not too bad.
-	if !i.eventHandlers.Insert(f) {
-		i.inf.AddEventHandler(informerEventHandler[I](func(o Event[I], initialSync bool) {
-			f([]Event[I]{o}, initialSync)
-		}))
-	}
-	return pollSyncer{
+	synced := i.inf.AddEventHandler(informerEventHandler[I](func(o Event[I], initialSync bool) {
+		f([]Event[I]{o})
+	}))
+	base := i.baseSyncer
+	handler := pollSyncer{
 		name: fmt.Sprintf("%v handler", i.name()),
-		f:    i.inf.HasSynced,
+		f:    synced.HasSynced,
+	}
+	sync := multiSyncer{syncers: []Syncer{base, handler}}
+	return informerHandlerRegistration{
+		Syncer: sync,
+		remove: func() {
+			i.inf.ShutdownHandler(synced)
+		},
 	}
 }
 
+type informerHandlerRegistration struct {
+	Syncer
+	remove func()
+}
+
+func (i informerHandlerRegistration) UnregisterHandler() {
+	i.remove()
+}
+
 // nolint: unused // (not true)
-func (i *informer[I]) index(extract func(o I) []string) kclient.RawIndexer {
-	idx := i.inf.Index(extract)
-	return idx
+type informerIndex[I any] struct {
+	idx kclient.RawIndexer
+}
+
+// nolint: unused // (not true)
+func (ii *informerIndex[I]) Lookup(key string) []I {
+	return slices.Map(ii.idx.Lookup(key), func(i any) I {
+		return i.(I)
+	})
+}
+
+// nolint: unused // (not true)
+func (i *informer[I]) index(name string, extract func(o I) []string) indexer[I] {
+	idx := i.inf.Index(name, extract)
+	return &informerIndex[I]{
+		idx: idx,
+	}
 }
 
 func informerEventHandler[I controllers.ComparableObject](handler func(o Event[I], initialSync bool)) cache.ResourceEventHandler {
@@ -152,7 +196,7 @@ func informerEventHandler[I controllers.ComparableObject](handler func(o Event[I
 func WrapClient[I controllers.ComparableObject](c kclient.Informer[I], opts ...CollectionOption) Collection[I] {
 	o := buildCollectionOptions(opts...)
 	if o.name == "" {
-		o.name = fmt.Sprintf("NewInformer[%v]", ptr.TypeName[I]())
+		o.name = fmt.Sprintf("Informer[%v]", ptr.TypeName[I]())
 	}
 	h := &informer[I]{
 		inf:            c,
@@ -163,27 +207,27 @@ func WrapClient[I controllers.ComparableObject](c kclient.Informer[I], opts ...C
 		augmentation:   o.augmentation,
 		synced:         make(chan struct{}),
 	}
+	h.baseSyncer = channelSyncer{
+		name:   h.collectionName,
+		synced: h.synced,
+	}
+
+	if o.metadata != nil {
+		h.metadata = o.metadata
+	}
 
 	go func() {
-		// First, wait for the informer to populate
-		if !kube.WaitForCacheSync(o.name, o.stop, c.HasSynced) {
-			return
-		}
-		// Now, take all our handlers we have built up and register them...
-		handlers := h.eventHandlers.MarkInitialized()
-		for _, h := range handlers {
-			c.AddEventHandler(informerEventHandler[I](func(o Event[I], initialSync bool) {
-				h([]Event[I]{o}, initialSync)
-			}))
-		}
-		// Now wait for handlers to sync
-		if !kube.WaitForCacheSync(o.name+" handlers", o.stop, c.HasSynced) {
-			c.ShutdownHandlers()
+		defer c.ShutdownHandlers()
+		// First, wait for the informer to populate. We ignore handlers which have their own syncing
+		if !kube.WaitForCacheSync(o.name, o.stop, c.HasSyncedIgnoringHandlers) {
 			return
 		}
 		close(h.synced)
 		h.log.Infof("%v synced", h.name())
+
+		<-o.stop
 	}()
+	maybeRegisterCollectionForDebugging(h, o.debugger)
 	return h
 }
 

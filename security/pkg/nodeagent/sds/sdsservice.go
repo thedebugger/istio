@@ -18,6 +18,7 @@ package sds
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -37,11 +38,13 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	mesh "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/backoff"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/xds"
 )
 
@@ -80,7 +83,7 @@ func newSDSService(st security.SecretManager, options *security.Options, pkpConf
 
 	ret.rootCaPath = options.CARootPath
 
-	if options.FileMountedCerts {
+	if options.FileMountedCerts || options.ServeOnlyFiles {
 		return ret
 	}
 
@@ -213,7 +216,7 @@ func (w *Watch) GetWatchedResource(string) *xds.WatchedResource {
 func (w *Watch) NewWatchedResource(typeURL string, names []string) {
 	w.Lock()
 	defer w.Unlock()
-	w.watch = &xds.WatchedResource{TypeUrl: typeURL, ResourceNames: names}
+	w.watch = &xds.WatchedResource{TypeUrl: typeURL, ResourceNames: sets.New(names...)}
 }
 
 func (w *Watch) UpdateWatchedResource(_ string, f func(*xds.WatchedResource) *xds.WatchedResource) {
@@ -231,11 +234,7 @@ func (w *Watch) requested(secretName string) bool {
 	w.Lock()
 	defer w.Unlock()
 	if w.watch != nil {
-		for _, res := range w.watch.ResourceNames {
-			if res == secretName {
-				return true
-			}
-		}
+		return w.watch.ResourceNames.Contains(secretName)
 	}
 	return false
 }
@@ -302,7 +301,7 @@ func toEnvoySecret(s *security.SecretItem, caRootPath string, pkpConf *mesh.Priv
 		cfg, ok = security.SdsCertificateConfigFromResourceName(s.ResourceName)
 	}
 	if s.ResourceName == security.RootCertReqResourceName || (ok && cfg.IsRootCertificate()) {
-		secret.Type = &tls.Secret_ValidationContext{
+		secretValidationContext := &tls.Secret_ValidationContext{
 			ValidationContext: &tls.CertificateValidationContext{
 				TrustedCa: &core.DataSource{
 					Specifier: &core.DataSource_InlineBytes{
@@ -311,6 +310,19 @@ func toEnvoySecret(s *security.SecretItem, caRootPath string, pkpConf *mesh.Priv
 				},
 			},
 		}
+
+		if features.EnableCACRL {
+			// Check if the plugged-in CA CRL file is present and update the secretValidationContext accordingly.
+			if isCrlFileProvided() {
+				secretValidationContext.ValidationContext.Crl = &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: security.CACRLFilePath,
+					},
+				}
+			}
+		}
+
+		secret.Type = secretValidationContext
 	} else {
 		switch pkpConf.GetProvider().(type) {
 		case *mesh.PrivateKeyProvider_Cryptomb:
@@ -383,4 +395,20 @@ func toEnvoySecret(s *security.SecretItem, caRootPath string, pkpConf *mesh.Priv
 		}
 	}
 	return secret
+}
+
+// isCrlFileProvided checks if the Plugged-in CA CRL file is present
+func isCrlFileProvided() bool {
+	_, err := os.Stat(security.CACRLFilePath)
+	if err == nil {
+		return true
+	}
+
+	if os.IsNotExist(err) {
+		sdsServiceLog.Debugf("CRL is not configured, %s does not exist", security.CACRLFilePath)
+		return false
+	}
+
+	sdsServiceLog.Errorf("Error checking for CA CRL file: %v", err)
+	return false
 }

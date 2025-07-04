@@ -45,6 +45,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	kubelabels "istio.io/istio/pkg/kube/labels"
 	"istio.io/istio/pkg/log"
 	pm "istio.io/istio/pkg/model"
@@ -156,18 +157,23 @@ func AddrStrToPrefix(addr string) (netip.Prefix, error) {
 	return netip.PrefixFrom(ipa, ipa.BitLen()), nil
 }
 
+// PrefixToCidrRange converts from CIDR prefix to CIDR proto
+func PrefixToCidrRange(prefix netip.Prefix) *core.CidrRange {
+	return &core.CidrRange{
+		AddressPrefix: prefix.Addr().String(),
+		PrefixLen: &wrapperspb.UInt32Value{
+			Value: uint32(prefix.Bits()),
+		},
+	}
+}
+
 // AddrStrToCidrRange converts from string to CIDR proto
 func AddrStrToCidrRange(addr string) (*core.CidrRange, error) {
 	prefix, err := AddrStrToPrefix(addr)
 	if err != nil {
 		return nil, err
 	}
-	return &core.CidrRange{
-		AddressPrefix: prefix.Addr().String(),
-		PrefixLen: &wrapperspb.UInt32Value{
-			Value: uint32(prefix.Bits()),
-		},
-	}, nil
+	return PrefixToCidrRange(prefix), nil
 }
 
 // BuildAddress returns a SocketAddress with the given ip and port or uds.
@@ -450,10 +456,6 @@ func MergeAnyWithAny(dst *anypb.Any, src *anypb.Any) (*anypb.Any, error) {
 // AppendLbEndpointMetadata adds metadata values to a lb endpoint using the passed in metadata as base.
 func AppendLbEndpointMetadata(istioMetadata *model.EndpointMetadata, envoyMetadata *core.Metadata,
 ) {
-	if !features.EndpointTelemetryLabel || !features.EnableTelemetryLabel {
-		return
-	}
-
 	if envoyMetadata.FilterMetadata == nil {
 		envoyMetadata.FilterMetadata = map[string]*structpb.Struct{}
 	}
@@ -471,7 +473,7 @@ func AppendLbEndpointMetadata(istioMetadata *model.EndpointMetadata, envoyMetada
 	// server does not have sidecar injected, and request fails to reach server and thus metadata exchange does not happen.
 	// Due to performance concern, telemetry metadata is compressed into a semicolon separated string:
 	// workload-name;namespace;canonical-service-name;canonical-service-revision;cluster-id.
-	if features.EndpointTelemetryLabel {
+	if features.EnableTelemetryLabel && features.EndpointTelemetryLabel {
 		// allow defaulting for non-injected cases
 		canonicalName, canonicalRevision := kubelabels.CanonicalService(istioMetadata.Labels, istioMetadata.WorkloadName)
 
@@ -595,6 +597,34 @@ func MeshConfigToEnvoyForwardClientCertDetails(c meshconfig.ForwardClientCertDet
 	return hcm.HttpConnectionManager_ForwardClientCertDetails(c - 1)
 }
 
+// MeshNetworksToEnvoyInternalAddressConfig converts all of the FromCidr Endpoints into Envy internal networks.
+// Because the input is an unordered map, the output is sorted to ensure config stability.
+func MeshNetworksToEnvoyInternalAddressConfig(nets *meshconfig.MeshNetworks) *hcm.HttpConnectionManager_InternalAddressConfig {
+	if nets == nil {
+		return nil
+	}
+	prefixes := []netip.Prefix{}
+	for _, internalnetwork := range nets.Networks {
+		for _, ne := range internalnetwork.Endpoints {
+			if prefix, err := AddrStrToPrefix(ne.GetFromCidr()); err == nil {
+				prefixes = append(prefixes, prefix)
+			}
+		}
+	}
+	if len(prefixes) == 0 {
+		return nil
+	}
+	sort.Slice(prefixes, func(a, b int) bool {
+		ap, bp := prefixes[a], prefixes[b]
+		return ap.Addr().Less(bp.Addr()) || (ap.Addr() == bp.Addr() && ap.Bits() < bp.Bits())
+	})
+	iac := &hcm.HttpConnectionManager_InternalAddressConfig{}
+	for _, prefix := range prefixes {
+		iac.CidrRanges = append(iac.CidrRanges, PrefixToCidrRange(prefix))
+	}
+	return iac
+}
+
 // ByteCount returns a human readable byte format
 // Inspired by https://yourbasic.org/golang/formatting-byte-size-to-human-readable-format/
 func ByteCount(b int) string {
@@ -682,10 +712,13 @@ func GetEndpointHost(e *endpoint.LbEndpoint) string {
 	return ""
 }
 
-func BuildTunnelMetadataStruct(address string, port int) *structpb.Struct {
+func BuildTunnelMetadataStruct(address string, port int, waypoint string) *structpb.Struct {
 	m := map[string]interface{}{
 		// logical destination behind the tunnel, on which policy and telemetry will be applied
 		"local": net.JoinHostPort(address, strconv.Itoa(port)),
+	}
+	if waypoint != "" {
+		m["waypoint"] = waypoint
 	}
 	st, _ := structpb.NewStruct(m)
 	return st
@@ -845,4 +878,9 @@ func ShallowCopyTrafficPolicy(original *networking.TrafficPolicy) *networking.Tr
 	ret.Tunnel = original.Tunnel
 	ret.ProxyProtocol = original.ProxyProtocol
 	return ret
+}
+
+func DelimitedStatsPrefix(statPrefix string) string {
+	statPrefix += constants.StatPrefixDelimiter
+	return statPrefix
 }

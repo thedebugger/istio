@@ -49,7 +49,7 @@ const (
 		"\"%UPSTREAM_TRANSPORT_FAILURE_REASON%\" %BYTES_RECEIVED% %BYTES_SENT% " +
 		"%DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% \"%REQ(X-FORWARDED-FOR)%\" " +
 		"\"%REQ(USER-AGENT)%\" \"%REQ(X-REQUEST-ID)%\" \"%REQ(:AUTHORITY)%\" \"%UPSTREAM_HOST%\" " +
-		"%UPSTREAM_CLUSTER% %UPSTREAM_LOCAL_ADDRESS% %DOWNSTREAM_LOCAL_ADDRESS% " +
+		"%UPSTREAM_CLUSTER_RAW% %UPSTREAM_LOCAL_ADDRESS% %DOWNSTREAM_LOCAL_ADDRESS% " +
 		"%DOWNSTREAM_REMOTE_ADDRESS% %REQUESTED_SERVER_NAME% %ROUTE_NAME%\n"
 
 	HTTPEnvoyAccessLogFriendlyName = "http_envoy_accesslog"
@@ -62,7 +62,7 @@ const (
 	reqWithoutQueryCommandOperator = "%REQ_WITHOUT_QUERY"
 	metadataCommandOperator        = "%METADATA"
 	celCommandOperator             = "%CEL"
-	// count of all supported fotmatter, right now is 3(CEL, METADATA and REQ_WITHOUT_QUERY).
+	// count of all supported formatter, right now is 3(CEL, METADATA and REQ_WITHOUT_QUERY).
 	maxFormattersLength = 3
 
 	DevStdout = "/dev/stdout"
@@ -97,7 +97,7 @@ var (
 			"request_id":                        {Kind: &structpb.Value_StringValue{StringValue: "%REQ(X-REQUEST-ID)%"}},
 			"authority":                         {Kind: &structpb.Value_StringValue{StringValue: "%REQ(:AUTHORITY)%"}},
 			"upstream_host":                     {Kind: &structpb.Value_StringValue{StringValue: "%UPSTREAM_HOST%"}},
-			"upstream_cluster":                  {Kind: &structpb.Value_StringValue{StringValue: "%UPSTREAM_CLUSTER%"}},
+			"upstream_cluster":                  {Kind: &structpb.Value_StringValue{StringValue: "%UPSTREAM_CLUSTER_RAW%"}},
 			"upstream_local_address":            {Kind: &structpb.Value_StringValue{StringValue: "%UPSTREAM_LOCAL_ADDRESS%"}},
 			"downstream_local_address":          {Kind: &structpb.Value_StringValue{StringValue: "%DOWNSTREAM_LOCAL_ADDRESS%"}},
 			"downstream_remote_address":         {Kind: &structpb.Value_StringValue{StringValue: "%DOWNSTREAM_REMOTE_ADDRESS%"}},
@@ -110,6 +110,8 @@ var (
 	// We need to propagate these as part of access log service stream
 	// Logging them by default on the console may be an issue as the base64 encoded string is bound to be a big one.
 	// But end users can certainly configure it on their own via the meshConfig using the %FILTER_STATE% macro.
+	// Related to https://github.com/istio/proxy/pull/5825, start from 1.24, Istio use new filter state key.
+	envoyStateToLog     = []string{"upstream_peer", "downstream_peer"}
 	envoyWasmStateToLog = []string{"wasm.upstream_peer", "wasm.upstream_peer_id", "wasm.downstream_peer", "wasm.downstream_peer_id"}
 
 	// reqWithoutQueryFormatter configures additional formatters needed for some of the format strings like "REQ_WITHOUT_QUERY"
@@ -136,24 +138,30 @@ var (
 // configureFromProviderConfigHandled contains the number of providers we handle below.
 // This is to ensure this stays in sync as new handlers are added
 // STOP. DO NOT UPDATE THIS WITHOUT UPDATING telemetryAccessLog.
-const telemetryAccessLogHandled = 14
+const telemetryAccessLogHandled = 15
 
-func telemetryAccessLog(push *PushContext, fp *meshconfig.MeshConfig_ExtensionProvider) *accesslog.AccessLog {
+func telemetryAccessLog(push *PushContext, proxy *Proxy, fp *meshconfig.MeshConfig_ExtensionProvider) *accesslog.AccessLog {
+	// Skip built-in formatter if Istio version is >= 1.26
+	// This is because if we send CEL/METADATA in the access log,
+	// envoy will report lots of warn message endlessly.
+	skipBuiltInFormatter := proxy.IstioVersion != nil && proxy.VersionGreaterOrEqual(&IstioVersion{Major: 1, Minor: 26})
+
 	var al *accesslog.AccessLog
 	switch prov := fp.Provider.(type) {
 	case *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLog:
 		// For built-in provider, fallback to MeshConfig for formatting options when LogFormat unset.
-		if fp.Name == builtinEnvoyAccessLogProvider && prov.EnvoyFileAccessLog.LogFormat == nil {
-			al = FileAccessLogFromMeshConfig(prov.EnvoyFileAccessLog.Path, push.Mesh)
+		if fp.Name == builtinEnvoyAccessLogProvider &&
+			prov.EnvoyFileAccessLog.LogFormat == nil && !prov.EnvoyFileAccessLog.OmitEmptyValues {
+			al = FileAccessLogFromMeshConfig(prov.EnvoyFileAccessLog.Path, push.Mesh, skipBuiltInFormatter)
 		} else {
-			al = fileAccessLogFromTelemetry(prov.EnvoyFileAccessLog)
+			al = fileAccessLogFromTelemetry(prov.EnvoyFileAccessLog, skipBuiltInFormatter)
 		}
 	case *meshconfig.MeshConfig_ExtensionProvider_EnvoyHttpAls:
-		al = httpGrpcAccessLogFromTelemetry(push, prov.EnvoyHttpAls)
+		al = httpGrpcAccessLogFromTelemetry(push, proxy, prov.EnvoyHttpAls)
 	case *meshconfig.MeshConfig_ExtensionProvider_EnvoyTcpAls:
-		al = tcpGrpcAccessLogFromTelemetry(push, prov.EnvoyTcpAls)
+		al = tcpGrpcAccessLogFromTelemetry(push, proxy, prov.EnvoyTcpAls)
 	case *meshconfig.MeshConfig_ExtensionProvider_EnvoyOtelAls:
-		al = openTelemetryLog(push, prov.EnvoyOtelAls)
+		al = openTelemetryLog(push, proxy, prov.EnvoyOtelAls, skipBuiltInFormatter)
 	case *meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp,
 		*meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc,
 		*meshconfig.MeshConfig_ExtensionProvider_Zipkin,
@@ -163,6 +171,7 @@ func telemetryAccessLog(push *PushContext, fp *meshconfig.MeshConfig_ExtensionPr
 		*meshconfig.MeshConfig_ExtensionProvider_Opencensus,
 		*meshconfig.MeshConfig_ExtensionProvider_Opentelemetry,
 		*meshconfig.MeshConfig_ExtensionProvider_Prometheus,
+		*meshconfig.MeshConfig_ExtensionProvider_Sds,
 		*meshconfig.MeshConfig_ExtensionProvider_Stackdriver:
 		// No access logs supported for this provider
 		// Stackdriver is a special case as its handled in the Metrics logic, as it uses a shared filter
@@ -172,13 +181,23 @@ func telemetryAccessLog(push *PushContext, fp *meshconfig.MeshConfig_ExtensionPr
 	return al
 }
 
-func tcpGrpcAccessLogFromTelemetry(push *PushContext, prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyTcpGrpcV3LogProvider) *accesslog.AccessLog {
+func filterStateObjectsToLog(proxy *Proxy) []string {
+	if proxy.VersionGreaterOrEqual(&IstioVersion{Major: 1, Minor: 24, Patch: 0}) {
+		return envoyStateToLog
+	}
+
+	return envoyWasmStateToLog
+}
+
+func tcpGrpcAccessLogFromTelemetry(push *PushContext, proxy *Proxy,
+	prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyTcpGrpcV3LogProvider,
+) *accesslog.AccessLog {
 	logName := TCPEnvoyAccessLogFriendlyName
 	if prov != nil && prov.LogName != "" {
 		logName = prov.LogName
 	}
 
-	filterObjects := envoyWasmStateToLog
+	filterObjects := filterStateObjectsToLog(proxy)
 	if len(prov.FilterStateObjectsToLog) != 0 {
 		filterObjects = prov.FilterStateObjectsToLog
 	}
@@ -212,7 +231,7 @@ func tcpGrpcAccessLogFromTelemetry(push *PushContext, prov *meshconfig.MeshConfi
 	}
 }
 
-func fileAccessLogFromTelemetry(prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLogProvider) *accesslog.AccessLog {
+func fileAccessLogFromTelemetry(prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLogProvider, skipBuiltInFormatter bool) *accesslog.AccessLog {
 	p := prov.Path
 	if p == "" {
 		p = DevStdout
@@ -225,12 +244,12 @@ func fileAccessLogFromTelemetry(prov *meshconfig.MeshConfig_ExtensionProvider_En
 	if prov.LogFormat != nil {
 		switch logFormat := prov.LogFormat.LogFormat.(type) {
 		case *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLogProvider_LogFormat_Text:
-			fl.AccessLogFormat, needsFormatter = buildFileAccessTextLogFormat(logFormat.Text)
+			fl.AccessLogFormat, needsFormatter = buildFileAccessTextLogFormat(logFormat.Text, prov.OmitEmptyValues, skipBuiltInFormatter)
 		case *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLogProvider_LogFormat_Labels:
-			fl.AccessLogFormat, needsFormatter = buildFileAccessJSONLogFormat(logFormat)
+			fl.AccessLogFormat, needsFormatter = buildFileAccessJSONLogFormat(logFormat, prov.OmitEmptyValues, skipBuiltInFormatter)
 		}
 	} else {
-		fl.AccessLogFormat, needsFormatter = buildFileAccessTextLogFormat("")
+		fl.AccessLogFormat, needsFormatter = buildFileAccessTextLogFormat("", prov.OmitEmptyValues, skipBuiltInFormatter)
 	}
 	if len(needsFormatter) != 0 {
 		fl.GetLogFormat().Formatters = needsFormatter
@@ -244,9 +263,11 @@ func fileAccessLogFromTelemetry(prov *meshconfig.MeshConfig_ExtensionProvider_En
 	return al
 }
 
-func buildFileAccessTextLogFormat(logFormatText string) (*fileaccesslog.FileAccessLog_LogFormat, []*core.TypedExtensionConfig) {
+func buildFileAccessTextLogFormat(
+	logFormatText string, omitEmptyValues bool, skipBuiltInFormatter bool,
+) (*fileaccesslog.FileAccessLog_LogFormat, []*core.TypedExtensionConfig) {
 	formatString := fileAccessLogFormat(logFormatText)
-	formatters := accessLogTextFormatters(formatString)
+	formatters := accessLogTextFormatters(formatString, skipBuiltInFormatter)
 
 	return &fileaccesslog.FileAccessLog_LogFormat{
 		LogFormat: &core.SubstitutionFormatString{
@@ -257,12 +278,14 @@ func buildFileAccessTextLogFormat(logFormatText string) (*fileaccesslog.FileAcce
 					},
 				},
 			},
+			OmitEmptyValues: omitEmptyValues,
 		},
 	}, formatters
 }
 
 func buildFileAccessJSONLogFormat(
 	logFormat *meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLogProvider_LogFormat_Labels,
+	omitEmptyValues bool, skipBuiltInFormatter bool,
 ) (*fileaccesslog.FileAccessLog_LogFormat, []*core.TypedExtensionConfig) {
 	jsonLogStruct := EnvoyJSONLogFormatIstio
 	if logFormat.Labels != nil {
@@ -274,18 +297,19 @@ func buildFileAccessJSONLogFormat(
 		jsonLogStruct = EnvoyJSONLogFormatIstio
 	}
 
-	formatters := accessLogJSONFormatters(jsonLogStruct)
+	formatters := accessLogJSONFormatters(jsonLogStruct, skipBuiltInFormatter)
 	return &fileaccesslog.FileAccessLog_LogFormat{
 		LogFormat: &core.SubstitutionFormatString{
 			Format: &core.SubstitutionFormatString_JsonFormat{
 				JsonFormat: jsonLogStruct,
 			},
 			JsonFormatOptions: &core.JsonFormatOptions{SortProperties: false},
+			OmitEmptyValues:   omitEmptyValues,
 		},
 	}, formatters
 }
 
-func accessLogJSONFormatters(jsonLogStruct *structpb.Struct) []*core.TypedExtensionConfig {
+func accessLogJSONFormatters(jsonLogStruct *structpb.Struct, skipBuiltInFormatter bool) []*core.TypedExtensionConfig {
 	if jsonLogStruct == nil {
 		return nil
 	}
@@ -295,10 +319,10 @@ func accessLogJSONFormatters(jsonLogStruct *structpb.Struct) []*core.TypedExtens
 		if !reqWithoutQuery && strings.Contains(value.GetStringValue(), reqWithoutQueryCommandOperator) {
 			reqWithoutQuery = true
 		}
-		if !metadata && strings.Contains(value.GetStringValue(), metadataCommandOperator) {
+		if !skipBuiltInFormatter && !metadata && strings.Contains(value.GetStringValue(), metadataCommandOperator) {
 			metadata = true
 		}
-		if !cel && strings.Contains(value.GetStringValue(), celCommandOperator) {
+		if !skipBuiltInFormatter && !cel && strings.Contains(value.GetStringValue(), celCommandOperator) {
 			cel = true
 		}
 	}
@@ -317,28 +341,31 @@ func accessLogJSONFormatters(jsonLogStruct *structpb.Struct) []*core.TypedExtens
 	return formatters
 }
 
-func accessLogTextFormatters(text string) []*core.TypedExtensionConfig {
+func accessLogTextFormatters(text string, skipBuiltInFormatter bool) []*core.TypedExtensionConfig {
 	formatters := make([]*core.TypedExtensionConfig, 0, maxFormattersLength)
 	if strings.Contains(text, reqWithoutQueryCommandOperator) {
 		formatters = append(formatters, reqWithoutQueryFormatter)
 	}
-	if strings.Contains(text, metadataCommandOperator) {
+	// Start from Istio 1.26+(envoy 1.34), the formatter ``%CEL%`` and ``%METADATA%`` will be treated as built-in formatters
+	if !skipBuiltInFormatter && strings.Contains(text, metadataCommandOperator) {
 		formatters = append(formatters, metadataFormatter)
 	}
-	if strings.Contains(text, celCommandOperator) {
+	if !skipBuiltInFormatter && strings.Contains(text, celCommandOperator) {
 		formatters = append(formatters, celFormatter)
 	}
 
 	return formatters
 }
 
-func httpGrpcAccessLogFromTelemetry(push *PushContext, prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyHttpGrpcV3LogProvider) *accesslog.AccessLog {
+func httpGrpcAccessLogFromTelemetry(push *PushContext, proxy *Proxy,
+	prov *meshconfig.MeshConfig_ExtensionProvider_EnvoyHttpGrpcV3LogProvider,
+) *accesslog.AccessLog {
 	logName := HTTPEnvoyAccessLogFriendlyName
 	if prov != nil && prov.LogName != "" {
 		logName = prov.LogName
 	}
 
-	filterObjects := envoyWasmStateToLog
+	filterObjects := filterStateObjectsToLog(proxy)
 	if len(prov.FilterStateObjectsToLog) != 0 {
 		filterObjects = prov.FilterStateObjectsToLog
 	}
@@ -388,7 +415,7 @@ func fileAccessLogFormat(formatString string) string {
 	return EnvoyTextLogFormat
 }
 
-func FileAccessLogFromMeshConfig(path string, mesh *meshconfig.MeshConfig) *accesslog.AccessLog {
+func FileAccessLogFromMeshConfig(path string, mesh *meshconfig.MeshConfig, skipBuiltInFormatter bool) *accesslog.AccessLog {
 	// We need to build access log. This is needed either on first access or when mesh config changes.
 	fl := &fileaccesslog.FileAccessLog{
 		Path: path,
@@ -397,7 +424,7 @@ func FileAccessLogFromMeshConfig(path string, mesh *meshconfig.MeshConfig) *acce
 	switch mesh.AccessLogEncoding {
 	case meshconfig.MeshConfig_TEXT:
 		formatString := fileAccessLogFormat(mesh.AccessLogFormat)
-		formatters = accessLogTextFormatters(formatString)
+		formatters = accessLogTextFormatters(formatString, skipBuiltInFormatter)
 		fl.AccessLogFormat = &fileaccesslog.FileAccessLog_LogFormat{
 			LogFormat: &core.SubstitutionFormatString{
 				Format: &core.SubstitutionFormatString_TextFormatSource{
@@ -419,7 +446,7 @@ func FileAccessLogFromMeshConfig(path string, mesh *meshconfig.MeshConfig) *acce
 				jsonLogStruct = &parsedJSONLogStruct
 			}
 		}
-		formatters = accessLogJSONFormatters(jsonLogStruct)
+		formatters = accessLogJSONFormatters(jsonLogStruct, skipBuiltInFormatter)
 		fl.AccessLogFormat = &fileaccesslog.FileAccessLog_LogFormat{
 			LogFormat: &core.SubstitutionFormatString{
 				Format: &core.SubstitutionFormatString_JsonFormat{
@@ -443,8 +470,8 @@ func FileAccessLogFromMeshConfig(path string, mesh *meshconfig.MeshConfig) *acce
 	return al
 }
 
-func openTelemetryLog(pushCtx *PushContext,
-	provider *meshconfig.MeshConfig_ExtensionProvider_EnvoyOpenTelemetryLogProvider,
+func openTelemetryLog(pushCtx *PushContext, proxy *Proxy,
+	provider *meshconfig.MeshConfig_ExtensionProvider_EnvoyOpenTelemetryLogProvider, skipBuiltInFormatter bool,
 ) *accesslog.AccessLog {
 	hostname, cluster, err := clusterLookupFn(pushCtx, provider.Service, int(provider.Port))
 	if err != nil {
@@ -468,7 +495,7 @@ func openTelemetryLog(pushCtx *PushContext,
 		labels = provider.LogFormat.Labels
 	}
 
-	cfg := buildOpenTelemetryAccessLogConfig(logName, hostname, cluster, f, labels)
+	cfg := buildOpenTelemetryAccessLogConfig(proxy, logName, hostname, cluster, f, labels, skipBuiltInFormatter)
 
 	return &accesslog.AccessLog{
 		Name:       OtelEnvoyALSName,
@@ -476,7 +503,9 @@ func openTelemetryLog(pushCtx *PushContext,
 	}
 }
 
-func buildOpenTelemetryAccessLogConfig(logName, hostname, clusterName, format string, labels *structpb.Struct) *otelaccesslog.OpenTelemetryAccessLogConfig {
+func buildOpenTelemetryAccessLogConfig(proxy *Proxy,
+	logName, hostname, clusterName, format string, labels *structpb.Struct, skipBuiltInFormatter bool,
+) *otelaccesslog.OpenTelemetryAccessLogConfig {
 	cfg := &otelaccesslog.OpenTelemetryAccessLogConfig{
 		CommonConfig: &grpcaccesslog.CommonGrpcAccessLogConfig{
 			LogName: logName,
@@ -489,7 +518,7 @@ func buildOpenTelemetryAccessLogConfig(logName, hostname, clusterName, format st
 				},
 			},
 			TransportApiVersion:     core.ApiVersion_V3,
-			FilterStateObjectsToLog: envoyWasmStateToLog,
+			FilterStateObjectsToLog: filterStateObjectsToLog(proxy),
 		},
 		DisableBuiltinLabels: true,
 	}
@@ -508,15 +537,12 @@ func buildOpenTelemetryAccessLogConfig(logName, hostname, clusterName, format st
 		}
 	}
 
-	// it's unnecessary to check proxy version here,
-	// users should add CEL/METADATA/REQ_WITHOUT_QUERY commands after all proxy upgraded to 1.23+.
-	// Otherwise, the configuration will be rejected.
-	cfg.Formatters = accessLogFormatters(format, labels)
+	cfg.Formatters = accessLogFormatters(format, labels, skipBuiltInFormatter)
 
 	return cfg
 }
 
-func accessLogFormatters(text string, labels *structpb.Struct) []*core.TypedExtensionConfig {
+func accessLogFormatters(text string, labels *structpb.Struct, skipBuiltInFormatter bool) []*core.TypedExtensionConfig {
 	formatters := make([]*core.TypedExtensionConfig, 0, maxFormattersLength)
 	defer func() {
 		slices.SortBy(formatters, func(f *core.TypedExtensionConfig) string {
@@ -524,7 +550,7 @@ func accessLogFormatters(text string, labels *structpb.Struct) []*core.TypedExte
 		})
 	}()
 
-	formatters = append(formatters, accessLogTextFormatters(text)...)
+	formatters = append(formatters, accessLogTextFormatters(text, skipBuiltInFormatter)...)
 	if len(formatters) >= maxFormattersLength {
 		// all formatters are added, return if we have reached the limit
 		return formatters
@@ -535,7 +561,7 @@ func accessLogFormatters(text string, labels *structpb.Struct) []*core.TypedExte
 		names.Insert(f.Name)
 	}
 
-	for _, f := range accessLogJSONFormatters(labels) {
+	for _, f := range accessLogJSONFormatters(labels, skipBuiltInFormatter) {
 		if !names.Contains(f.Name) {
 			formatters = append(formatters, f)
 			names.Insert(f.Name)

@@ -12,18 +12,18 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-FROM ruby:3.3.0-slim
+FROM ruby:3.4.3-slim
 
 WORKDIR /opt/microservices
-COPY Gemfile /opt/microservices/
+COPY Gemfile Gemfile.lock /opt/microservices/
 RUN bundle install
 
 COPY details.rb /opt/microservices/
 
 ARG service_version
-ENV SERVICE_VERSION ${service_version:-v1}
+ENV SERVICE_VERSION=${service_version:-v1}
 ARG enable_external_book_service
-ENV ENABLE_EXTERNAL_BOOK_SERVICE ${enable_external_book_service:-false}
+ENV ENABLE_EXTERNAL_BOOK_SERVICE=${enable_external_book_service:-false}
 
 EXPOSE 9080
 

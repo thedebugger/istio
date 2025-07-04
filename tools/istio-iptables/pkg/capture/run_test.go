@@ -27,23 +27,11 @@ import (
 	dep "istio.io/istio/tools/istio-iptables/pkg/dependencies"
 )
 
-func constructTestConfig() *config.Config {
-	return &config.Config{
-		ProxyPort:               "15001",
-		InboundCapturePort:      "15006",
-		InboundTunnelPort:       "15008",
-		ProxyUID:                constants.DefaultProxyUID,
-		ProxyGID:                constants.DefaultProxyUID,
-		InboundTProxyMark:       "1337",
-		InboundTProxyRouteTable: "133",
-		OwnerGroupsInclude:      constants.OwnerGroupsInclude.DefaultValue,
-		HostIPv4LoopbackCidr:    constants.HostIPv4LoopbackCidr.DefaultValue,
-		RestoreFormat:           false,
-	}
-}
-
-func TestIptables(t *testing.T) {
-	cases := []struct {
+func getCommonTestCases() []struct {
+	name   string
+	config func(cfg *config.Config)
+} {
+	return []struct {
 		name   string
 		config func(cfg *config.Config)
 	}{
@@ -70,7 +58,7 @@ func TestIptables(t *testing.T) {
 		{
 			"tproxy",
 			func(cfg *config.Config) {
-				cfg.InboundInterceptionMode = constants.TPROXY
+				cfg.InboundInterceptionMode = "TPROXY"
 				cfg.InboundPortsInclude = "*"
 				cfg.OutboundIPRangesExclude = "1.1.0.0/16"
 				cfg.OutboundIPRangesInclude = "9.9.0.0/16"
@@ -94,7 +82,7 @@ func TestIptables(t *testing.T) {
 			"ipv6-virt-interfaces",
 			func(cfg *config.Config) {
 				cfg.InboundPortsInclude = "4000,5000"
-				cfg.KubeVirtInterfaces = "eth0,eth1"
+				cfg.RerouteVirtualInterfaces = "eth0,eth1"
 				cfg.EnableIPv6 = true
 			},
 		},
@@ -103,7 +91,7 @@ func TestIptables(t *testing.T) {
 			func(cfg *config.Config) {
 				cfg.InboundPortsInclude = "4000,5000"
 				cfg.InboundPortsExclude = "6000,7000,"
-				cfg.KubeVirtInterfaces = "eth0,eth1"
+				cfg.RerouteVirtualInterfaces = "eth0,eth1"
 				cfg.OutboundIPRangesExclude = "2001:db8::/32"
 				cfg.OutboundIPRangesInclude = "2001:db8::/32"
 				cfg.EnableIPv6 = true
@@ -114,7 +102,7 @@ func TestIptables(t *testing.T) {
 			func(cfg *config.Config) {
 				cfg.InboundPortsInclude = "4000,5000"
 				cfg.InboundPortsExclude = "6000,7000"
-				cfg.KubeVirtInterfaces = "eth0,eth1"
+				cfg.RerouteVirtualInterfaces = "eth0,eth1"
 				cfg.ProxyGID = "1,2"
 				cfg.ProxyUID = "3,4"
 				cfg.EnableIPv6 = true
@@ -137,7 +125,7 @@ func TestIptables(t *testing.T) {
 		{
 			"kube-virt-interfaces",
 			func(cfg *config.Config) {
-				cfg.KubeVirtInterfaces = "eth1,eth2"
+				cfg.RerouteVirtualInterfaces = "eth1,eth2"
 				cfg.OutboundIPRangesInclude = "*"
 			},
 		},
@@ -150,7 +138,7 @@ func TestIptables(t *testing.T) {
 		{
 			"ipnets-with-kube-virt-interfaces",
 			func(cfg *config.Config) {
-				cfg.KubeVirtInterfaces = "eth1,eth2"
+				cfg.RerouteVirtualInterfaces = "eth1,eth2"
 				cfg.OutboundIPRangesInclude = "10.0.0.0/8"
 			},
 		},
@@ -170,14 +158,14 @@ func TestIptables(t *testing.T) {
 			"inbound-ports-tproxy",
 			func(cfg *config.Config) {
 				cfg.InboundPortsInclude = "32000,31000"
-				cfg.InboundInterceptionMode = constants.TPROXY
+				cfg.InboundInterceptionMode = "TPROXY"
 			},
 		},
 		{
 			"inbound-ports-wildcard-tproxy",
 			func(cfg *config.Config) {
 				cfg.InboundPortsInclude = "*"
-				cfg.InboundInterceptionMode = constants.TPROXY
+				cfg.InboundInterceptionMode = "TPROXY"
 			},
 		},
 		{
@@ -253,12 +241,6 @@ func TestIptables(t *testing.T) {
 			},
 		},
 		{
-			"logging",
-			func(cfg *config.Config) {
-				cfg.TraceLogging = true
-			},
-		},
-		{
 			"drop-invalid",
 			func(cfg *config.Config) {
 				cfg.DropInvalid = true
@@ -271,14 +253,41 @@ func TestIptables(t *testing.T) {
 			},
 		},
 	}
-	for _, tt := range cases {
+}
+
+func constructTestConfig() *config.Config {
+	return &config.Config{
+		ProxyPort:               "15001",
+		InboundCapturePort:      "15006",
+		InboundTunnelPort:       "15008",
+		ProxyUID:                constants.DefaultProxyUID,
+		ProxyGID:                constants.DefaultProxyUID,
+		InboundTProxyMark:       "1337",
+		InboundTProxyRouteTable: "133",
+		OwnerGroupsInclude:      constants.OwnerGroupsInclude.DefaultValue,
+		HostIPv4LoopbackCidr:    constants.HostIPv4LoopbackCidr.DefaultValue,
+	}
+}
+
+func compareToGolden(t *testing.T, name string, actual []string) {
+	t.Helper()
+	gotBytes := []byte(strings.Join(actual, "\n"))
+	goldenFile := filepath.Join("testdata", name+".golden")
+	testutil.CompareContent(t, gotBytes, goldenFile)
+}
+
+func TestIptables(t *testing.T) {
+	for _, tt := range getCommonTestCases() {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := constructTestConfig()
 			tt.config(cfg)
 
 			ext := &dep.DependenciesStub{}
-			iptConfigurator := NewIptablesConfigurator(cfg, ext)
-			iptConfigurator.Run()
+			iptConfigurator, _ := NewIptablesConfigurator(cfg, ext)
+			err := iptConfigurator.Run()
+			if err != nil {
+				t.Fatal(err)
+			}
 			compareToGolden(t, tt.name, ext.ExecutedAll)
 		})
 	}
@@ -322,7 +331,7 @@ func TestSeparateV4V6(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := constructTestConfig()
-			iptConfigurator := NewIptablesConfigurator(cfg, &dep.DependenciesStub{})
+			iptConfigurator, _ := NewIptablesConfigurator(cfg, &dep.DependenciesStub{})
 			v4Range, v6Range, err := iptConfigurator.separateV4V6(tt.cidr)
 			if err != nil {
 				t.Fatal(err)
@@ -335,11 +344,4 @@ func TestSeparateV4V6(t *testing.T) {
 			}
 		})
 	}
-}
-
-func compareToGolden(t *testing.T, name string, actual []string) {
-	t.Helper()
-	gotBytes := []byte(strings.Join(actual, "\n"))
-	goldenFile := filepath.Join("testdata", name+".golden")
-	testutil.CompareContent(t, gotBytes, goldenFile)
 }

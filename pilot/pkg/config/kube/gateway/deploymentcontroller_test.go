@@ -17,11 +17,13 @@ package gateway
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"go.uber.org/atomic"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,6 +34,8 @@ import (
 	k8sbeta "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/yaml"
 
+	"istio.io/api/annotation"
+	"istio.io/api/label"
 	istioio_networking_v1beta1 "istio.io/api/networking/v1beta1"
 	istio_type_v1beta1 "istio.io/api/type/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
@@ -50,12 +54,19 @@ import (
 	"istio.io/istio/pkg/kube/kclient/clienttest"
 	"istio.io/istio/pkg/kube/kubetypes"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/revisions"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/file"
 	"istio.io/istio/pkg/test/util/retry"
+)
+
+var (
+	copyLabelsAnnotationsEnabled  = true
+	copyLabelsAnnotationsDisabled = false
 )
 
 func TestConfigureIstioGateway(t *testing.T) {
@@ -69,6 +80,39 @@ func TestConfigureIstioGateway(t *testing.T) {
 			ControllerName: k8s.GatewayController(features.ManagedGatewayController),
 		},
 	}
+	upgradeDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-upgrade",
+			Namespace: "default",
+			Labels: map[string]string{
+				"gateway.istio.io/managed": "istio.io-mesh-controller",
+				"istio.io/gateway-name":    "test-upgrade",
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"gateway.networking.k8s.io/gateway-name": "test-upgrade",
+					"istio.io/gateway-name":                  "test-upgrade",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"gateway.istio.io/managed":               "istio.io-mesh-controller",
+						"gateway.networking.k8s.io/gateway-name": "test-upgrade",
+						"istio.io/gateway-name":                  "test-upgrade",
+						"istio.io/dataplane-mode":                "none",
+						"service.istio.io/canonical-name":        "test-upgrade",
+						"service.istio.io/canonical-revision":    "latest",
+						"sidecar.istio.io/inject":                "false",
+						"topology.istio.io/network":              "network-1",
+					},
+				},
+			},
+		},
+	}
+
 	defaultObjects := []runtime.Object{defaultNamespace}
 	store := model.NewFakeStore()
 	if _, err := store.Create(config.Config{
@@ -80,7 +124,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 		Spec: &istioio_networking_v1beta1.ProxyConfig{
 			Selector: &istio_type_v1beta1.WorkloadSelector{
 				MatchLabels: map[string]string{
-					"gateway.networking.k8s.io/gateway-name": "default",
+					label.IoK8sNetworkingGatewayGatewayName.Name: "default",
 				},
 			},
 			Image: &istioio_networking_v1beta1.ProxyImage{
@@ -99,6 +143,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 		values                   string
 		discoveryNamespaceFilter kubetypes.DynamicObjectFilter
 		ignore                   bool
+		copyLabelsAnnotations    *bool
 	}{
 		{
 			name: "simple",
@@ -137,7 +182,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "default",
 					Namespace:   "default",
-					Annotations: map[string]string{gatewaySAOverride: "custom-sa"},
+					Annotations: map[string]string{annotation.GatewayServiceAccount.Name: "custom-sa"},
 				},
 				Spec: k8s.GatewaySpec{
 					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
@@ -152,11 +197,11 @@ func TestConfigureIstioGateway(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "default",
 					Namespace:   "default",
-					Annotations: map[string]string{gatewayNameOverride: "default"},
+					Annotations: map[string]string{annotation.GatewayNameOverride.Name: "default"},
 				},
 				Spec: k8s.GatewaySpec{
 					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
-					Addresses: []k8s.GatewayAddress{{
+					Addresses: []k8s.GatewaySpecAddress{{
 						Type:  func() *k8s.AddressType { x := k8s.IPAddressType; return &x }(),
 						Value: "1.2.3.4",
 					}},
@@ -172,8 +217,8 @@ func TestConfigureIstioGateway(t *testing.T) {
 					Name:      "default",
 					Namespace: "default",
 					Annotations: map[string]string{
-						"networking.istio.io/service-type": string(corev1.ServiceTypeClusterIP),
-						gatewayNameOverride:                "default",
+						"networking.istio.io/service-type":  string(corev1.ServiceTypeClusterIP),
+						annotation.GatewayNameOverride.Name: "default",
 					},
 				},
 				Spec: k8s.GatewaySpec{
@@ -194,8 +239,8 @@ func TestConfigureIstioGateway(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "default",
 					Namespace:   "default",
-					Labels:      map[string]string{"topology.istio.io/network": "network-1"},
-					Annotations: map[string]string{gatewayNameOverride: "default"},
+					Labels:      map[string]string{label.TopologyNetwork.Name: "network-1"},
+					Annotations: map[string]string{annotation.GatewayNameOverride.Name: "default"},
 				},
 				Spec: k8s.GatewaySpec{
 					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
@@ -216,7 +261,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 					Name:      "namespace",
 					Namespace: "default",
 					Labels: map[string]string{
-						"topology.istio.io/network": "network-1", // explicitly set network won't be overwritten
+						label.TopologyNetwork.Name: "network-1", // explicitly set network won't be overwritten
 					},
 				},
 				Spec: k8s.GatewaySpec{
@@ -247,6 +292,34 @@ func TestConfigureIstioGateway(t *testing.T) {
 						Name:     "mesh",
 						Port:     k8s.PortNumber(15008),
 						Protocol: "ALL",
+					}},
+				},
+			},
+			objects: defaultObjects,
+			values: `global:
+  hub: test
+  tag: test
+  network: network-1`,
+		},
+		{
+			name: "istio-east-west",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "eastwestgateway",
+					Namespace: "istio-system",
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: constants.EastWestGatewayClassName,
+					Listeners: []k8s.Listener{{
+						Name:     "mesh",
+						Port:     k8s.PortNumber(15008),
+						Protocol: "ALL",
+						TLS: &k8s.GatewayTLSConfig{
+							Mode: ptr.Of(k8s.TLSModeTerminate),
+							Options: map[k8s.AnnotationKey]k8s.AnnotationValue{
+								gatewayTLSTerminateModeKey: "ISTIO_MUTUAL",
+							},
+						},
 					}},
 				},
 			},
@@ -295,7 +368,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 				Spec: k8s.GatewaySpec{
 					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
 					Infrastructure: &k8s.GatewayInfrastructure{
-						Labels:      map[k8s.AnnotationKey]k8s.AnnotationValue{"foo": "bar", "gateway.networking.k8s.io/ignore": "true"},
+						Labels:      map[k8s.LabelKey]k8s.LabelValue{"foo": "bar", "gateway.networking.k8s.io/ignore": "true"},
 						Annotations: map[k8s.AnnotationKey]k8s.AnnotationValue{"fizz": "buzz", "gateway.networking.k8s.io/ignore": "true"},
 					},
 				},
@@ -310,7 +383,7 @@ func TestConfigureIstioGateway(t *testing.T) {
 					Namespace: "default",
 					// TODO why are we setting this on gateways?
 					Labels: map[string]string{
-						constants.DataplaneModeLabel: constants.DataplaneModeAmbient,
+						label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient,
 					},
 				},
 				Spec: k8s.GatewaySpec{
@@ -329,32 +402,183 @@ func TestConfigureIstioGateway(t *testing.T) {
 				Spec: k8s.GatewaySpec{
 					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
 					Infrastructure: &k8s.GatewayInfrastructure{
-						// TODO why are we setting this on gateways?
-						Labels: map[k8s.AnnotationKey]k8s.AnnotationValue{
-							constants.DataplaneModeLabel: constants.DataplaneModeAmbient,
+						Labels: map[k8s.LabelKey]k8s.LabelValue{
+							k8s.LabelKey(label.IoIstioDataplaneMode.Name): constants.DataplaneModeAmbient,
 						},
 					},
 				},
 			},
 			objects: defaultObjects,
 		},
+		{
+			name: "istio-upgrade-to-1.24",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-upgrade",
+					Namespace: "default",
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: constants.WaypointGatewayClassName,
+					Listeners: []k8s.Listener{{
+						Name:     "mesh",
+						Port:     k8s.PortNumber(15008),
+						Protocol: "ALL",
+					}},
+				},
+			},
+			objects: defaultObjects,
+			values: `global:
+  hub: test
+  tag: test
+  network: network-1`,
+		},
+		{
+			name: "customizations",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "namespace",
+					Namespace: "default",
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
+					Infrastructure: &k8s.GatewayInfrastructure{
+						Labels: map[k8s.LabelKey]k8s.LabelValue{"foo": "bar"},
+						ParametersRef: &k8s.LocalParametersReference{
+							Group: "",
+							Kind:  "ConfigMap",
+							Name:  "gw-options",
+						},
+					},
+				},
+			},
+			objects: append(slices.Clone(defaultObjects), &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw-options", Namespace: "default"},
+				Data: map[string]string{
+					"podDisruptionBudget": `
+spec:
+  minAvailable: 1`,
+					"horizontalPodAutoscaler": `
+spec:
+  minReplicas: 2
+  maxReplicas: 2`,
+					"deployment": `
+metadata:
+  annotations:
+    cm-annotation: cm-annotation-value
+spec:
+  replicas: 4
+  template:
+    spec:
+      containers:
+      - name: istio-proxy
+        resources:
+          requests:
+            cpu: 222m`,
+				},
+			}),
+			values: ``,
+		},
+		{
+			name: "illegal_customizations",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "namespace",
+					Namespace: "default",
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
+					Infrastructure: &k8s.GatewayInfrastructure{
+						Labels: map[k8s.LabelKey]k8s.LabelValue{"foo": "bar"},
+						ParametersRef: &k8s.LocalParametersReference{
+							Group: "",
+							Kind:  "ConfigMap",
+							Name:  "gw-options",
+						},
+					},
+				},
+			},
+			objects: append(slices.Clone(defaultObjects), &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw-options", Namespace: "default"},
+				Data: map[string]string{
+					"deployment": `
+metadata:
+  name: not-allowed`,
+				},
+			}),
+			values: ``,
+		},
+		{
+			name: "copy-labels-annotations-disabled-infra-set",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "default",
+					Namespace:   "default",
+					Labels:      map[string]string{"should-not": "see"},
+					Annotations: map[string]string{"should-not": "see"},
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
+					Infrastructure: &k8s.GatewayInfrastructure{
+						Labels:      map[k8s.LabelKey]k8s.LabelValue{"should": "see-infra-label"},
+						Annotations: map[k8s.AnnotationKey]k8s.AnnotationValue{"should": "see-infra-annotation"},
+					},
+				},
+			},
+			objects:               defaultObjects,
+			copyLabelsAnnotations: &copyLabelsAnnotationsDisabled,
+		},
+		{
+			name: "copy-labels-annotations-disabled-infra-nil",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "default",
+					Namespace:   "default",
+					Labels:      map[string]string{"should-not": "see"},
+					Annotations: map[string]string{"should-not": "see"},
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
+				},
+			},
+			objects:               defaultObjects,
+			copyLabelsAnnotations: &copyLabelsAnnotationsDisabled,
+		},
+		{
+			name: "copy-labels-annotations-enabled-infra-nil",
+			gw: k8sbeta.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "default",
+					Namespace:   "default",
+					Labels:      map[string]string{"should": "see"},
+					Annotations: map[string]string{"should": "see"},
+				},
+				Spec: k8s.GatewaySpec{
+					GatewayClassName: k8s.ObjectName(features.GatewayAPIDefaultGatewayClass),
+				},
+			},
+			objects:               defaultObjects,
+			copyLabelsAnnotations: &copyLabelsAnnotationsEnabled,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.copyLabelsAnnotations != nil {
+				test.SetForTest(t, &features.EnableGatewayAPICopyLabelsAnnotations, *tt.copyLabelsAnnotations)
+			}
 			buf := &bytes.Buffer{}
 			client := kube.NewFakeClient(tt.objects...)
 			kube.SetObjectFilter(client, tt.discoveryNamespaceFilter)
 			client.Kube().Discovery().(*fakediscovery.FakeDiscovery).FakedServerVersion = &kubeVersion.Info{Major: "1", Minor: "28"}
 			kclient.NewWriteClient[*k8sbeta.GatewayClass](client).Create(customClass)
 			kclient.NewWriteClient[*k8sbeta.Gateway](client).Create(tt.gw.DeepCopy())
+			kclient.NewWriteClient[*appsv1.Deployment](client).Create(upgradeDeployment)
 			stop := test.NewStop(t)
 			env := model.NewEnvironment()
 			env.PushContext().ProxyConfigs = tt.pcs
 			tw := revisions.NewTagWatcher(client, "")
 			go tw.Run(stop)
-			d := NewDeploymentController(
-				client, cluster.ID(features.ClusterName), env, testInjectionConfig(t, tt.values), func(fn func()) {
-				}, tw, "")
+			d := NewDeploymentController(client, cluster.ID(features.ClusterName), env, testInjectionConfig(t, tt.values), func(fn func()) {
+			}, tw, "", "")
 			d.patcher = func(gvr schema.GroupVersionResource, name string, namespace string, data []byte, subresources ...string) error {
 				b, err := yaml.JSONToYAML(data)
 				if err != nil {
@@ -372,6 +596,11 @@ func TestConfigureIstioGateway(t *testing.T) {
 				assert.Equal(t, buf.String(), "")
 			} else {
 				resp := timestampRegex.ReplaceAll(buf.Bytes(), []byte("lastTransitionTime: fake"))
+				if util.Refresh() {
+					if err := os.WriteFile(filepath.Join("testdata", "deployment", tt.name+".yaml"), resp, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
 				util.CompareContent(t, resp, filepath.Join("testdata", "deployment", tt.name+".yaml"))
 			}
 			// ensure we didn't mutate the object
@@ -409,7 +638,7 @@ func TestVersionManagement(t *testing.T) {
 	})
 	tw := revisions.NewTagWatcher(c, "default")
 	env := &model.Environment{}
-	d := NewDeploymentController(c, "", env, testInjectionConfig(t, ""), func(fn func()) {}, tw, "")
+	d := NewDeploymentController(c, "", env, testInjectionConfig(t, ""), func(fn func()) {}, tw, "", "")
 	reconciles := atomic.NewInt32(0)
 	wantReconcile := int32(0)
 	expectReconciled := func() {

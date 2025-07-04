@@ -24,6 +24,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/ambient"
@@ -51,6 +52,39 @@ var (
 
 	// used to validate telemetry in-cluster
 	prom prometheus.Instance
+)
+
+const (
+	ambientControlPlaneValues = `
+values:
+  cni:
+    # The CNI repair feature is disabled for these tests because this is a controlled environment,
+    # and it is important to catch issues that might otherwise be automatically fixed.
+    # Refer to issue #49207 for more context.
+    repair:
+      enabled: false
+  ztunnel:
+    terminationGracePeriodSeconds: 5
+    env:
+      SECRET_TTL: 5m
+`
+
+	ambientMultiNetworkControlPlaneValues = `
+values:
+  pilot:
+    env:
+      AMBIENT_ENABLE_MULTI_NETWORK: "true"
+  cni:
+    # The CNI repair feature is disabled for these tests because this is a controlled environment,
+    # and it is important to catch issues that might otherwise be automatically fixed.
+    # Refer to issue #49207 for more context.
+    repair:
+      enabled: false
+  ztunnel:
+    terminationGracePeriodSeconds: 5
+    env:
+      SECRET_TTL: 5m
+`
 )
 
 type EchoDeployments struct {
@@ -101,30 +135,34 @@ func TestMain(m *testing.M) {
 			ctx.Settings().SkipVMs()
 			cfg.EnableCNI = true
 			cfg.DeployEastWestGW = false
-			cfg.ControlPlaneValues = `
-values:
-  cni:
-    # The CNI repair feature is disabled for these tests because this is a controlled environment,
-    # and it is important to catch issues that might otherwise be automatically fixed.
-    # Refer to issue #49207 for more context.
-    repair:
-      enabled: false
-  ztunnel:
-    terminationGracePeriodSeconds: 5
-    env:
-      SECRET_TTL: 5m
-`
+			cfg.ControlPlaneValues = ambientControlPlaneValues
+			if ctx.Settings().AmbientMultiNetwork {
+				cfg.ControlPlaneValues = ambientMultiNetworkControlPlaneValues
+				// TODO: Remove once we're actually ready to test the multi-cluster
+				// features
+				cfg.SkipDeployCrossClusterSecrets = true
+			}
 		}, cert.CreateCASecretAlt)).
 		Setup(func(t resource.Context) error {
+			gatewayConformanceInputs.Cluster = t.Clusters().Default()
 			gatewayConformanceInputs.Client = t.Clusters().Default()
 			gatewayConformanceInputs.Cleanup = !t.Settings().NoCleanup
 
 			return nil
 		}).
-		Setup(func(t resource.Context) error {
-			return SetupApps(t, i, apps)
-		}).
-		Setup(testRegistrySetup).
+		SetupParallel(
+			testRegistrySetup,
+			func(t resource.Context) error {
+				return SetupApps(t, i, apps)
+			},
+			func(t resource.Context) (err error) {
+				prom, err = prometheus.New(t, prometheus.Config{})
+				if err != nil {
+					return err
+				}
+				return
+			},
+		).
 		Run()
 }
 
@@ -146,7 +184,7 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 		Prefix: "echo",
 		Inject: false,
 		Labels: map[string]string{
-			constants.DataplaneModeLabel: "ambient",
+			label.IoIstioDataplaneMode.Name: "ambient",
 		},
 	})
 	if err != nil {
@@ -159,11 +197,6 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 			"istio.io/test-exclude-namespace": "true",
 		},
 	})
-	if err != nil {
-		return err
-	}
-
-	prom, err = prometheus.New(t, prometheus.Config{})
 	if err != nil {
 		return err
 	}
@@ -187,18 +220,18 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 					Replicas: 1,
 					Version:  "v1",
 					Labels: map[string]string{
-						"app":                             WorkloadAddressedWaypoint,
-						"version":                         "v1",
-						constants.AmbientUseWaypointLabel: "waypoint",
+						"app":                         WorkloadAddressedWaypoint,
+						"version":                     "v1",
+						label.IoIstioUseWaypoint.Name: "waypoint",
 					},
 				},
 				{
 					Replicas: 1,
 					Version:  "v2",
 					Labels: map[string]string{
-						"app":                             WorkloadAddressedWaypoint,
-						"version":                         "v2",
-						constants.AmbientUseWaypointLabel: "waypoint",
+						"app":                         WorkloadAddressedWaypoint,
+						"version":                     "v2",
+						label.IoIstioUseWaypoint.Name: "waypoint",
 					},
 				},
 			},
@@ -207,7 +240,7 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 			Service:              ServiceAddressedWaypoint,
 			Namespace:            apps.Namespace,
 			Ports:                ports.All(),
-			ServiceLabels:        map[string]string{constants.AmbientUseWaypointLabel: "waypoint"},
+			ServiceLabels:        map[string]string{label.IoIstioUseWaypoint.Name: "waypoint"},
 			ServiceAccount:       true,
 			ServiceWaypointProxy: "waypoint",
 			Subsets: []echo.SubsetConfig{
@@ -254,12 +287,12 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 				{
 					Replicas: 1,
 					Version:  "v1",
-					Labels:   map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeNone},
+					Labels:   map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone},
 				},
 				{
 					Replicas: 1,
 					Version:  "v2",
-					Labels:   map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeNone},
+					Labels:   map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone},
 				},
 			},
 		})
@@ -282,16 +315,16 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 					Replicas: 1,
 					Version:  "v1",
 					Labels: map[string]string{
-						"sidecar.istio.io/inject":    "true",
-						constants.DataplaneModeLabel: constants.DataplaneModeNone,
+						"sidecar.istio.io/inject":       "true",
+						label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone,
 					},
 				},
 				{
 					Replicas: 1,
 					Version:  "v2",
 					Labels: map[string]string{
-						"sidecar.istio.io/inject":    "true",
-						constants.DataplaneModeLabel: constants.DataplaneModeNone,
+						"sidecar.istio.io/inject":       "true",
+						label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone,
 					},
 				},
 			},
@@ -325,8 +358,7 @@ func SetupApps(t resource.Context, i istio.Instance, apps *EchoDeployments) erro
 	apps.Mesh = inMesh.GetMatches(echos)
 	apps.MeshExternal = match.Not(inMesh).GetMatches(echos)
 
-	// TODO(https://github.com/istio/istio/issues/51083) remove manually allocate
-	if err := cdeployment.DeployExternalServiceEntry(t.ConfigIstio(), apps.Namespace, apps.ExternalNamespace, true).
+	if err := cdeployment.DeployExternalServiceEntry(t.ConfigIstio(), apps.Namespace, apps.ExternalNamespace, false).
 		Apply(apply.CleanupConditionally); err != nil {
 		return err
 	}

@@ -70,9 +70,11 @@ import (
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/inject"
 	"istio.io/istio/pkg/kube/kclient"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/kube/namespace"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/spiffe"
@@ -128,6 +130,8 @@ type Server struct {
 	// internalDebugMux is a mux for *internal* calls to the debug interface. That is, authentication is disabled.
 	internalDebugMux *http.ServeMux
 
+	metricsExporter http.Handler
+
 	// httpMux listens on the httpAddr (8080).
 	// If a Gateway is used in front and https is off it is also multiplexing
 	// the rest of the features if their port is empty.
@@ -149,7 +153,8 @@ type Server struct {
 	RA       ra.RegistrationAuthority
 	caServer *caserver.Server
 
-	// TrustAnchors for workload to workload mTLS
+	// TrustAnchors for workload to workload mTLS and proxy to istiod TLS
+	// Only initiated when `ISTIO_MULTIROOT_MESH` = true
 	workloadTrustBundle *tb.TrustBundle
 	certMu              sync.RWMutex
 	istiodCert          *tls.Certificate
@@ -177,6 +182,8 @@ type Server struct {
 	statusManager *status.Manager
 	// RWConfigStore is the configstore which allows updates, particularly for status.
 	RWConfigStore model.ConfigStoreController
+
+	krtDebugger *krt.DebugHandler
 }
 
 type readinessFlags struct {
@@ -224,10 +231,15 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	e.DomainSuffix = args.RegistryOptions.KubeOptions.DomainSuffix
 
 	ac := aggregate.NewController(aggregate.Options{
-		MeshHolder: e,
+		MeshHolder:      e,
+		ConfigClusterID: getClusterID(args),
 	})
 	e.ServiceDiscovery = ac
 
+	exporter, err := monitoring.RegisterPrometheusExporter(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not set up prometheus exporter: %v", err)
+	}
 	s := &Server{
 		clusterID:               getClusterID(args),
 		environment:             e,
@@ -241,16 +253,16 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		internalStop:            make(chan struct{}),
 		istiodCertBundleWatcher: keycertbundle.NewWatcher(),
 		webhookInfo:             &webhookInfo{},
+		metricsExporter:         exporter,
+		krtDebugger:             args.KrtDebugger,
 	}
-	s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
 
 	// Apply custom initialization functions.
 	for _, fn := range initFuncs {
 		fn(s)
 	}
 	// Initialize workload Trust Bundle before XDS Server
-	e.TrustBundle = s.workloadTrustBundle
-	s.XDSServer = xds.NewDiscoveryServer(e, args.RegistryOptions.KubeOptions.ClusterAliases)
+	s.XDSServer = xds.NewDiscoveryServer(e, args.RegistryOptions.KubeOptions.ClusterAliases, args.KrtDebugger)
 	configGen := core.NewConfigGenerator(s.XDSServer.Cache)
 
 	grpcprom.EnableHandlingTimeHistogram()
@@ -286,6 +298,12 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	s.environment.Init()
 	if err := s.environment.InitNetworksManager(s.XDSServer); err != nil {
 		return nil, err
+	}
+
+	if features.MultiRootMesh {
+		// Initialize trust bundle after mesh config which it depends on
+		s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
+		e.TrustBundle = s.workloadTrustBundle
 	}
 
 	// Options based on the current 'defaults' in istio.
@@ -373,7 +391,12 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 	// so we build it later.
 	if s.kubeClient != nil {
 		authenticators = append(authenticators,
-			kubeauth.NewKubeJWTAuthenticator(s.environment.Watcher, s.kubeClient.Kube(), s.clusterID, s.multiclusterController.GetRemoteKubeClient))
+			kubeauth.NewKubeJWTAuthenticator(
+				s.environment.Watcher,
+				s.kubeClient.Kube(),
+				s.clusterID,
+				args.RegistryOptions.KubeOptions.ClusterAliases,
+				s.multiclusterController))
 	}
 	if len(features.TrustedGatewayCIDR) > 0 {
 		authenticators = append(authenticators, &authenticate.XfccAuthenticator{})
@@ -512,12 +535,11 @@ func (s *Server) initSDSServer() {
 		log.Warnf("skipping Kubernetes credential reader; PILOT_ENABLE_XDS_IDENTITY_CHECK must be set to true for this feature.")
 	} else {
 		creds := kubecredentials.NewMulticluster(s.clusterID, s.multiclusterController)
-		creds.AddSecretHandler(func(name string, namespace string) {
+		creds.AddSecretHandler(func(k kind.Kind, name string, namespace string) {
 			s.XDSServer.ConfigUpdate(&model.PushRequest{
 				Full:           false,
-				ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.Secret, Name: name, Namespace: namespace}),
-
-				Reason: model.NewReasonStats(model.SecretTrigger),
+				ConfigsUpdated: sets.New(model.ConfigKey{Kind: k, Name: name, Namespace: namespace}),
+				Reason:         model.NewReasonStats(model.SecretTrigger),
 			})
 		})
 		s.environment.CredentialsController = creds
@@ -758,6 +780,7 @@ func (s *Server) initSecureDiscoveryService(args *PilotArgs, trustDomain string)
 		return nil
 	}
 	log.Info("initializing secure discovery service")
+
 	cfg := &tls.Config{
 		GetCertificate: s.getIstiodCertificate,
 		ClientAuth:     tls.VerifyClientCertIfGiven,
@@ -885,7 +908,7 @@ func (s *Server) initRegistryEventHandlers() {
 			}
 			pushReq := &model.PushRequest{
 				Full:           true,
-				ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.MustFromGVK(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
+				ConfigsUpdated: sets.New(model.ConfigKey{Kind: gvk.MustToKind(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
 				Reason:         model.NewReasonStats(model.ConfigUpdate),
 			}
 			s.XDSServer.ConfigUpdate(pushReq)
@@ -905,29 +928,12 @@ func (s *Server) initRegistryEventHandlers() {
 			if schema.GroupVersionKind() == gvk.WorkloadGroup {
 				continue
 			}
+			// Already handled by gateway controller
+			if schema.GroupVersionKind().Group == gvk.KubernetesGateway.Group {
+				continue
+			}
 
 			s.configController.RegisterEventHandler(schema.GroupVersionKind(), configHandler)
-		}
-		if s.environment.GatewayAPIController != nil {
-			s.environment.GatewayAPIController.RegisterEventHandler(gvk.Namespace, func(config.Config, config.Config, model.Event) {
-				s.XDSServer.ConfigUpdate(&model.PushRequest{
-					Full:   true,
-					Reason: model.NewReasonStats(model.NamespaceUpdate),
-				})
-			})
-			s.environment.GatewayAPIController.RegisterEventHandler(gvk.Secret, func(_ config.Config, gw config.Config, _ model.Event) {
-				s.XDSServer.ConfigUpdate(&model.PushRequest{
-					Full: true,
-					ConfigsUpdated: map[model.ConfigKey]struct{}{
-						{
-							Kind:      kind.KubernetesGateway,
-							Name:      gw.Name,
-							Namespace: gw.Namespace,
-						}: {},
-					},
-					Reason: model.NewReasonStats(model.SecretTrigger),
-				})
-			})
 		}
 	}
 }
@@ -981,7 +987,7 @@ func (s *Server) initIstiodCerts(args *PilotArgs, host string) error {
 		// choose a different source.
 		// The feature didn't work for few releases, but a skip-version upgrade may still
 		// encounter it.
-		log.Fatalf("PILOT_CERT_PROVIDER=kubernetes is no longer supported by upstream K8S")
+		log.Fatal("PILOT_CERT_PROVIDER=kubernetes is no longer supported by upstream K8S")
 	} else if strings.HasPrefix(features.PilotCertProvider, constants.CertProviderKubernetesSignerPrefix) {
 		log.Infof("initializing Istiod DNS certificates using K8S RA:%s  host: %s, custom host: %s", features.PilotCertProvider,
 			host, features.IstiodServiceCustomHost)
@@ -1152,11 +1158,14 @@ func (s *Server) initControllers(args *PilotArgs) error {
 }
 
 func (s *Server) initNodeUntaintController(args *PilotArgs) {
+	if s.kubeClient == nil {
+		return
+	}
 	s.addStartFunc("nodeUntainter controller", func(stop <-chan struct{}) error {
 		go leaderelection.
 			NewLeaderElection(args.Namespace, args.PodName, leaderelection.NodeUntaintController, args.Revision, s.kubeClient).
 			AddRunFunction(func(leaderStop <-chan struct{}) {
-				nodeUntainter := untaint.NewNodeUntainter(leaderStop, s.kubeClient, args.CniNamespace, args.Namespace)
+				nodeUntainter := untaint.NewNodeUntainter(leaderStop, s.kubeClient, args.CniNamespace, args.Namespace, args.KrtDebugger)
 				nodeUntainter.Run(leaderStop)
 			}).Run(stop)
 		return nil
@@ -1164,6 +1173,9 @@ func (s *Server) initNodeUntaintController(args *PilotArgs) {
 }
 
 func (s *Server) initIPAutoallocateController(args *PilotArgs) {
+	if s.kubeClient == nil {
+		return
+	}
 	s.addStartFunc("ip autoallocate controller", func(stop <-chan struct{}) error {
 		go leaderelection.
 			NewLeaderElection(args.Namespace, args.PodName, leaderelection.IPAutoallocateController, args.Revision, s.kubeClient).
@@ -1228,11 +1240,6 @@ func (s *Server) shouldStartNsController() bool {
 		return false
 	}
 
-	// For Kubernetes CA, we don't distribute it; it is mounted in all pods by Kubernetes.
-	// This is never called - isK8SSigning is true.
-	if features.PilotCertProvider == constants.CertProviderKubernetes {
-		return false
-	}
 	// For no CA we don't distribute it either, as there is no cert
 	if features.PilotCertProvider == constants.CertProviderNone {
 		return false
@@ -1274,6 +1281,7 @@ func (s *Server) initMeshHandlers(changeHandler func(_ *meshconfig.MeshConfig)) 
 		s.XDSServer.ConfigUpdate(&model.PushRequest{
 			Full:   true,
 			Reason: model.NewReasonStats(model.GlobalUpdate),
+			Forced: true,
 		})
 	})
 }
@@ -1307,6 +1315,7 @@ func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
 		pushReq := &model.PushRequest{
 			Full:   true,
 			Reason: model.NewReasonStats(model.GlobalUpdate),
+			Forced: true,
 		}
 		s.XDSServer.ConfigUpdate(pushReq)
 	})

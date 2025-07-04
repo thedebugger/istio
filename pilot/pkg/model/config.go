@@ -94,19 +94,6 @@ func ConfigNamesOfKind(configs sets.Set[ConfigKey], kind kind.Kind) sets.String 
 	return ret
 }
 
-// ConfigNameOfKind extracts config names of the specified kind.
-func ConfigNameOfKind(configs map[ConfigKey]struct{}, kind kind.Kind) sets.String {
-	ret := sets.New[string]()
-
-	for conf := range configs {
-		if conf.Kind == kind {
-			ret.Insert(conf.Name)
-		}
-	}
-
-	return ret
-}
-
 // ConfigStore describes a set of platform agnostic APIs that must be supported
 // by the underlying platform to store and retrieve Istio configuration.
 //
@@ -306,44 +293,6 @@ func mostSpecificHostWildcardMatch[V any](needle string, wildcard map[host.Name]
 				matchValue = wildcard[h]
 				found = true
 			} else if host.MoreSpecific(h, matchHost) {
-				matchHost = h
-				matchValue = v
-			}
-		}
-	}
-
-	return matchHost, matchValue, found
-}
-
-// OldestMatchingHost returns the oldest matching host for a given needle (whether specific or wildcarded)
-func OldestMatchingHost(needle host.Name, specific map[host.Name]config.Config, wildcard map[host.Name]config.Config) (host.Name, config.Config, bool) {
-	// The algorithm is a bit different than MostSpecificHostMatch. We can't short-circuit on the first
-	// match, regardless of whether it's specific or wildcarded. This is because we have to check the timestamp
-	// of all configs to make sure there's not an older matching one that we should use instead.
-
-	if needle.IsWildCarded() {
-		needle = needle[1:]
-	}
-
-	found := false
-	var matchHost host.Name
-	var matchValue config.Config
-	// exact match first
-	if v, ok := specific[needle]; ok {
-		found = true
-		matchHost = needle
-		matchValue = v
-	}
-
-	// Even if we have a match, we still need to check the wildcard map to see if there's an older match
-	for h, v := range wildcard {
-		if strings.HasSuffix(string(needle), string(h[1:])) {
-			if !found {
-				matchHost = h
-				matchValue = wildcard[h]
-				found = true
-			} else if h.Matches(matchHost) && v.GetCreationTimestamp().Before(matchValue.GetCreationTimestamp()) {
-				// Only replace if the new match is more specific and older than the current match
 				matchHost = h
 				matchValue = v
 			}

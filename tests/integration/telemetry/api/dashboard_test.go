@@ -156,7 +156,6 @@ func TestDashboard(t *testing.T) {
 			// all in a single scrape which can lead to `rate()` not behaving correctly.
 			go setupDashboardTest(c.Done())
 			for _, d := range dashboards {
-				d := d
 				t.NewSubTest(d.name).Run(func(t framework.TestContext) {
 					for _, cl := range t.Clusters() {
 						if !cl.IsPrimary() && d.requirePrimary {
@@ -250,7 +249,7 @@ func checkMetric(cl cluster.Cluster, p prometheus.Instance, query string, exclud
 }
 
 const gatewayConfig = `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: echo-gateway
@@ -271,7 +270,7 @@ spec:
     hosts:
     - "*"
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: echo

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"k8s.io/client-go/rest"
 
@@ -96,7 +97,7 @@ func (i *installer) Install(c cluster.Cluster, args installArgs) error {
 
 	// Generate the manifest YAML, so that we can uninstall it in Close.
 	var stdOut, stdErr bytes.Buffer
-	if err := mesh.ManifestGenerate(kubeClient, &mesh.RootArgs{}, &mesh.ManifestGenerateArgs{
+	if err := mesh.ManifestGenerate(kubeClient, &mesh.ManifestGenerateArgs{
 		InFilenames:   iArgs.InFilenames,
 		Set:           iArgs.Set,
 		Force:         iArgs.Force,
@@ -114,6 +115,7 @@ func (i *installer) Install(c cluster.Cluster, args installArgs) error {
 
 	// Actually run the install command
 	iArgs.SkipConfirmation = true
+	iArgs.ReadinessTimeout = time.Minute * 5
 
 	componentName := args.ComponentName
 	if len(componentName) == 0 {
@@ -140,6 +142,7 @@ func (i *installer) Close(c cluster.Cluster) error {
 	if len(manifests) > 0 {
 		return i.ctx.ConfigKube(c).YAML("", removeCRDsSlice(manifests)).Delete()
 	}
+	scopes.Framework.Debugf("Deleting yaml on cluster %s: %+v", c.Name(), manifests)
 	return nil
 }
 
@@ -150,7 +153,7 @@ func (i *installer) Dump(resource.Context) {
 	}
 	for clusterName, manifests := range i.manifests {
 		clusterDir := path.Join(manifestsDir, clusterName)
-		if err := os.Mkdir(manifestsDir, 0o700); err != nil {
+		if err := os.Mkdir(clusterDir, 0o700); err != nil {
 			scopes.Framework.Errorf("Unable to create directory for dumping %s install manifests: %v", clusterName, err)
 		}
 		for i, manifest := range manifests {

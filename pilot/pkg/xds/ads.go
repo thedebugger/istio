@@ -147,8 +147,8 @@ func (s *DiscoveryServer) processRequest(req *discovery.DiscoveryRequest, con *C
 	// For now, don't let xDS piggyback debug requests start watchers.
 	if strings.HasPrefix(req.TypeUrl, v3.DebugType) {
 		return s.pushXds(con,
-			&model.WatchedResource{TypeUrl: req.TypeUrl, ResourceNames: req.ResourceNames},
-			&model.PushRequest{Full: true, Push: con.proxy.LastPushContext})
+			&model.WatchedResource{TypeUrl: req.TypeUrl, ResourceNames: sets.New(req.ResourceNames...)},
+			&model.PushRequest{Full: true, Push: con.proxy.LastPushContext, Forced: true})
 	}
 
 	shouldRespond, delta := xds.ShouldRespond(con.proxy, con.ID(), req)
@@ -164,8 +164,9 @@ func (s *DiscoveryServer) processRequest(req *discovery.DiscoveryRequest, con *C
 		// The usage of LastPushTime (rather than time.Now()), is critical here for correctness; This time
 		// is used by the XDS cache to determine if a entry is stale. If we use Now() with an old push context,
 		// we may end up overriding active cache entries with stale ones.
-		Start: con.proxy.LastPushTime,
-		Delta: delta,
+		Start:  con.proxy.LastPushTime,
+		Delta:  delta,
+		Forced: true,
 	}
 
 	// SidecarScope for the proxy may not have been updated based on this pushContext.
@@ -226,12 +227,7 @@ func (s *DiscoveryServer) Stream(stream DiscoveryStream) error {
 	}
 
 	// InitContext returns immediately if the context was already initialized.
-	if err = s.globalPushContext().InitContext(s.Env, nil, nil); err != nil {
-		// Error accessing the data - log and close, maybe a different pilot replica
-		// has more luck
-		log.Warnf("Error reading config %v", err)
-		return status.Error(codes.Unavailable, "error reading config")
-	}
+	s.globalPushContext().InitContext(s.Env, nil, nil)
 	con := newConnection(peerAddr, stream)
 	con.ids = ids
 	con.s = s
@@ -386,11 +382,13 @@ func (s *DiscoveryServer) initializeProxy(con *Connection) error {
 }
 
 func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.PushRequest) {
+	proxy.Lock()
+	defer proxy.Unlock()
 	var shouldResetGateway, shouldResetSidecarScope bool
 	// 1. If request == nil(initiation phase) or request.ConfigsUpdated == nil(global push), set proxy serviceTargets.
 	// 2. otherwise only set when svc update, this is for the case that a service may select the proxy
-	if request == nil || len(request.ConfigsUpdated) == 0 ||
-		model.HasConfigsOfKind(request.ConfigsUpdated, kind.ServiceEntry) {
+	if request == nil || request.Forced ||
+		proxy.ShouldUpdateServiceTargets(request.ConfigsUpdated) {
 		proxy.SetServiceTargets(s.Env.ServiceDiscovery)
 		// proxy.SetGatewaysForProxy depends on the serviceTargets,
 		// so when we reset serviceTargets, should reset gateway as well.
@@ -414,14 +412,14 @@ func (s *DiscoveryServer) computeProxyState(proxy *model.Proxy, request *model.P
 		shouldResetSidecarScope = true
 	} else {
 		push = request.Push
-		if len(request.ConfigsUpdated) == 0 {
+		if request.Forced {
 			shouldResetSidecarScope = true
 		}
 		for conf := range request.ConfigsUpdated {
 			switch conf.Kind {
-			case kind.ServiceEntry, kind.DestinationRule, kind.VirtualService, kind.Sidecar, kind.HTTPRoute, kind.TCPRoute, kind.TLSRoute, kind.GRPCRoute:
+			case kind.ServiceEntry, kind.DestinationRule, kind.VirtualService, kind.Sidecar:
 				shouldResetSidecarScope = true
-			case kind.Gateway, kind.KubernetesGateway, kind.GatewayClass, kind.ReferenceGrant:
+			case kind.Gateway:
 				shouldResetGateway = true
 			case kind.Ingress:
 				shouldResetSidecarScope = true
@@ -478,7 +476,8 @@ func (s *DiscoveryServer) pushConnection(con *Connection, pushEv *Event) error {
 		s.computeProxyState(con.proxy, pushRequest)
 	}
 
-	if !s.ProxyNeedsPush(con.proxy, pushRequest) {
+	pushRequest, needsPush := s.ProxyNeedsPush(con.proxy, pushRequest)
+	if !needsPush {
 		log.Debugf("Skipping push to %v, no updates required", con.ID())
 		return nil
 	}
@@ -543,6 +542,7 @@ func (s *DiscoveryServer) ProxyUpdate(clusterID cluster.ID, ip string) {
 		Push:   s.globalPushContext(),
 		Start:  time.Now(),
 		Reason: model.NewReasonStats(model.ProxyUpdate),
+		Forced: true,
 	})
 }
 
@@ -553,6 +553,7 @@ func AdsPushAll(s *DiscoveryServer) {
 		Full:   true,
 		Push:   s.globalPushContext(),
 		Reason: model.NewReasonStats(model.DebugTrigger),
+		Forced: true,
 	})
 }
 
@@ -618,7 +619,7 @@ func (conn *Connection) Clusters() []string {
 // watchedResourcesByOrder returns the ordered list of
 // watched resources for the proxy, ordered in accordance with known push order.
 func (conn *Connection) watchedResourcesByOrder() []*model.WatchedResource {
-	allWatched := conn.proxy.CloneWatchedResources()
+	allWatched := conn.proxy.ShallowCloneWatchedResources()
 	ordered := make([]*model.WatchedResource, 0, len(allWatched))
 	// first add all known types, in order
 	for _, tp := range PushOrder {

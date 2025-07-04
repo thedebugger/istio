@@ -31,7 +31,6 @@ import (
 	"go.uber.org/atomic"
 	"gomodules.xyz/jsonpatch/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/json"
@@ -43,16 +42,15 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
-	"istio.io/istio/pkg/queue"
-	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/util/sets"
 )
 
 var scope = log.RegisterScope("kube", "Kubernetes client messages")
@@ -71,14 +69,10 @@ type Client struct {
 	revision string
 
 	// kinds keeps track of all cache handlers for known types
-	kinds   map[config.GroupVersionKind]kclient.Untyped
+	kinds   map[config.GroupVersionKind]nsStore
 	kindsMu sync.RWMutex
-	queue   queue.Instance
 	// a flag indicates whether this client has been run, it is to prevent run queue twice
 	started *atomic.Bool
-
-	// handlers defines a list of event handlers per-type
-	handlers map[config.GroupVersionKind][]model.EventHandler
 
 	schemasByCRDName map[string]resource.Schema
 	client           kube.Client
@@ -86,6 +80,13 @@ type Client struct {
 
 	// namespacesFilter is only used to initiate filtered informer.
 	filtersByGVK map[config.GroupVersionKind]kubetypes.Filter
+	stop         chan struct{}
+}
+
+type nsStore struct {
+	collection krt.Collection[config.Config]
+	index      krt.Index[string, config.Config]
+	handlers   []krt.HandlerRegistration
 }
 
 type Option struct {
@@ -93,6 +94,7 @@ type Option struct {
 	DomainSuffix string
 	Identifier   string
 	FiltersByGVK map[config.GroupVersionKind]kubetypes.Filter
+	KrtDebugger  *krt.DebugHandler
 }
 
 var _ model.ConfigStoreController = &Client{}
@@ -112,31 +114,50 @@ func NewForSchemas(client kube.Client, opts Option, schemas collection.Schemas) 
 		name := fmt.Sprintf("%s.%s", s.Plural(), s.Group())
 		schemasByCRDName[name] = s
 	}
+
+	stop := make(chan struct{})
+
 	out := &Client{
 		domainSuffix:     opts.DomainSuffix,
 		schemas:          schemas,
 		schemasByCRDName: schemasByCRDName,
 		revision:         opts.Revision,
-		queue:            queue.NewQueue(1 * time.Second),
 		started:          atomic.NewBool(false),
-		kinds:            map[config.GroupVersionKind]kclient.Untyped{},
-		handlers:         map[config.GroupVersionKind][]model.EventHandler{},
+		kinds:            map[config.GroupVersionKind]nsStore{},
 		client:           client,
 		logger:           scope.WithLabels("controller", opts.Identifier),
 		filtersByGVK:     opts.FiltersByGVK,
+		stop:             stop,
 	}
 
+	kopts := krt.NewOptionsBuilder(stop, "crdclient", opts.KrtDebugger)
 	for _, s := range out.schemas.All() {
 		// From the spec: "Its name MUST be in the format <.spec.name>.<.spec.group>."
 		name := fmt.Sprintf("%s.%s", s.Plural(), s.Group())
-		out.addCRD(name)
+		out.addCRD(name, kopts)
 	}
 
 	return out
 }
 
 func (cl *Client) RegisterEventHandler(kind config.GroupVersionKind, handler model.EventHandler) {
-	cl.handlers[kind] = append(cl.handlers[kind], handler)
+	if c, ok := cl.kind(kind); ok {
+		c.handlers = append(c.handlers, c.collection.RegisterBatch(func(o []krt.Event[config.Config]) {
+			for _, event := range o {
+				switch event.Event {
+				case controllers.EventAdd:
+					handler(config.Config{}, *event.New, model.Event(event.Event))
+				case controllers.EventUpdate:
+					handler(*event.Old, *event.New, model.Event(event.Event))
+				case controllers.EventDelete:
+					handler(config.Config{}, *event.Old, model.Event(event.Event))
+				}
+			}
+		}, false))
+		return
+	}
+
+	cl.logger.Warnf("unknown type: %s", kind)
 }
 
 // Run the queue and all informers. Callers should  wait for HasSynced() before depending on results.
@@ -148,19 +169,19 @@ func (cl *Client) Run(stop <-chan struct{}) {
 
 	t0 := time.Now()
 	cl.logger.Infof("Starting Pilot K8S CRD controller")
-
 	if !kube.WaitForCacheSync("crdclient", stop, cl.informerSynced) {
 		cl.logger.Errorf("Failed to sync Pilot K8S CRD controller cache")
-		return
+	} else {
+		cl.logger.Infof("Pilot K8S CRD controller synced in %v", time.Since(t0))
 	}
-	cl.logger.Infof("Pilot K8S CRD controller synced in %v", time.Since(t0))
-	cl.queue.Run(stop)
+	<-stop
+	close(cl.stop)
 	cl.logger.Infof("controller terminated")
 }
 
 func (cl *Client) informerSynced() bool {
 	for gk, ctl := range cl.allKinds() {
-		if !ctl.HasSynced() {
+		if !ctl.collection.HasSynced() {
 			cl.logger.Infof("controller %q is syncing...", gk)
 			return false
 		}
@@ -169,7 +190,19 @@ func (cl *Client) informerSynced() bool {
 }
 
 func (cl *Client) HasSynced() bool {
-	return cl.queue.HasSynced()
+	for _, ctl := range cl.allKinds() {
+		if !ctl.collection.HasSynced() {
+			return false
+		}
+
+		for _, h := range ctl.handlers {
+			if !h.HasSynced() {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // Schemas for the store
@@ -184,14 +217,21 @@ func (cl *Client) Get(typ config.GroupVersionKind, name, namespace string) *conf
 		cl.logger.Warnf("unknown type: %s", typ)
 		return nil
 	}
-	obj := h.Get(name, namespace)
+
+	var key string
+	if namespace == "" {
+		key = name
+	} else {
+		key = namespace + "/" + name
+	}
+
+	obj := h.collection.GetKey(key)
 	if obj == nil {
 		cl.logger.Debugf("couldn't find %s/%s in informer index", namespace, name)
 		return nil
 	}
 
-	cfg := TranslateObject(obj, typ, cl.domainSuffix)
-	return &cfg
+	return obj
 }
 
 // Create implements store interface
@@ -257,24 +297,20 @@ func (cl *Client) List(kind config.GroupVersionKind, namespace string) []config.
 		return nil
 	}
 
-	list := h.List(namespace, klabels.Everything())
-
-	out := make([]config.Config, 0, len(list))
-	for _, item := range list {
-		cfg := TranslateObject(item, kind, cl.domainSuffix)
-		out = append(out, cfg)
+	if namespace == metav1.NamespaceAll {
+		return h.collection.List()
 	}
 
-	return out
+	return h.index.Lookup(namespace)
 }
 
-func (cl *Client) allKinds() map[config.GroupVersionKind]kclient.Untyped {
+func (cl *Client) allKinds() map[config.GroupVersionKind]nsStore {
 	cl.kindsMu.RLock()
 	defer cl.kindsMu.RUnlock()
 	return maps.Clone(cl.kinds)
 }
 
-func (cl *Client) kind(r config.GroupVersionKind) (kclient.Untyped, bool) {
+func (cl *Client) kind(r config.GroupVersionKind) (nsStore, bool) {
 	cl.kindsMu.RLock()
 	defer cl.kindsMu.RUnlock()
 	ch, ok := cl.kinds[r]
@@ -327,7 +363,7 @@ func genPatchBytes(oldRes, modRes runtime.Object, patchType types.PatchType) ([]
 	}
 }
 
-func (cl *Client) addCRD(name string) {
+func (cl *Client) addCRD(name string, opts krt.OptionsBuilder) {
 	cl.logger.Debugf("adding CRD %q", name)
 	s, f := cl.schemasByCRDName[name]
 	if !f {
@@ -343,6 +379,11 @@ func (cl *Client) addCRD(name string) {
 		cl.logger.Debugf("added resource that already exists: %v", resourceGVK)
 		return
 	}
+	translateFunc, f := translationMap[resourceGVK]
+	if !f {
+		cl.logger.Errorf("translation function for %v not found", resourceGVK)
+		return
+	}
 
 	// We need multiple filters:
 	// 1. Is it in this revision?
@@ -350,6 +391,7 @@ func (cl *Client) addCRD(name string) {
 	// 3. Does it have a special per-type object filter?
 	var extraFilter func(obj any) bool
 	var transform func(obj any) (any, error)
+	var fieldSelector string
 	if of, f := cl.filtersByGVK[resourceGVK]; f {
 		if of.ObjectFilter != nil {
 			extraFilter = of.ObjectFilter.Filter
@@ -357,15 +399,20 @@ func (cl *Client) addCRD(name string) {
 		if of.ObjectTransform != nil {
 			transform = of.ObjectTransform
 		}
+		fieldSelector = of.FieldSelector
 	}
 
 	var namespaceFilter kubetypes.DynamicObjectFilter
 	if !s.IsClusterScoped() {
-		namespaceFilter = kube.FilterIfEnhancedFilteringEnabled(cl.client)
+		namespaceFilter = cl.client.ObjectFilter()
 	}
 	filter := kubetypes.Filter{
-		ObjectFilter:    composeFilters(namespaceFilter, cl.inRevision, extraFilter),
+		ObjectFilter:    kubetypes.ComposeFilters(namespaceFilter, cl.inRevision, extraFilter),
 		ObjectTransform: transform,
+		FieldSelector:   fieldSelector,
+	}
+	if resourceGVK == gvk.KubernetesGateway {
+		filter.ObjectFilter = kubetypes.ComposeFilters(namespaceFilter, extraFilter)
 	}
 
 	var kc kclient.Untyped
@@ -380,66 +427,23 @@ func (cl *Client) addCRD(name string) {
 		)
 	}
 
-	kind := s.Kind()
-	kc.AddEventHandler(controllers.EventHandler[controllers.Object]{
-		AddFunc: func(obj controllers.Object) {
-			incrementEvent(kind, "add")
-			cl.queue.Push(func() error {
-				cl.onEvent(resourceGVK, nil, obj, model.EventAdd)
-				return nil
-			})
+	wrappedClient := krt.WrapClient(kc, opts.WithName("informer/"+resourceGVK.Kind)...)
+	collection := krt.MapCollection(wrappedClient, func(obj controllers.Object) config.Config {
+		cfg := translateFunc(obj)
+		cfg.Domain = cl.domainSuffix
+		return cfg
+	}, opts.WithName("collection/"+resourceGVK.Kind)...)
+	index := krt.NewNamespaceIndex(collection)
+	cl.kinds[resourceGVK] = nsStore{
+		collection: collection,
+		index:      index,
+		handlers: []krt.HandlerRegistration{
+			collection.RegisterBatch(func(o []krt.Event[config.Config]) {
+				for _, event := range o {
+					incrementEvent(resourceGVK.Kind, event.Event.String())
+				}
+			}, false),
 		},
-		UpdateFunc: func(old, cur controllers.Object) {
-			incrementEvent(kind, "update")
-			cl.queue.Push(func() error {
-				cl.onEvent(resourceGVK, old, cur, model.EventUpdate)
-				return nil
-			})
-		},
-		DeleteFunc: func(obj controllers.Object) {
-			incrementEvent(kind, "delete")
-			cl.queue.Push(func() error {
-				cl.onEvent(resourceGVK, nil, obj, model.EventDelete)
-				return nil
-			})
-		},
-	})
-
-	cl.kinds[resourceGVK] = kc
-}
-
-// composedFilter offers a way to join multiple different object filters into a single one
-type composedFilter struct {
-	// The primary filter, which has a handler. Optional
-	filter kubetypes.DynamicObjectFilter
-	// Secondary filters (no handler allowed)
-	extra []func(obj any) bool
-}
-
-func (f composedFilter) Filter(obj any) bool {
-	for _, filter := range f.extra {
-		if !filter(obj) {
-			return false
-		}
-	}
-	if f.filter != nil {
-		return f.filter.Filter(obj)
-	}
-	return true
-}
-
-func (f composedFilter) AddHandler(fn func(selected, deselected sets.String)) {
-	if f.filter != nil {
-		f.filter.AddHandler(fn)
-	}
-}
-
-func composeFilters(filter kubetypes.DynamicObjectFilter, extra ...func(obj any) bool) kubetypes.DynamicObjectFilter {
-	return composedFilter{
-		filter: filter,
-		extra: slices.FilterInPlace(extra, func(f func(obj any) bool) bool {
-			return f != nil
-		}),
 	}
 }
 
@@ -449,22 +453,4 @@ func (cl *Client) inRevision(obj any) bool {
 		return false
 	}
 	return config.LabelsInRevision(object.GetLabels(), cl.revision)
-}
-
-func (cl *Client) onEvent(resourceGVK config.GroupVersionKind, old controllers.Object, curr controllers.Object, event model.Event) {
-	currItem := controllers.ExtractObject(curr)
-	if currItem == nil {
-		return
-	}
-
-	currConfig := TranslateObject(currItem, resourceGVK, cl.domainSuffix)
-
-	var oldConfig config.Config
-	if old != nil {
-		oldConfig = TranslateObject(old, resourceGVK, cl.domainSuffix)
-	}
-
-	for _, f := range cl.handlers[resourceGVK] {
-		f(oldConfig, currConfig, event)
-	}
 }

@@ -47,16 +47,21 @@ func NewMock(t test.Failer, inputs []any) *MockCollection {
 }
 
 func GetMockCollection[T any](mc *MockCollection) krt.Collection[T] {
-	return krt.NewStaticCollection(extractType[T](&mc.inputs))
+	return krt.NewStaticCollection(
+		nil, // Always synced
+		extractType[T](&mc.inputs),
+		krt.WithStop(test.NewStop(mc.t)),
+		krt.WithDebugging(krt.GlobalDebugHandler),
+	)
 }
 
 func GetMockSingleton[T any](mc *MockCollection) krt.StaticSingleton[T] {
 	t := extractType[T](&mc.inputs)
 	if len(t) > 1 {
 		mc.t.Helper()
-		mc.t.Fatalf("multiple types returned")
+		mc.t.Fatal("multiple types returned")
 	}
-	return krt.NewStatic(slices.First(t))
+	return krt.NewStatic(slices.First(t), true)
 }
 
 func extractType[T any](items *[]any) []T {
@@ -73,4 +78,8 @@ func extractType[T any](items *[]any) []T {
 
 	*items = unmatched
 	return matched
+}
+
+func Options(t test.Failer) krt.OptionsBuilder {
+	return krt.NewOptionsBuilder(test.NewStop(t), "test", krt.GlobalDebugHandler)
 }

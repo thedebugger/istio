@@ -44,6 +44,7 @@ func TestTagWatcher(t *testing.T) {
 	track.WaitOrdered("revision")
 	assert.Equal(t, tw.GetMyTags(), sets.New("revision"))
 
+	whs.Create(makeRevision("revision"))
 	whs.Create(makeTag("revision", "tag-foo"))
 	track.WaitOrdered("revision,tag-foo")
 	assert.Equal(t, tw.GetMyTags(), sets.New("revision", "tag-foo"))
@@ -72,7 +73,19 @@ func makeTag(revision string, tg string) *admissionregistrationv1.MutatingWebhoo
 			Name: tg,
 			Labels: map[string]string{
 				label.IoIstioRev.Name: revision,
-				"istio.io/tag":        tg,
+				label.IoIstioTag.Name: tg,
+			},
+		},
+	}
+}
+
+func makeRevision(revision string) *admissionregistrationv1.MutatingWebhookConfiguration {
+	return &admissionregistrationv1.MutatingWebhookConfiguration{
+		TypeMeta: metav1.TypeMeta{},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: revision,
+			Labels: map[string]string{
+				label.IoIstioRev.Name: revision,
 			},
 		},
 	}

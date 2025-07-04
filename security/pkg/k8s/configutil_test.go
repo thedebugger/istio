@@ -94,7 +94,7 @@ func TestUpdateDataInConfigMap(t *testing.T) {
 				}
 			}
 			fake.ClearActions()
-			err := updateDataInConfigMap(configmaps, tc.existingConfigMap, []byte(caBundle))
+			err := updateDataInConfigMap(configmaps, tc.existingConfigMap, constants.CACertNamespaceConfigMapDataName, []byte(caBundle))
 			if err != nil && err.Error() != tc.expectedErr {
 				t.Errorf("actual error (%s) different from expected error (%s).", err.Error(), tc.expectedErr)
 			}
@@ -188,6 +188,18 @@ func TestInsertDataToConfigMap(t *testing.T) {
 			clientMod:   createConfigMapNamespaceDeletingClient,
 		},
 		{
+			name:              "creation: namespace is not found",
+			existingConfigMap: nil,
+			caBundle:          caBundle,
+			meta:              metav1.ObjectMeta{Namespace: namespaceName, Name: configMapName},
+			expectedActions: []ktesting.Action{
+				ktesting.NewCreateAction(gvr, namespaceName, createConfigMap(namespaceName, configMapName,
+					map[string]string{dataName: "test-data"})),
+			},
+			expectedErr: "",
+			clientMod:   createConfigMapNamespaceDeletedClient,
+		},
+		{
 			name:              "creation: namespace is forbidden",
 			existingConfigMap: nil,
 			caBundle:          caBundle,
@@ -214,7 +226,7 @@ func TestInsertDataToConfigMap(t *testing.T) {
 			}
 			kc.RunAndWait(test.NewStop(t))
 			fake.ClearActions()
-			err := InsertDataToConfigMap(configmaps, tc.meta, tc.caBundle)
+			err := InsertDataToConfigMap(configmaps, tc.meta, constants.CACertNamespaceConfigMapDataName, tc.caBundle)
 			if err != nil && err.Error() != tc.expectedErr {
 				t.Errorf("actual error (%s) different from expected error (%s).", err.Error(), tc.expectedErr)
 			}
@@ -259,6 +271,17 @@ func createConfigMapNamespaceDeletingClient(client *fake.Clientset) {
 		Message: fmt.Sprintf("namespace %s is being terminated", namespaceName),
 		Field:   "metadata.namespace",
 	})
+	client.PrependReactor("create", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, &v1.ConfigMap{}, err
+	})
+}
+
+func createConfigMapNamespaceDeletedClient(client *fake.Clientset) {
+	client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, &v1.ConfigMap{}, errors.NewNotFound(v1.Resource("configmaps"), configMapName)
+	})
+
+	err := errors.NewNotFound(v1.Resource("namespaces"), namespaceName)
 	client.PrependReactor("create", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
 		return true, &v1.ConfigMap{}, err
 	})

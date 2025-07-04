@@ -16,37 +16,32 @@ package nodeagent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 
-	pconstants "istio.io/istio/cni/pkg/constants"
-	"istio.io/istio/cni/pkg/ipset"
-	"istio.io/istio/cni/pkg/iptables"
 	"istio.io/istio/cni/pkg/scopes"
-	"istio.io/istio/cni/pkg/util"
 	"istio.io/istio/pkg/kube"
 )
+
+const defaultZTunnelKeepAliveCheckInterval = 5 * time.Second
 
 var log = scopes.CNIAgent
 
 type MeshDataplane interface {
-	// called first, (even before Start()).
-	ConstructInitialSnapshot(ambientPods []*corev1.Pod) error
+	// MUST be called first, (even before Start()).
+	ConstructInitialSnapshot(existingAmbientPods []*corev1.Pod) error
 	Start(ctx context.Context)
 
-	//	IsPodInMesh(ctx context.Context, pod *metav1.ObjectMeta, netNs string) (bool, error)
 	AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs []netip.Addr, netNs string) error
 	RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error
 
-	Stop()
+	Stop(skipCleanup bool)
 }
 
 type Server struct {
@@ -67,51 +62,19 @@ func NewServer(ctx context.Context, ready *atomic.Value, pluginSocket string, ar
 		return nil, fmt.Errorf("error initializing kube client: %w", err)
 	}
 
-	cfg := &iptables.Config{
-		RestoreFormat: true,
-		RedirectDNS:   args.DNSCapture,
-		EnableIPv6:    args.EnableIPv6,
-	}
-
-	log.Debug("creating ipsets in the node netns")
-	set, err := createHostsideProbeIpset(cfg.EnableIPv6)
-	if err != nil {
-		return nil, fmt.Errorf("error initializing hostside probe ipset: %w", err)
-	}
-
-	podNsMap := newPodNetnsCache(openNetnsInRoot(pconstants.HostMountsPath))
-	ztunnelServer, err := newZtunnelServer(args.ServerSocket, podNsMap)
-	if err != nil {
-		return nil, fmt.Errorf("error initializing the ztunnel server: %w", err)
-	}
-
-	hostIptables, podIptables, err := iptables.NewIptablesConfigurator(cfg, realDependenciesHost(), realDependenciesInpod(), iptables.RealNlDeps())
-	if err != nil {
-		return nil, fmt.Errorf("error configuring iptables: %w", err)
-	}
-
-	// Create hostprobe rules now, in the host netns
-	hostIptables.DeleteHostRules()
-
-	if err := hostIptables.CreateHostRulesForHealthChecks(&HostProbeSNATIP, &HostProbeSNATIPV6); err != nil {
-		return nil, fmt.Errorf("error initializing the host rules for health checks: %w", err)
-	}
-
-	podNetns := NewPodNetnsProcFinder(os.DirFS(filepath.Join(pconstants.HostMountsPath, "proc")))
-	netServer := newNetServer(ztunnelServer, podNsMap, hostIptables, podIptables, podNetns, set)
-
-	// Set some defaults
 	s := &Server{
 		ctx:        ctx,
 		kubeClient: client,
 		isReady:    ready,
-		dataplane: &meshDataplane{
-			kubeClient: client.Kube(),
-			netServer:  netServer,
-		},
 	}
+
+	s.dataplane, err = initMeshDataplane(client, args)
+	if err != nil {
+		return nil, fmt.Errorf("error initializing mesh dataplane: %w", err)
+	}
+
 	s.NotReady()
-	s.handlers = setupHandlers(s.ctx, s.kubeClient, s.dataplane, args.SystemNamespace)
+	s.handlers = setupHandlers(s.ctx, s.kubeClient, s.dataplane, args.SystemNamespace, args.EnablementSelector)
 
 	cniServer := startCniPluginServer(ctx, pluginSocket, s.handlers, s.dataplane)
 	err = cniServer.Start()
@@ -131,6 +94,45 @@ func (s *Server) NotReady() {
 	s.isReady.Store(false)
 }
 
+func (s *Server) Start() {
+	log.Info("CNI ambient server starting")
+	s.kubeClient.RunAndWait(s.ctx.Done())
+	log.Info("CNI ambient server kubeclient started")
+	pods := s.handlers.GetActiveAmbientPodSnapshot()
+	err := s.dataplane.ConstructInitialSnapshot(pods)
+	// Start the informer handlers FIRST, before we snapshot.
+	// They will keep the (mutex'd) snapshot cache synced.
+	s.handlers.Start()
+	if err != nil {
+		log.Warnf("failed to construct initial snapshot: %v", err)
+	}
+	// Start accepting ztunnel connections
+	// (and send current snapshot when we get one)
+	s.dataplane.Start(s.ctx)
+	// Everything (informer handlers, snapshot, zt server) ready to go
+	log.Info("CNI ambient server marking ready")
+	s.Ready()
+}
+
+func (s *Server) Stop(skipCleanup bool) {
+	s.cniServerStopFunc()
+	s.dataplane.Stop(skipCleanup)
+}
+
+func (s *Server) ShouldStopForUpgrade(selfName, selfNamespace string) bool {
+	dsName := fmt.Sprintf("%s-node", selfName)
+	cniDS, err := s.kubeClient.Kube().AppsV1().DaemonSets(selfNamespace).Get(context.Background(), dsName, metav1.GetOptions{})
+	log.Debugf("Daemonset %s has deletion timestamp?: %+v", dsName, cniDS.DeletionTimestamp)
+	if err == nil && cniDS != nil && cniDS.DeletionTimestamp == nil {
+		log.Infof("terminating, but parent DS %s is still present, this is an upgrade, leaving plugin in place", dsName)
+		return true
+	}
+
+	// If the DS is gone, it's definitely not an upgrade, so carry on like normal.
+	log.Infof("parent DS %s is gone or marked for deletion, this is not an upgrade, shutting down normally %s", dsName, err)
+	return false
+}
+
 // buildKubeClient creates the kube client
 func buildKubeClient(kubeConfig string) (kube.Client, error) {
 	// Used by validation
@@ -148,92 +150,4 @@ func buildKubeClient(kubeConfig string) (kube.Client, error) {
 	}
 
 	return client, nil
-}
-
-// createHostsideProbeIpset creates an ipset. This is designed to be called from the host netns.
-// Note that if the ipset already exist by name, Create will not return an error.
-//
-// We will unconditionally flush our set before use here, so it shouldn't matter.
-func createHostsideProbeIpset(isV6 bool) (ipset.IPSet, error) {
-	linDeps := ipset.RealNlDeps()
-	probeSet, err := ipset.NewIPSet(iptables.ProbeIPSet, isV6, linDeps)
-	if err != nil {
-		return probeSet, err
-	}
-	probeSet.Flush()
-	return probeSet, nil
-}
-
-func (s *Server) Start() {
-	log.Info("CNI ambient server starting")
-	s.kubeClient.RunAndWait(s.ctx.Done())
-	log.Info("CNI ambient server kubeclient started")
-	pods := s.handlers.GetActiveAmbientPodSnapshot()
-	err := s.dataplane.ConstructInitialSnapshot(pods)
-	if err != nil {
-		log.Warnf("failed to construct initial snapshot: %v", err)
-	}
-
-	log.Info("CNI ambient server marking ready")
-	s.Ready()
-	s.dataplane.Start(s.ctx)
-	s.handlers.Start()
-}
-
-func (s *Server) Stop() {
-	log.Info("CNI ambient server terminating, cleaning up node net rules")
-
-	s.cniServerStopFunc()
-	s.dataplane.Stop()
-}
-
-type meshDataplane struct {
-	kubeClient kubernetes.Interface
-	netServer  MeshDataplane
-}
-
-func (s *meshDataplane) Start(ctx context.Context) {
-	s.netServer.Start(ctx)
-}
-
-func (s *meshDataplane) Stop() {
-	s.netServer.Stop()
-}
-
-func (s *meshDataplane) ConstructInitialSnapshot(ambientPods []*corev1.Pod) error {
-	return s.netServer.ConstructInitialSnapshot(ambientPods)
-}
-
-func (s *meshDataplane) AddPodToMesh(ctx context.Context, pod *corev1.Pod, podIPs []netip.Addr, netNs string) error {
-	var retErr error
-	err := s.netServer.AddPodToMesh(ctx, pod, podIPs, netNs)
-	if err != nil {
-		log.Errorf("failed to add pod to ztunnel: %v", err)
-		if !errors.Is(err, ErrPartialAdd) {
-			return err
-		}
-		retErr = err
-	}
-
-	log.Debugf("annotating pod %s", pod.Name)
-	if err := util.AnnotateEnrolledPod(s.kubeClient, &pod.ObjectMeta); err != nil {
-		log.Errorf("failed to annotate pod enrollment: %v", err)
-		// don't return error here, as this is purely informational.
-	}
-	return retErr
-}
-
-func (s *meshDataplane) RemovePodFromMesh(ctx context.Context, pod *corev1.Pod, isDelete bool) error {
-	log := log.WithLabels("ns", pod.Namespace, "name", pod.Name)
-	err := s.netServer.RemovePodFromMesh(ctx, pod, isDelete)
-	if err != nil {
-		log.Errorf("failed to remove pod from mesh: %v", err)
-		return err
-	}
-	log.Debug("removing annotation from pod")
-	err = util.AnnotateUnenrollPod(s.kubeClient, &pod.ObjectMeta)
-	if err != nil {
-		log.Errorf("failed to annotate pod unenrollment: %v", err)
-	}
-	return err
 }

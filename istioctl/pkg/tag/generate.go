@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	admitv1 "k8s.io/api/admissionregistration/v1"
@@ -29,18 +30,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 
 	"istio.io/istio/operator/pkg/helm"
+	"istio.io/istio/operator/pkg/render"
+	"istio.io/istio/operator/pkg/values"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/maps"
 )
 
 const (
-	IstioTagLabel       = "istio.io/tag"
 	DefaultRevisionName = "default"
-
-	defaultChart            = "default"
-	pilotDiscoveryChart     = "istio-control/istio-discovery"
-	revisionTagTemplateName = "revision-tags.yaml"
-	vwhTemplateName         = "validatingwebhook.yaml"
 
 	istioInjectionWebhookSuffix = "sidecar-injector.istio.io"
 
@@ -51,6 +48,7 @@ const (
 
 // tagWebhookConfig holds config needed to render a tag webhook.
 type tagWebhookConfig struct {
+	WebHookService string
 	Tag            string
 	Revision       string
 	URL            string
@@ -61,6 +59,8 @@ type tagWebhookConfig struct {
 	Annotations    map[string]string
 	// FailurePolicy records the failure policy to use for the webhook.
 	FailurePolicy map[string]*admitv1.FailurePolicyType
+	// ReinvocationPolicy records the reinvocation policy to use for the webhook.
+	ReinvocationPolicy string
 }
 
 // GenerateOptions is the group of options needed to generate a tag webhook.
@@ -151,8 +151,8 @@ func Generate(ctx context.Context, client kube.Client, opts *GenerateOptions, is
 			return "", fmt.Errorf("failed to create validating webhook: %w", err)
 		}
 		tagWhYAML = fmt.Sprintf(`%s
-%s
-%s`, tagWhYAML, helm.YAMLSeparator, vwhYAML)
+---
+%s`, tagWhYAML, vwhYAML)
 	}
 
 	return tagWhYAML, nil
@@ -200,25 +200,29 @@ func Create(client kube.CLIClient, manifests, ns string) error {
 
 // generateValidatingWebhook renders a validating webhook configuration from the given tagWebhookConfig.
 func generateValidatingWebhook(config *tagWebhookConfig, opts *GenerateOptions) (string, error) {
-	r := helm.NewHelmRenderer(opts.ManifestsPath, defaultChart, "Pilot", config.IstioNamespace, nil)
-
-	if err := r.Run(); err != nil {
-		return "", fmt.Errorf("failed running Helm renderer: %v", err)
+	vals := values.Map{
+		"spec": values.Map{
+			"installPackagePath": opts.ManifestsPath,
+			"values": values.Map{
+				"revision": config.Revision,
+				"base":     values.Map{"validationURL": config.URL},
+				"global":   values.Map{"istioNamespace": config.IstioNamespace},
+			},
+		},
 	}
-
-	values := fmt.Sprintf(`
-global:
-  istioNamespace: %s
-revision: %q
-base:
-  validationURL: %s
-`, config.IstioNamespace, config.Revision, config.URL)
-
-	validatingWebhookYAML, err := r.RenderManifestFiltered(values, func(tmplName string) bool {
-		return strings.Contains(tmplName, vwhTemplateName)
-	})
+	mfs, _, err := helm.Render("istio", config.IstioNamespace, "default", vals, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed rendering istio-control manifest: %v", err)
+		return "", nil
+	}
+	var validatingWebhookYAML string
+	for _, m := range mfs {
+		if m.GetKind() == "ValidatingWebhookConfiguration" {
+			validatingWebhookYAML = m.Content
+			break
+		}
+	}
+	if validatingWebhookYAML == "" {
+		return "", fmt.Errorf("could not find ValidatingWebhookConfiguration in manifests")
 	}
 
 	scheme := runtime.NewScheme()
@@ -270,29 +274,34 @@ func generateLabels(whLabels, curLabels, customLabels map[string]string, userMan
 
 // generateMutatingWebhook renders a mutating webhook configuration from the given tagWebhookConfig.
 func generateMutatingWebhook(config *tagWebhookConfig, opts *GenerateOptions) (string, error) {
-	r := helm.NewHelmRenderer(opts.ManifestsPath, pilotDiscoveryChart, "Pilot", config.IstioNamespace, nil)
-
-	if err := r.Run(); err != nil {
-		return "", fmt.Errorf("failed running Helm renderer: %v", err)
+	flags := []string{
+		"installPackagePath=" + opts.ManifestsPath,
+		"profile=empty",
+		"components.pilot.enabled=true",
+		"revision=" + config.Revision,
+		"values.revisionTags.[0]=" + config.Tag,
+		"values.sidecarInjectorWebhook.enableNamespacesByDefault=" + strconv.FormatBool(opts.AutoInjectNamespaces),
+		"values.istiodRemote.injectionURL=" + config.URL,
+		"values.global.istioNamespace=" + config.IstioNamespace,
 	}
-
-	values := fmt.Sprintf(`
-revision: %q
-revisionTags:
-  - %s
-
-sidecarInjectorWebhook:
-  enableNamespacesByDefault: %t
-
-istiodRemote:
-  injectionURL: %s
-`, config.Revision, config.Tag, opts.AutoInjectNamespaces, config.URL)
-
-	tagWebhookYaml, err := r.RenderManifestFiltered(values, func(tmplName string) bool {
-		return strings.Contains(tmplName, revisionTagTemplateName)
-	})
+	if len(config.ReinvocationPolicy) > 0 {
+		flags = append(flags, "values.sidecarInjectorWebhook.reinvocationPolicy="+config.ReinvocationPolicy)
+	}
+	mfs, _, err := render.GenerateManifest(nil, flags, false, nil, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed rendering istio-control manifest: %v", err)
+		return "", err
+	}
+	var tagWebhookYaml string
+	for _, mf := range mfs {
+		for _, m := range mf.Manifests {
+			if m.GetKind() == "MutatingWebhookConfiguration" && strings.HasPrefix(m.GetName(), "istio-revision-tag-") {
+				tagWebhookYaml = m.Content
+				break
+			}
+		}
+	}
+	if tagWebhookYaml == "" {
+		return "", fmt.Errorf("could not find MutatingWebhookConfiguration in manifests")
 	}
 
 	scheme := runtime.NewScheme()
@@ -314,6 +323,8 @@ istiodRemote:
 		decodedWh.Webhooks[i].ClientConfig.CABundle = []byte(config.CABundle)
 		if decodedWh.Webhooks[i].ClientConfig.Service != nil {
 			decodedWh.Webhooks[i].ClientConfig.Service.Path = &config.Path
+			// if profile=remote, need specify service istiod-remote to compatibility
+			decodedWh.Webhooks[i].ClientConfig.Service.Name = config.WebHookService
 		}
 	}
 	if opts.WebhookName != "" {
@@ -340,7 +351,7 @@ func tagWebhookConfigFromCanonicalWebhook(wh admitv1.MutatingWebhookConfiguratio
 		rev = ""
 	}
 
-	var injectionURL, caBundle, path string
+	var injectionURL, caBundle, path, reinvocationPolicy, service string
 	found := false
 	for _, w := range wh.Webhooks {
 		if strings.HasSuffix(w.Name, istioInjectionWebhookSuffix) {
@@ -353,6 +364,10 @@ func tagWebhookConfigFromCanonicalWebhook(wh admitv1.MutatingWebhookConfiguratio
 				if w.ClientConfig.Service.Path != nil {
 					path = *w.ClientConfig.Service.Path
 				}
+				service = w.ClientConfig.Service.Name
+			}
+			if w.ReinvocationPolicy != nil {
+				reinvocationPolicy = string(*w.ReinvocationPolicy)
 			}
 			break
 		}
@@ -374,14 +389,16 @@ func tagWebhookConfigFromCanonicalWebhook(wh admitv1.MutatingWebhookConfiguratio
 	}
 
 	return &tagWebhookConfig{
-		Tag:            tagName,
-		Revision:       rev,
-		URL:            injectionURL,
-		CABundle:       caBundle,
-		IstioNamespace: istioNS,
-		Path:           path,
-		Labels:         filteredLabels,
-		Annotations:    wh.Annotations,
-		FailurePolicy:  map[string]*admitv1.FailurePolicyType{},
+		WebHookService:     service,
+		Tag:                tagName,
+		Revision:           rev,
+		URL:                injectionURL,
+		CABundle:           caBundle,
+		IstioNamespace:     istioNS,
+		Path:               path,
+		Labels:             filteredLabels,
+		Annotations:        wh.Annotations,
+		FailurePolicy:      map[string]*admitv1.FailurePolicyType{},
+		ReinvocationPolicy: reinvocationPolicy,
 	}, nil
 }

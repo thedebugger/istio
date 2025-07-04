@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"cmp"
 	"fmt"
 
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +29,8 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/gvk"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 )
 
 var log = istiolog.RegisterScope("controllers", "common controller logic")
@@ -45,7 +48,7 @@ type ComparableObject interface {
 }
 
 // IsNil works around comparing generic types
-func IsNil[O ComparableObject](o O) bool {
+func IsNil[O comparable](o O) bool {
 	var t O
 	return o == t
 }
@@ -195,9 +198,13 @@ func FromEventHandler(handler func(o Event)) cache.ResourceEventHandler {
 // ObjectHandler returns a handler that will act on the latest version of an object
 // This means Add/Update/Delete are all handled the same and are just used to trigger reconciling.
 func ObjectHandler(handler func(o Object)) cache.ResourceEventHandler {
+	return TypedObjectHandler[Object](handler)
+}
+
+func TypedObjectHandler[T ComparableObject](handler func(o T)) cache.ResourceEventHandler {
 	h := func(obj any) {
-		o := ExtractObject(obj)
-		if o == nil {
+		o := Extract[T](obj)
+		if IsNil(o) {
 			return
 		}
 		handler(o)
@@ -275,7 +282,7 @@ func Extract[T Object](obj any) T {
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			log.Errorf("couldn't get object from tombstone: %+v", obj)
+			log.Errorf("couldn't get object from tombstone: (%T vs %T) %+v", obj, ptr.Empty[T](), obj)
 			return empty
 		}
 		o, ok = tombstone.Obj.(T)
@@ -339,4 +346,19 @@ func ShutdownAll(s ...Shutdowner) {
 	for _, h := range s {
 		h.ShutdownHandlers()
 	}
+}
+
+func OldestObject[T Object](configs []T) T {
+	return slices.MinFunc(configs, func(i, j T) int {
+		if r := i.GetCreationTimestamp().Compare(j.GetCreationTimestamp().Time); r != 0 {
+			return r
+		}
+		// If creation time is the same, then behavior is nondeterministic. In this case, we can
+		// pick an arbitrary but consistent ordering based on name and namespace, which is unique.
+		// CreationTimestamp is stored in seconds, so this is not uncommon.
+		if r := cmp.Compare(i.GetName(), j.GetName()); r != 0 {
+			return r
+		}
+		return cmp.Compare(i.GetNamespace(), j.GetNamespace())
+	})
 }

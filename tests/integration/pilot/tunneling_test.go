@@ -112,7 +112,9 @@ func TestTunnelingOutboundTraffic(t *testing.T) {
 			externalNs := apps.External.Namespace.Name()
 
 			applyForwardProxyConfigMaps(ctx, externalNs)
-			ctx.ConfigIstio().File(externalNs, "testdata/external-forward-proxy-deployment.yaml").ApplyOrFail(ctx)
+			ctx.ConfigIstio().EvalFile(externalNs, map[string]any{
+				"OpenShift": ctx.Settings().OpenShift,
+			}, "testdata/external-forward-proxy-deployment.yaml").ApplyOrFail(ctx)
 			applyForwardProxyService(ctx, externalNs)
 			externalForwardProxyIPs, err := i.PodIPsFor(ctx.Clusters().Default(), externalNs, "app=external-forward-proxy")
 			if err != nil {
@@ -313,7 +315,7 @@ func waitUntilTunnelingConfigurationIsRemovedOrFail(ctx framework.TestContext, m
 }
 
 func waitForTunnelingRemovedOrFail(ctx framework.TestContext, ns, app string) {
-	istioCtl := istioctl.NewOrFail(ctx, ctx, istioctl.Config{Cluster: ctx.Clusters().Default()})
+	istioCtl := istioctl.NewOrFail(ctx, istioctl.Config{Cluster: ctx.Clusters().Default()})
 	podName := getPodName(ctx, ns, app)
 	args := []string{"proxy-config", "listeners", "-n", ns, podName, "-o", "json"}
 	retry.UntilSuccessOrFail(ctx, func() error {

@@ -137,29 +137,39 @@ func (s *Server) CreateCertificate(ctx context.Context, request *pb.IstioCertifi
 			serverCaLog.Debugf("Append cert chain to response, %s", string(certChainBytes))
 		}
 	}
+	// expand `respCertChain` since each element might be a concatenated multi-cert PEM
+	// the expanded structure (one cert per `string` in `certChain`) is specifically expected by `ztunnel`
+	response := &pb.IstioCertificateResponse{}
+	for _, pem := range respCertChain {
+		for _, cert := range util.PemCertBytestoString([]byte(pem)) {
+			// the trailing "\n" is added for backwards compatibility
+			// there are ca clients (see pkg/test/framework/components/istio/ca.go) that would try to simply concatenate elements in the chain
+			response.CertChain = append(response.CertChain, cert+"\n")
+		}
+	}
+	// Per the spec: "... the root cert is the last element." so we do not want to flatten the root cert.
+	// If we did, the client cannot distinguish the root.
+	// A better API would put the root in a separate field entirely...
 	if len(rootCertBytes) != 0 {
-		respCertChain = append(respCertChain, string(rootCertBytes))
+		response.CertChain = append(response.CertChain, string(rootCertBytes))
 	}
-	response := &pb.IstioCertificateResponse{
-		CertChain: respCertChain,
-	}
+
+	serverCaLog.Debugf("Responding with cert chain, %q", response.CertChain)
 	s.monitoring.Success.Increment()
-	serverCaLog.Debugf("CSR successfully signed, sans %v.", caller.Identities)
+	serverCaLog.Debugf("CSR successfully signed, sans %v.", sans)
 	return response, nil
 }
 
-func recordCertsExpiry(keyCertBundle *util.KeyCertBundle) {
+// RecordCertsExpiry updates the certificate-expiration related metrics given a new keycertbundle
+func RecordCertsExpiry(keyCertBundle *util.KeyCertBundle) {
+	// Expiry of the first root cert in trust bundle
 	rootCertExpiry, err := keyCertBundle.ExtractRootCertExpiryTimestamp()
 	if err != nil {
 		serverCaLog.Errorf("failed to extract root cert expiry timestamp (error %v)", err)
+	} else {
+		rootCertExpiryTimestamp.Record(float64(rootCertExpiry.Unix()))
+		rootCertExpirySeconds.ValueFrom(func() float64 { return time.Until(rootCertExpiry).Seconds() })
 	}
-	rootCertExpiryTimestamp.Record(rootCertExpiry)
-
-	rootCertPem, err := util.ParsePemEncodedCertificate(keyCertBundle.GetRootCertPem())
-	if err != nil {
-		serverCaLog.Errorf("failed to parse the root cert: %v", err)
-	}
-	rootCertExpirySeconds.ValueFrom(func() float64 { return time.Until(rootCertPem.NotAfter).Seconds() })
 
 	if len(keyCertBundle.GetCertChainPem()) == 0 {
 		return
@@ -168,14 +178,10 @@ func recordCertsExpiry(keyCertBundle *util.KeyCertBundle) {
 	certChainExpiry, err := keyCertBundle.ExtractCACertExpiryTimestamp()
 	if err != nil {
 		serverCaLog.Errorf("failed to extract CA cert expiry timestamp (error %v)", err)
+	} else {
+		certChainExpiryTimestamp.Record(float64(certChainExpiry.Unix()))
+		certChainExpirySeconds.ValueFrom(func() float64 { return time.Until(certChainExpiry).Seconds() })
 	}
-	certChainExpiryTimestamp.Record(certChainExpiry)
-
-	certChainPem, err := util.ParsePemEncodedCertificate(keyCertBundle.GetCertChainPem())
-	if err != nil {
-		serverCaLog.Errorf("failed to parse the cert chain: %v", err)
-	}
-	certChainExpirySeconds.ValueFrom(func() float64 { return time.Until(certChainPem.NotAfter).Seconds() })
 }
 
 // Register registers a GRPC server on the specified port.
@@ -192,7 +198,7 @@ func New(
 ) (*Server, error) {
 	certBundle := ca.GetCAKeyCertBundle()
 	if len(certBundle.GetRootCertPem()) != 0 {
-		recordCertsExpiry(certBundle)
+		RecordCertsExpiry(certBundle)
 	}
 
 	server := &Server{

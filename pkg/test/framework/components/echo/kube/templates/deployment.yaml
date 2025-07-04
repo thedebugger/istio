@@ -76,6 +76,7 @@ spec:
   (ne (index $subset.Annotations "sidecar.istio.io/inject") "false")
   (ne (index $subset.Annotations "inject.istio.io/templates") "grpc")
   ($.OverlayIstioProxy)
+  (not (and $.OpenShift (eq $.Service "tproxy")))
 }}
       - name: istio-proxy
         image: auto
@@ -161,6 +162,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: BIND_FAMILY
+          value: {{ $.BindFamily }}
 {{- if $.ProxylessGRPC }}
         - name: EXPOSE_GRPC_ADMIN
           value: "true"

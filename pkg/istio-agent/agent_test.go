@@ -360,7 +360,7 @@ func TestAgent(t *testing.T) {
 		ctx, done := context.WithCancel(context.Background())
 		_, err := a.Run(ctx)
 		if err == nil {
-			t.Fatalf("expected to return an error if SDS socket not provided, and not default")
+			t.Fatal("expected to return an error if SDS socket not provided, and not default")
 		}
 		t.Cleanup(done)
 		t.Cleanup(func() {
@@ -526,7 +526,6 @@ func TestAgent(t *testing.T) {
 			a.ProxyConfig.ProxyAdminPort = 15000
 			a.AgentConfig.EnvoyPrometheusPort = 15090
 			a.AgentConfig.EnvoyStatusPort = 15021
-			a.AgentConfig.ProxyXDSDebugViaAgent = false // uses a fixed port
 			return a
 		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
 		envoyReady(t, "first agent", 15000)
@@ -536,7 +535,6 @@ func TestAgent(t *testing.T) {
 			a.ProxyConfig.ProxyAdminPort = 25000
 			a.AgentConfig.EnvoyPrometheusPort = 25090
 			a.AgentConfig.EnvoyStatusPort = 25021
-			a.AgentConfig.ProxyXDSDebugViaAgent = false // uses a fixed port
 			return a
 		}).Check(t, security.WorkloadKeyCertResourceName, security.RootCertReqResourceName)
 		envoyReady(t, "second agent", 25000)
@@ -585,7 +583,7 @@ func TestAgent(t *testing.T) {
 			xdsc := xds.NewAdsTest(t, conn).WithMetadata(meta)
 			_ = xdsc.RequestResponseAck(t, nil)
 		}); err == nil {
-			t.Fatalf("connect success with wrong CA")
+			t.Fatal("connect success with wrong CA")
 		}
 
 		// change ROOT CA, XDS will success
@@ -646,11 +644,10 @@ func Setup(t *testing.T, opts ...func(a AgentTest) AgentTest) *AgentTest {
 	resp.ProxyConfig.DiscoveryAddress = setupDiscovery(t, resp.XdsAuthenticator, ca.KeyCertBundle.GetRootCertPem(), resp.bootstrapGenerator)
 	rootCert := filepath.Join(env.IstioSrc, "./tests/testdata/certs/pilot/root-cert.pem")
 	resp.AgentConfig = AgentOptions{
-		ProxyXDSDebugViaAgent: true,
-		CARootCerts:           rootCert,
-		XDSRootCerts:          rootCert,
-		XdsUdsPath:            filepath.Join(d, "XDS"),
-		ServiceNode:           proxy.ServiceNode(),
+		CARootCerts:  rootCert,
+		XDSRootCerts: rootCert,
+		XdsUdsPath:   filepath.Join(d, "XDS"),
+		ServiceNode:  proxy.ServiceNode(),
 		SDSFactory: func(options *security.Options, workloadSecretCache security.SecretManager, pkpConf *meshconfig.PrivateKeyProvider) SDSService {
 			return sds.NewServer(options, workloadSecretCache, pkpConf)
 		},
@@ -804,7 +801,7 @@ func expectFileUnchanged(t *testing.T, files ...string) {
 		for i, f := range files {
 			now := testutil.ReadFile(t, f)
 			if !reflect.DeepEqual(initials[i], now) {
-				t.Fatalf("file is changed!")
+				t.Fatal("file is changed!")
 			}
 		}
 	}
@@ -907,7 +904,7 @@ func setupDiscovery(t *testing.T, auth *security.FakeAuthenticator, certPem []by
 	opt := tlsOptions(t, certPem)
 	// Set up a simple service to make sure we have mTLS requested
 	ds := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{ConfigString: `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: ServiceEntry
 metadata:
   name: app
@@ -915,12 +912,13 @@ metadata:
 spec:
   hosts:
   - app.com
+  location: MESH_INTERNAL
   ports:
   - number: 80
     name: http
     protocol: HTTP
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: plaintext

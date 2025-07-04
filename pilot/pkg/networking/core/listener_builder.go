@@ -61,7 +61,7 @@ type ListenerBuilder struct {
 	virtualOutboundListener *listener.Listener
 	virtualInboundListener  *listener.Listener
 
-	envoyFilterWrapper *model.EnvoyFilterWrapper
+	envoyFilterWrapper *model.MergedEnvoyFilterWrapper
 
 	// authnBuilder provides access to authn (mTLS) configuration for the given proxy.
 	authnBuilder *authn.Builder
@@ -86,6 +86,13 @@ func NewListenerBuilder(node *model.Proxy, push *model.PushContext) *ListenerBui
 	builder.authzBuilder = authz.NewBuilder(authz.Local, push, node, node.Type == model.Waypoint)
 	builder.authzCustomBuilder = authz.NewBuilder(authz.Custom, push, node, node.Type == model.Waypoint)
 	return builder
+}
+
+func maxConnectionsToAcceptPerSocketEvent() *wrappers.UInt32Value {
+	if features.MaxConnectionsToAcceptPerSocketEvent > 0 {
+		return &wrappers.UInt32Value{Value: uint32(features.MaxConnectionsToAcceptPerSocketEvent)}
+	}
+	return nil
 }
 
 func (lb *ListenerBuilder) appendSidecarInboundListeners() *ListenerBuilder {
@@ -127,12 +134,13 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 	actualWildcards, _ := getWildcardsAndLocalHost(lb.node.GetIPMode())
 	// add an extra listener that binds to the port that is the recipient of the iptables redirect
 	ipTablesListener := &listener.Listener{
-		Name:             model.VirtualOutboundListenerName,
-		Address:          util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
-		Transparent:      isTransparentProxy,
-		UseOriginalDst:   proto.BoolTrue,
-		FilterChains:     filterChains,
-		TrafficDirection: core.TrafficDirection_OUTBOUND,
+		Name:                                 model.VirtualOutboundListenerName,
+		Address:                              util.BuildAddress(actualWildcards[0], uint32(lb.push.Mesh.ProxyListenPort)),
+		Transparent:                          isTransparentProxy,
+		UseOriginalDst:                       proto.BoolTrue,
+		FilterChains:                         filterChains,
+		TrafficDirection:                     core.TrafficDirection_OUTBOUND,
+		MaxConnectionsToAcceptPerSocketEvent: maxConnectionsToAcceptPerSocketEvent(),
 	}
 	// add extra addresses for the listener
 	if features.EnableDualStack && len(actualWildcards) > 1 {
@@ -310,6 +318,13 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	} else {
 		connectionManager.CodecType = hcm.HttpConnectionManager_AUTO
 	}
+
+	// Preserve HTTP/1.x traffic header case
+	if lb.node.Metadata.ProxyConfigOrDefault(lb.push.Mesh.GetDefaultConfig()).GetProxyHeaders().GetPreserveHttp1HeaderCase().GetValue() {
+		// This value only affects HTTP/1.x traffic
+		connectionManager.HttpProtocolOptions = preserveCaseFormatterConfig
+	}
+
 	connectionManager.AccessLog = []*accesslog.AccessLog{}
 	connectionManager.StatPrefix = httpOpts.statPrefix
 
@@ -421,16 +436,13 @@ func (lb *ListenerBuilder) buildHTTPConnectionManager(httpOpts *httpListenerOpts
 	connectionManager.HttpFilters = filters
 	connectionManager.RequestIdExtension = requestidextension.BuildUUIDRequestIDExtension(reqIDExtensionCtx)
 
-	if features.EnableHCMInternalNetworks && lb.push.Networks != nil {
-		for _, internalnetwork := range lb.push.Networks.Networks {
-			iac := &hcm.HttpConnectionManager_InternalAddressConfig{}
-			for _, ne := range internalnetwork.Endpoints {
-				if cidr := util.ConvertAddressToCidr(ne.GetFromCidr()); cidr != nil {
-					iac.CidrRanges = append(iac.CidrRanges, cidr)
-				}
-			}
-			connectionManager.InternalAddressConfig = iac
-		}
+	// If UseRemoteAddress is set, we must set the internal address config to preserve internal headers.
+	// As of Envoy 1.33, the default internalAddressConfig is set to an empty set. In previous versions
+	// the default was all private IPs. To preserve internal headers when useRemoteAddress is set, we must
+	// explicitly set MeshNetworks to configure Envoy's internal_address_config.
+	// MeshNetwork configuration docs can be found here: https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshNetworks
+	if (features.EnableHCMInternalNetworks || httpOpts.useRemoteAddress) && lb.push.Networks != nil {
+		connectionManager.InternalAddressConfig = util.MeshNetworksToEnvoyInternalAddressConfig(lb.push.Networks)
 	}
 	connectionManager.Proxy_100Continue = features.Enable100ContinueHeaders
 	return connectionManager

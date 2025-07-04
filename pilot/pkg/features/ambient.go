@@ -39,6 +39,12 @@ var (
 		true, false,
 		"If enabled, HBONE support can be configured for proxies.")
 
+	EnableAmbientStatus = registerAmbient(
+		"AMBIENT_ENABLE_STATUS",
+		true, false,
+		"If enabled, status messages for ambient mode will be written to resources. "+
+			"Currently, this does not do leader election, so may be unsafe to enable with multiple replicas.")
+
 	// Not required for ambient, so disabled by default
 	PreferHBONESend = registerAmbient(
 		"PILOT_PREFER_SENDING_HBONE",
@@ -50,6 +56,17 @@ var (
 		false, false,
 		"If enabled, zTunnel will receive synthetic authorization policies for each workload ALLOW the Waypoint's identity. "+
 			"Unless other ALLOW policies are created, this effectively denies traffic that doesn't go through the waypoint.")
+
+	EnableIngressWaypointRouting = registerAmbient("ENABLE_INGRESS_WAYPOINT_ROUTING", true, false,
+		"If true, Gateways will call service waypoints if the 'istio.io/ingress-use-waypoint' label set on the Service.")
+
+	EnableAmbientMultiNetwork = registerAmbient("AMBIENT_ENABLE_MULTI_NETWORK", false, false,
+		"If true, the multi-network functionality will be enabled.")
+
+	WaypointLayeredAuthorizationPolicies = env.Register(
+		"ENABLE_LAYERED_WAYPOINT_AUTHORIZATION_POLICIES",
+		false,
+		"If enabled, selector based authorization policies will be enforced as L4 policies in front of the waypoint.").Get()
 )
 
 // registerAmbient registers a variable that is allowed only if EnableAmbient is set

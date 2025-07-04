@@ -49,7 +49,7 @@ func (s *DiscoveryServer) EDSUpdate(shard model.ShardKey, serviceName string, na
 ) {
 	inboundEDSUpdates.Increment()
 	// Update the endpoint shards
-	pushType := s.Env.EndpointIndex.UpdateServiceEndpoints(shard, serviceName, namespace, istioEndpoints)
+	pushType := s.Env.EndpointIndex.UpdateServiceEndpoints(shard, serviceName, namespace, istioEndpoints, true)
 	if pushType == model.IncrementalPush || pushType == model.FullPush {
 		// Trigger a push
 		s.ConfigUpdate(&model.PushRequest{
@@ -72,7 +72,7 @@ func (s *DiscoveryServer) EDSCacheUpdate(shard model.ShardKey, serviceName strin
 ) {
 	inboundEDSUpdates.Increment()
 	// Update the endpoint shards
-	s.Env.EndpointIndex.UpdateServiceEndpoints(shard, serviceName, namespace, istioEndpoints)
+	s.Env.EndpointIndex.UpdateServiceEndpoints(shard, serviceName, namespace, istioEndpoints, false)
 }
 
 func (s *DiscoveryServer) RemoveShard(shardKey model.ShardKey) {
@@ -100,20 +100,13 @@ var skippedEdsConfigs = sets.New(
 	kind.WasmPlugin,
 	kind.ProxyConfig,
 	kind.DNSName,
-
-	kind.KubernetesGateway,
-	kind.HTTPRoute,
-	kind.TCPRoute,
-	kind.TLSRoute,
-	kind.GRPCRoute,
 )
 
-func edsNeedsPush(updates model.XdsUpdates) bool {
-	// If none set, we will always push
-	if len(updates) == 0 {
-		return true
+func edsNeedsPush(req *model.PushRequest, proxy *model.Proxy) bool {
+	if res, ok := xdsNeedsPush(req, proxy); ok {
+		return res
 	}
-	for config := range updates {
+	for config := range req.ConfigsUpdated {
 		if !skippedEdsConfigs.Contains(config.Kind) {
 			return true
 		}
@@ -122,7 +115,7 @@ func edsNeedsPush(updates model.XdsUpdates) bool {
 }
 
 func (eds *EdsGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, req *model.PushRequest) (model.Resources, model.XdsLogDetails, error) {
-	if !edsNeedsPush(req.ConfigsUpdated) {
+	if !edsNeedsPush(req, proxy) {
 		return nil, model.DefaultXdsLogDetails, nil
 	}
 	resources, logDetails := eds.buildEndpoints(proxy, req, w)
@@ -132,7 +125,7 @@ func (eds *EdsGenerator) Generate(proxy *model.Proxy, w *model.WatchedResource, 
 func (eds *EdsGenerator) GenerateDeltas(proxy *model.Proxy, req *model.PushRequest,
 	w *model.WatchedResource,
 ) (model.Resources, model.DeletedResources, model.XdsLogDetails, bool, error) {
-	if !edsNeedsPush(req.ConfigsUpdated) {
+	if !edsNeedsPush(req, proxy) {
 		return nil, nil, model.DefaultXdsLogDetails, false, nil
 	}
 	if !shouldUseDeltaEds(req) {
@@ -155,7 +148,7 @@ func shouldUseDeltaEds(req *model.PushRequest) bool {
 // This allows us to perform more efficient pushes where we only update the endpoints that did change.
 func canSendPartialFullPushes(req *model.PushRequest) bool {
 	// If we don't know what configs are updated, just send a full push
-	if len(req.ConfigsUpdated) == 0 {
+	if req.Forced {
 		return false
 	}
 	for cfg := range req.ConfigsUpdated {
@@ -189,7 +182,7 @@ func (eds *EdsGenerator) buildEndpoints(proxy *model.Proxy,
 	empty := 0
 	cached := 0
 	regenerated := 0
-	for _, clusterName := range w.ResourceNames {
+	for clusterName := range w.ResourceNames {
 		if edsUpdatedServices != nil {
 			if _, ok := edsUpdatedServices[model.ParseSubsetKeyHostname(clusterName)]; !ok {
 				// Cluster was not updated, skip recomputing. This happens when we get an incremental update for a
@@ -246,7 +239,7 @@ func (eds *EdsGenerator) buildDeltaEndpoints(proxy *model.Proxy,
 	cached := 0
 	regenerated := 0
 
-	for _, clusterName := range w.ResourceNames {
+	for clusterName := range w.ResourceNames {
 		// filter out eds that are not updated for clusters
 		if _, ok := edsUpdatedServices[model.ParseSubsetKeyHostname(clusterName)]; !ok {
 			continue

@@ -164,6 +164,7 @@ func (t *configGenTest) dialEcho(addr string) *echo.Client {
 }
 
 func TestTrafficShifting(t *testing.T) {
+	t.Skip("https://github.com/istio/istio/issues/53202")
 	tt := newConfigGenTest(t, xds.FakeOptions{
 		KubernetesObjectString: `
 apiVersion: v1
@@ -183,7 +184,7 @@ spec:
     port: 7070
 `,
 		ConfigString: `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: echo-dr
@@ -198,7 +199,7 @@ spec:
       labels:
         version: v2
 ---
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: echo-vs
@@ -242,6 +243,7 @@ spec:
 }
 
 func TestMtls(t *testing.T) {
+	t.Skip("https://github.com/istio/istio/issues/53202")
 	tt := newConfigGenTest(t, xds.FakeOptions{
 		KubernetesObjectString: `
 apiVersion: v1
@@ -261,7 +263,7 @@ spec:
     port: 7070
 `,
 		ConfigString: `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: echo-dr
@@ -272,7 +274,7 @@ spec:
     tls:
       mode: ISTIO_MUTUAL
 ---
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: PeerAuthentication
 metadata:
   name: default
@@ -316,7 +318,7 @@ spec:
     port: 7071
 `,
 		ConfigString: `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: echo-delay

@@ -16,6 +16,10 @@ package xds_test
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,19 +28,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"istio.io/api/annotation"
 	"istio.io/api/security/v1beta1"
 	metav1beta1 "istio.io/api/type/v1beta1"
-	securityclient "istio.io/client-go/pkg/apis/security/v1beta1"
+	securityclient "istio.io/client-go/pkg/apis/security/v1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pilot/test/xds"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/kube/kclient/clienttest"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/util/sets"
 )
+
+func init() {
+	// Most tests need this, and setting it per-test can trigger races from tests still executing after completion
+	features.EnableAmbient = true
+}
 
 func buildExpect(t *testing.T) func(resp *discovery.DeltaDiscoveryResponse, names ...string) {
 	return func(resp *discovery.DeltaDiscoveryResponse, names ...string) {
@@ -81,13 +94,12 @@ func buildExpectAddedAndRemoved(t *testing.T) func(resp *discovery.DeltaDiscover
 		for _, r := range resp.RemovedResources {
 			haveRemoved.Insert(r)
 		}
-		assert.Equal(t, sets.SortedList(have), sets.SortedList(wantAdded))
-		assert.Equal(t, sets.SortedList(haveRemoved), sets.SortedList(wantRemoved))
+		assert.Equal(t, sets.SortedList(have), sets.SortedList(wantAdded), "updated")
+		assert.Equal(t, sets.SortedList(haveRemoved), sets.SortedList(wantRemoved), "removed")
 	}
 }
 
 func TestWorkloadReconnect(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	t.Run("ondemand", func(t *testing.T) {
 		expect := buildExpect(t)
 		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
@@ -109,6 +121,10 @@ func TestWorkloadReconnect(t *testing.T) {
 
 		// Create new pod in the meantime
 		createPod(s, "pod2", "sa", "127.0.0.2", "node")
+		// Wait for it to be ready
+		assert.EventuallyEqual(t, func() int {
+			return len(s.KubeRegistry.All())
+		}, 2)
 
 		// Reconnect
 		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
@@ -139,6 +155,10 @@ func TestWorkloadReconnect(t *testing.T) {
 
 		// Create new pod in the meantime
 		createPod(s, "pod2", "sa", "127.0.0.2", "node")
+		// Wait for it to be ready
+		assert.EventuallyEqual(t, func() int {
+			return len(s.KubeRegistry.All())
+		}, 2)
 
 		// Reconnect
 		ads = s.ConnectDeltaADS().WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
@@ -146,7 +166,7 @@ func TestWorkloadReconnect(t *testing.T) {
 			ResourceNamesSubscribe:   []string{},
 			ResourceNamesUnsubscribe: []string{},
 			InitialResourceVersions: map[string]string{
-				"/127.0.0.1": "",
+				"Kubernetes//Pod/default/pod": "",
 			},
 		})
 		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod", "Kubernetes//Pod/default/pod2")
@@ -154,7 +174,6 @@ func TestWorkloadReconnect(t *testing.T) {
 }
 
 func TestWorkload(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	t.Run("ondemand", func(t *testing.T) {
 		expect := buildExpect(t)
 		expectRemoved := buildExpectExpectRemoved(t)
@@ -162,6 +181,7 @@ func TestWorkload(t *testing.T) {
 			DebounceTime: time.Millisecond * 25,
 		})
 		ads := s.ConnectDeltaADS().WithTimeout(time.Second * 5).WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		spamDebugEndpointsToDetectRace(t, s)
 
 		ads.Request(&discovery.DeltaDiscoveryRequest{
 			ResourceNamesSubscribe:   []string{"*"},
@@ -233,12 +253,14 @@ func TestWorkload(t *testing.T) {
 		expect(ads.ExpectResponse(), "Kubernetes//Pod/default/pod4")
 	})
 	t.Run("wildcard", func(t *testing.T) {
+		log.FindScope("delta").SetOutputLevel(log.DebugLevel)
 		expect := buildExpect(t)
 		expectRemoved := buildExpectExpectRemoved(t)
 		s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{
 			DebounceTime: time.Millisecond * 25,
 		})
 		ads := s.ConnectDeltaADS().WithTimeout(time.Second * 5).WithType(v3.AddressType).WithMetadata(model.NodeMetadata{NodeName: "node"})
+		spamDebugEndpointsToDetectRace(t, s)
 
 		ads.Request(&discovery.DeltaDiscoveryRequest{
 			ResourceNamesSubscribe: []string{"*"},
@@ -270,6 +292,45 @@ func TestWorkload(t *testing.T) {
 	})
 }
 
+// Historically, the debug interface has been a common source of race conditions in the discovery server
+// spamDebugEndpointsToDetectRace hits all the endpoints, attempting to trigger any latent race conditions.
+func spamDebugEndpointsToDetectRace(t *testing.T, s *xds.FakeDiscoveryServer) {
+	stop := test.NewStop(t)
+	go func() {
+		for _, proxySpecific := range []bool{true, false} {
+			for range 10 {
+				for _, url := range s.Discovery.DebugEndpoints() {
+					select {
+					case <-stop:
+						// Test is over, stop early
+						return
+					default:
+					}
+					// Drop mutating URLs
+					if strings.Contains(url, "push=true") {
+						continue
+					}
+					if strings.Contains(url, "clear=true") {
+						continue
+					}
+					if proxySpecific {
+						url += "?proxyID=test"
+					}
+					req, err := http.NewRequest(http.MethodGet, url, nil)
+					if err != nil {
+						panic(err.Error())
+					}
+					log.Debugf("calling %v..", req.URL)
+					rr := httptest.NewRecorder()
+					h, _ := s.DiscoveryDebug.Handler(req)
+					h.ServeHTTP(rr, req)
+					_, _ = io.Copy(io.Discard, rr.Body)
+				}
+			}
+		}
+	}()
+}
+
 func deletePod(s *xds.FakeDiscoveryServer, name string) {
 	err := s.KubeClient().Kube().CoreV1().Pods("default").Delete(context.Background(), name, metav1.DeleteOptions{})
 	if err != nil {
@@ -291,6 +352,7 @@ func deletePeerAuthentication(s *xds.FakeDiscoveryServer, name string, ns string
 	clienttest.NewWriter[*securityclient.PeerAuthentication](s.T(), s.KubeClient()).Delete(name, ns)
 }
 
+// nolint: unparam
 func createPeerAuthentication(s *xds.FakeDiscoveryServer, name string, ns string, spec *v1beta1.PeerAuthentication) {
 	c := &securityclient.PeerAuthentication{
 		ObjectMeta: metav1.ObjectMeta{
@@ -312,7 +374,7 @@ func mkPod(name string, sa string, ip string, node string) *corev1.Pod {
 			Name:      name,
 			Namespace: "default",
 			Annotations: map[string]string{
-				constants.AmbientRedirection: constants.AmbientRedirectionEnabled,
+				annotation.AmbientRedirection.Name: constants.AmbientRedirectionEnabled,
 			},
 			Labels: map[string]string{
 				"app": sa,
@@ -372,7 +434,6 @@ func createService(s *xds.FakeDiscoveryServer, name, namespace string, selector 
 }
 
 func TestWorkloadAuthorizationPolicy(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	expect := buildExpect(t)
 	expectRemoved := buildExpectExpectRemoved(t)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
@@ -400,7 +461,6 @@ func TestWorkloadAuthorizationPolicy(t *testing.T) {
 }
 
 func TestWorkloadPeerAuthentication(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	expect := buildExpect(t)
 	expectAddedAndRemoved := buildExpectAddedAndRemoved(t)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
@@ -440,5 +500,53 @@ func TestWorkloadPeerAuthentication(t *testing.T) {
 
 	// Irrelevant update (pod is in the default namespace and not "ns") shouldn't push
 	createPod(s, "pod", "sa", "127.0.0.1", "node")
+	ads.ExpectNoResponse()
+}
+
+// Regression tests for NOP PeerAuthentication triggering a removal
+func TestPeerAuthenticationUpdate(t *testing.T) {
+	expectAddedAndRemoved := buildExpectAddedAndRemoved(t)
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	ads := s.ConnectDeltaADS().WithType(v3.WorkloadAuthorizationType).WithTimeout(time.Second * 10).WithNodeType(model.Ztunnel)
+
+	ads.Request(&discovery.DeltaDiscoveryRequest{
+		ResourceNamesSubscribe: []string{"*"},
+	})
+	ads.ExpectEmptyResponse()
+
+	// One PA will create 2 resources, but they may not come in one push. Workaround this by forcing them to come one-by-one
+	createPeerAuthentication(s, "policy1", "ns", &v1beta1.PeerAuthentication{})
+	expectAddedAndRemoved(ads.ExpectResponse(), []string{"istio-system/istio_converted_static_strict"}, nil)
+
+	// Now create our real policy
+	spec := &v1beta1.PeerAuthentication{
+		Selector: &metav1beta1.WorkloadSelector{
+			MatchLabels: map[string]string{
+				"app": "sa",
+			},
+		},
+		Mtls: &v1beta1.PeerAuthentication_MutualTLS{
+			Mode: v1beta1.PeerAuthentication_MutualTLS_STRICT,
+		},
+		PortLevelMtls: map[uint32]*v1beta1.PeerAuthentication_MutualTLS{
+			8080: {
+				Mode: v1beta1.PeerAuthentication_MutualTLS_DISABLE,
+			},
+		},
+	}
+	createPeerAuthentication(s, "policy1", "ns", spec)
+	expectAddedAndRemoved(ads.ExpectResponse(), []string{"ns/converted_peer_authentication_policy1"}, nil)
+
+	// Create in the Istio config store. This is important, since this will trigger an update on PeerAuthentication which
+	// is what caused the issue.
+	_, err := s.Discovery.Env.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.PeerAuthentication,
+			Name:             "policy1",
+			Namespace:        "ns",
+		},
+		Spec: spec,
+	})
+	assert.NoError(t, err)
 	ads.ExpectNoResponse()
 }

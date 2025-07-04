@@ -123,16 +123,13 @@ function build_images() {
     # We run tests across all VM types only in postsubmit
     nonDistrolessTargets+="docker.app_sidecar_ubuntu_bionic docker.app_sidecar_debian_12 docker.app_sidecar_rockylinux_9 "
   fi
-  if [[ "${SELECT_TEST}" == "test.integration.operator.kube" || "${SELECT_TEST}" == "test.integration.kube" || "${JOB_TYPE:-postsubmit}" == "postsubmit" ]]; then
-    targets+="docker.operator "
-  fi
   if [[ "${SELECT_TEST}" == "test.integration.ambient.kube" || "${SELECT_TEST}" == "test.integration.kube"  || "${SELECT_TEST}" == "test.integration.helm.kube" || "${JOB_TYPE:-postsubmit}" == "postsubmit" ]]; then
     targets+="docker.ztunnel "
   fi
   targets+="docker.install-cni "
   # Integration tests are always running on local architecture (no cross compiling), so find out what that is.
   arch="linux/amd64"
-  if [[ "$(uname -m)" == "aarch64" ]]; then
+  if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]]; then
       arch="linux/arm64"
   fi
   if [[ "${VARIANT:-default}" == "distroless" ]]; then
@@ -159,10 +156,32 @@ function setup_kind_registry() {
   # https://docs.tilt.dev/choosing_clusters.html#discovering-the-registry
   for cluster in $(kind get clusters); do
     # TODO get context/config from existing variables
-    kind export kubeconfig --name="${cluster}"
+    if [[ "${DEVCONTAINER}" ]]; then
+      kind export kubeconfig --name="${cluster}" --internal
+    else
+      kind export kubeconfig --name="${cluster}"
+    fi
     for node in $(kind get nodes --name="${cluster}"); do
-      kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:${KIND_REGISTRY_PORT}" --overwrite;
+      docker exec "${node}" mkdir -p "${KIND_REGISTRY_DIR}"
+      cat <<EOF | docker exec -i "${node}" cp /dev/stdin "${KIND_REGISTRY_DIR}/hosts.toml"
+[host."http://${KIND_REGISTRY_NAME}:5000"]
+EOF
+    
+      kubectl annotate node "${node}" "kind.x-k8s.io/registry=kind-registry:${KIND_REGISTRY_PORT}" --overwrite;
     done
+
+    # Document the local registry
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${KIND_REGISTRY_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
   done
 }
 

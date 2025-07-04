@@ -29,7 +29,8 @@ var (
 	FilterGatewayClusterConfig = env.Register("PILOT_FILTER_GATEWAY_CLUSTER_CONFIG", false,
 		"If enabled, Pilot will send only clusters that referenced in gateway virtual services attached to gateway").Get()
 
-	SendUnhealthyEndpoints = atomic.NewBool(env.Register(
+	// GlobalSendUnhealthyEndpoints contains the raw setting on GlobalSendUnhealthyEndpoints. This should be checked per-service
+	GlobalSendUnhealthyEndpoints = atomic.NewBool(env.Register(
 		"PILOT_SEND_UNHEALTHY_ENDPOINTS",
 		false,
 		"If enabled, Pilot will include unhealthy endpoints in EDS pushes and even if they are sent Envoy does not use them for load balancing."+
@@ -129,17 +130,15 @@ var (
 		return val
 	}()
 
-	EnableStatus = env.Register(
-		"PILOT_ENABLE_STATUS",
-		false,
-		"If enabled, pilot will update the CRD Status field of all istio resources with reconciliation status.",
-	).Get()
-
 	EnableGatewayAPI = env.Register("PILOT_ENABLE_GATEWAY_API", true,
 		"If this is set to true, support for Kubernetes gateway-api (github.com/kubernetes-sigs/gateway-api) will "+
 			" be enabled. In addition to this being enabled, the gateway-api CRDs need to be installed.").Get()
 
-	EnableAlphaGatewayAPI = env.Register("PILOT_ENABLE_ALPHA_GATEWAY_API", false,
+	EnableGatewayAPICopyLabelsAnnotations = env.Register("PILOT_ENABLE_GATEWAY_API_COPY_LABELS_ANNOTATIONS", true,
+		"If this is set to false, istiod will not copy any attributes from the Gateway resource onto its related Deployment resources.").Get()
+
+	EnableAlphaGatewayAPIName = "PILOT_ENABLE_ALPHA_GATEWAY_API"
+	EnableAlphaGatewayAPI     = env.Register(EnableAlphaGatewayAPIName, false,
 		"If this is set to true, support for alpha APIs in the Kubernetes gateway-api (github.com/kubernetes-sigs/gateway-api) will "+
 			" be enabled. In addition to this being enabled, the gateway-api CRDs need to be installed.").Get()
 
@@ -153,8 +152,8 @@ var (
 		"If this is set to true, istiod will create and manage its default GatewayClasses").Get()
 
 	DeltaXds = env.Register("ISTIO_DELTA_XDS", true,
-		"If enabled, pilot will only send the delta configs as opposed to the state of the world on a "+
-			"Resource Request. This feature uses the delta xds api, but does not currently send the actual deltas.").Get()
+		"If enabled, pilot will only send the delta configs as opposed to the state of the world configuration on a Resource Request. "+
+			"While this feature uses the delta xds api, it may still occasionally send unchanged configurations instead of just the actual deltas.").Get()
 
 	EnableQUICListeners = env.Register("PILOT_ENABLE_QUIC_LISTENERS", false,
 		"If true, QUIC listeners will be generated wherever there are listeners terminating TLS on gateways "+
@@ -165,10 +164,6 @@ var (
 
 	EnableHCMInternalNetworks = env.Register("ENABLE_HCM_INTERNAL_NETWORKS", false,
 		"If enable, endpoints defined in mesh networks will be configured as internal addresses in Http Connection Manager").Get()
-
-	EnableEnhancedResourceScoping = env.Register("ENABLE_ENHANCED_RESOURCE_SCOPING", true,
-		"If enabled, meshConfig.discoverySelectors will limit the CustomResource configurations(like Gateway,VirtualService,DestinationRule,Ingress, etc)"+
-			"that can be processed by pilot. This will also restrict the root-ca certificate distribution.").Get()
 
 	EnableLeaderElection = env.Register("ENABLE_LEADER_ELECTION", true,
 		"If enabled (default), starts a leader election client and gains leadership before executing controllers. "+
@@ -187,17 +182,23 @@ var (
 	EnableNativeSidecars = env.Register("ENABLE_NATIVE_SIDECARS", false,
 		"If set, used Kubernetes native Sidecar container support. Requires SidecarContainer feature flag.")
 
-	PassthroughTargetPort = env.Register("ENABLE_RESOLUTION_NONE_TARGET_PORT", true,
-		"If enabled, targetPort will be supported for resolution=NONE ServiceEntry").Get()
-
-	PersistOldestWinsHeuristicForVirtualServiceHostMatching = env.Register("PERSIST_OLDEST_FIRST_HEURISTIC_FOR_VIRTUAL_SERVICE_HOST_MATCHING", false,
-		"If enabled, istiod will persist the oldest first heuristic for subtly conflicting traffic policy selection"+
-			"(such as with overlapping wildcard hosts)").Get()
-
 	Enable100ContinueHeaders = env.Register("ENABLE_100_CONTINUE_HEADERS", true,
 		"If enabled, istiod will proxy 100-continue headers as is").Get()
 
-	EnableDeferredClusterCreation = env.Register("ENABLE_DEFERRED_CLUSTER_CREATION", true,
-		"If enabled, Istio will create clusters only when there are requests. This will save memory and CPU cycles"+
-			" in cases where there are lots of inactive clusters and > 1 worker thread").Get()
+	EnableLocalityWeightedLbConfig = env.Register("ENABLE_LOCALITY_WEIGHTED_LB_CONFIG", false,
+		"If enabled, always set LocalityWeightedLbConfig for a cluster, "+
+			" otherwise only apply it when locality lb is specified by DestinationRule for a service").Get()
+
+	EnableEnhancedDestinationRuleMerge = env.Register("ENABLE_ENHANCED_DESTINATIONRULE_MERGE", true,
+		"If enabled, Istio merge destinationrules considering their exportTo fields,"+
+			" they will be kept as independent rules if the exportTos are not equal.").Get()
+
+	UnifiedSidecarScoping = env.Register("PILOT_UNIFIED_SIDECAR_SCOPE", true,
+		"If true, unified SidecarScope creation will be used. This is only intended as a temporary feature flag for backwards compatibility.").Get()
+
+	CACertConfigMapName = env.Register("PILOT_CA_CERT_CONFIGMAP", "istio-ca-root-cert",
+		"The name of the ConfigMap that stores the Root CA Certificate that is used by istiod").Get()
+
+	EnvoyStatusPortEnableProxyProtocol = env.Register("ENVOY_STATUS_PORT_ENABLE_PROXY_PROTOCOL", false,
+		"If enabled, Envoy will support requests with proxy protocol on its status port").Get()
 )

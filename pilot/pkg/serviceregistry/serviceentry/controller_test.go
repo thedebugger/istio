@@ -26,6 +26,7 @@ import (
 	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/config/memory"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
 	"istio.io/istio/pkg/config"
@@ -33,6 +34,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/maps"
@@ -101,7 +103,7 @@ func initServiceDiscoveryWithoutEvents(t test.Failer) (model.ConfigStore, *Contr
 		}
 	}()
 
-	meshcfg := mesh.NewFixedWatcher(mesh.DefaultMeshConfig())
+	meshcfg := meshwatcher.NewTestWatcher(mesh.DefaultMeshConfig())
 	serviceController := NewController(configController, fx, meshcfg)
 	return configController, serviceController
 }
@@ -117,7 +119,7 @@ func initServiceDiscoveryWithOpts(t test.Failer, workloadOnly bool, opts ...Opti
 	delegate := model.NewEndpointIndexUpdater(endpoints)
 	xdsUpdater := xdsfake.NewWithDelegate(delegate)
 
-	meshcfg := mesh.NewFixedWatcher(mesh.DefaultMeshConfig())
+	meshcfg := meshwatcher.NewTestWatcher(mesh.DefaultMeshConfig())
 	istioStore := configController
 	var controller *Controller
 	if !workloadOnly {
@@ -133,9 +135,12 @@ func TestServiceDiscoveryServices(t *testing.T) {
 	store, sd, fx := initServiceDiscovery(t)
 	expectedServices := []*model.Service{
 		makeService(
-			"*.istio.io", "httpDNSRR", []string{constants.UnspecifiedIP}, map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSRoundRobinLB),
-		makeService("*.google.com", "httpDNS", []string{constants.UnspecifiedIP}, map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
-		makeService("tcpstatic.com", "tcpStatic", []string{"172.217.0.1"}, map[string]int{"tcp-444": 444}, true, model.ClientSideLB),
+			"*.istio.io", "httpDNSRR", "httpDNSRR",
+			[]string{constants.UnspecifiedIP}, "", "", map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSRoundRobinLB),
+		makeService("*.google.com", "httpDNS", "httpDNS",
+			[]string{constants.UnspecifiedIP}, "", "", map[string]int{"http-port": 80, "http-alt-port": 8080}, true, model.DNSLB),
+		makeService("tcpstatic.com", "tcpStatic", "tcpStatic",
+			[]string{"172.217.0.1"}, "", "", map[string]int{"tcp-444": 444}, true, model.ClientSideLB),
 	}
 
 	createConfigs([]*config.Config{httpDNS, httpDNSRR, tcpStatic}, store, t)
@@ -197,10 +202,10 @@ func TestServiceDiscoveryServiceDeleteOverlapping(t *testing.T) {
 		})
 
 	expected := []*model.ServiceInstance{
-		makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+		makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 			selector.Spec.(*networking.ServiceEntry).Ports[0],
 			map[string]string{"app": "wle"}, "default"),
-		makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+		makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 			selector.Spec.(*networking.ServiceEntry).Ports[1],
 			map[string]string{"app": "wle"}, "default"),
 	}
@@ -271,12 +276,12 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 
 	// Setup the expected instances for `httpStatic`. This will be added/removed from as we add various configs
 	baseInstances := []*model.ServiceInstance{
-		makeInstance(httpStatic, "2.2.2.2", 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpStatic, "2.2.2.2", 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
-		makeInstance(httpStatic, "3.3.3.3", 1080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpStatic, "3.3.3.3", 8080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
-		makeInstance(httpStatic, "4.4.4.4", 1080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, PlainText),
-		makeInstance(httpStatic, "4.4.4.4", 8080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}, PlainText),
+		makeInstance(httpStatic, []string{"2.2.2.2"}, 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpStatic, []string{"2.2.2.2"}, 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
+		makeInstance(httpStatic, []string{"3.3.3.3"}, 1080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpStatic, []string{"3.3.3.3"}, 8080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
+		makeInstance(httpStatic, []string{"4.4.4.4"}, 1080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, PlainText),
+		makeInstance(httpStatic, []string{"4.4.4.4"}, 8080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}, PlainText),
 	}
 
 	t.Run("simple entry", func(t *testing.T) {
@@ -294,7 +299,7 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Create another SE for the same host, expect these instances to get added
 		createConfigs([]*config.Config{httpStaticOverlay}, store, t)
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStatic, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace},
@@ -306,8 +311,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Update the SE for the same host, expect these instances to get added
 		createConfigs([]*config.Config{httpStaticOverlayUpdated}, store, t)
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStatic, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace, EndpointCount: len(instances)})
 
@@ -322,28 +327,28 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Add another SE with an additional endpoint with a matching address
 		createConfigs([]*config.Config{httpStaticOverlayUpdatedInstance}, store, t)
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"some-new-label": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"some-new-label": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStaticOverlayUpdatedInstance, 0, instances)
 		proxyInstances := []model.ServiceTarget{
 			makeTarget(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
 			makeTarget(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"some-new-label": "bar"}, PlainText),
 		}
-		expectProxyTargets(t, sd, proxyInstances, "6.6.6.6")
+		expectProxyTargets(t, sd, proxyInstances, []string{"6.6.6.6"})
 		// TODO 45 is wrong
 		expectEvents(t, events, Event{Type: "eds", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace, EndpointCount: len(instances)})
 
 		// Remove the additional endpoint
 		createConfigs([]*config.Config{httpStaticOverlayUpdated}, store, t)
 		instances = append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStatic, 0, instances)
 		proxyInstances = []model.ServiceTarget{
 			makeTarget(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
 		}
-		expectProxyTargets(t, sd, proxyInstances, "6.6.6.6")
+		expectProxyTargets(t, sd, proxyInstances, []string{"6.6.6.6"})
 		expectEvents(t, events, Event{Type: "eds", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace, EndpointCount: len(instances)})
 	})
 
@@ -351,7 +356,7 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Update the SE for the same host to remove the endpoint
 		createConfigs([]*config.Config{httpStaticOverlay}, store, t)
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStaticOverlay, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "eds", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace, EndpointCount: len(instances)})
@@ -361,8 +366,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Update the SE for the same host in a different ns, expect these instances to get added
 		createConfigs([]*config.Config{httpStaticOverlayUpdatedNs}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstance(httpStaticOverlayUpdatedNs, "5.5.5.5", 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlayUpdatedNs, "7.7.7.7", 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"namespace": "bar"}, PlainText),
+			makeInstance(httpStaticOverlayUpdatedNs, []string{"5.5.5.5"}, 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlayUpdatedNs, []string{"7.7.7.7"}, 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"namespace": "bar"}, PlainText),
 		}
 		// This lookup is per-namespace, so we should only see the objects in the same namespace
 		expectServiceInstances(t, sd, httpStaticOverlayUpdatedNs, 0, instances)
@@ -379,8 +384,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		expectServiceInstances(t, sd, httpStatic, 0, baseInstances)
 		// Check the other namespace is untouched
 		instances := []*model.ServiceInstance{
-			makeInstance(httpStaticOverlayUpdatedNs, "5.5.5.5", 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlayUpdatedNs, "7.7.7.7", 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"namespace": "bar"}, PlainText),
+			makeInstance(httpStaticOverlayUpdatedNs, []string{"5.5.5.5"}, 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlayUpdatedNs, []string{"7.7.7.7"}, 4567, httpStaticOverlayUpdatedNs.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"namespace": "bar"}, PlainText),
 		}
 		expectServiceInstances(t, sd, httpStaticOverlayUpdatedNs, 0, instances)
 		// svcUpdate is not triggered since `httpStatic` is there and has instances, so we should
@@ -411,8 +416,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		// Add back the ServiceEntry, expect these instances to get added
 		createConfigs([]*config.Config{httpStaticOverlayUpdated}, store, t)
 		instances = append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		expectServiceInstances(t, sd, httpStatic, 0, instances)
 		// Service change, so we need a full push
 		expectEvents(t, events,
@@ -432,8 +437,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 
 		// Endpoint ports should be changed
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 33333, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 33333, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 33333, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 33333, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		expectServiceInstances(t, sd, targetPortChanged, 0, instances)
 
 		// Expect a full push, as the target port has changed
@@ -447,8 +452,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 
 		// Endpoint ports should be changed
 		instances = append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		expectServiceInstances(t, sd, targetPortChanged, 0, instances)
 		// Expect a full push, as the target port has changed
 		expectEvents(t, events,
@@ -467,8 +472,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		}()
 		createConfigs([]*config.Config{httpStaticHost}, store, t)
 		instances := append(baseInstances,
-			makeInstance(httpStaticOverlay, "5.5.5.5", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(httpStaticOverlay, "6.6.6.6", 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
+			makeInstance(httpStaticOverlay, []string{"5.5.5.5"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(httpStaticOverlay, []string{"6.6.6.6"}, 4567, httpStaticOverlay.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText))
 		// This is not applied, just to make makeInstance pick the right service.
 		otherHost := func() *config.Config {
 			c := httpStaticOverlayUpdated.DeepCopy()
@@ -477,8 +482,8 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 			return &c
 		}()
 		instances2 := []*model.ServiceInstance{
-			makeInstance(otherHost, "5.5.5.5", 4567, httpStaticHost.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
-			makeInstance(otherHost, "6.6.6.6", 4567, httpStaticHost.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
+			makeInstance(otherHost, []string{"5.5.5.5"}, 4567, httpStaticHost.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"overlay": "bar"}, PlainText),
+			makeInstance(otherHost, []string{"6.6.6.6"}, 4567, httpStaticHost.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"other": "bar"}, PlainText),
 		}
 		expectServiceInstances(t, sd, httpStaticHost, 0, instances, instances2)
 		// Service change, so we need a full push
@@ -499,9 +504,9 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 	t.Run("change dns endpoints", func(t *testing.T) {
 		// Setup the expected instances for DNS. This will be added/removed from as we add various configs
 		instances1 := []*model.ServiceInstance{
-			makeInstance(tcpDNS, "lon.google.com", 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
+			makeInstance(tcpDNS, []string{"lon.google.com"}, 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
 				nil, MTLS),
-			makeInstance(tcpDNS, "in.google.com", 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
+			makeInstance(tcpDNS, []string{"in.google.com"}, 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
 				nil, MTLS),
 		}
 
@@ -519,7 +524,7 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 		}()
 
 		instances2 := []*model.ServiceInstance{
-			makeInstance(tcpDNS, "lon.google.com", 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
+			makeInstance(tcpDNS, []string{"lon.google.com"}, 444, tcpDNS.Spec.(*networking.ServiceEntry).Ports[0],
 				nil, MTLS),
 		}
 
@@ -558,6 +563,7 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 			Event{Type: "service", ID: "selector1.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "service", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "eds cache", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace},
+			Event{Type: "eds cache", ID: "selector1.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "xds full", ID: "*.google.com,selector1.com"}) // service added
 
 		selector1Updated := func() *config.Config {
@@ -573,6 +579,7 @@ func TestServiceDiscoveryServiceUpdate(t *testing.T) {
 			Event{Type: "service", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "service", ID: "selector1.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "eds cache", ID: "*.google.com", Namespace: httpStaticOverlay.Namespace},
+			Event{Type: "eds cache", ID: "selector1.com", Namespace: httpStaticOverlay.Namespace},
 			Event{Type: "xds full", ID: "*.google.com,selector1.com"}) // service updated
 	})
 }
@@ -610,7 +617,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{selector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "selector.com", Namespace: selector.Namespace},
@@ -623,10 +630,10 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		createConfigs([]*config.Config{wle}, store, t)
 
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -634,7 +641,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "2.2.2.2"},
@@ -651,10 +658,10 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		}()
 
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(updated, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(updated, []string{"2.2.2.2"}, 444,
 				updated.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(updated, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(updated, []string{"2.2.2.2"}, 445,
 				updated.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -664,7 +671,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		}
 
 		createConfigs([]*config.Config{updated}, store, t)
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, []*model.ServiceInstance{})
 		expectServiceInstances(t, sd, updated, 0, instances)
 		expectEvents(t, events,
@@ -677,10 +684,10 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 
 	t.Run("restore service entry host", func(t *testing.T) {
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -696,7 +703,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		}()
 
 		createConfigs([]*config.Config{selector}, store, t)
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectServiceInstances(t, sd, updated, 0, []*model.ServiceInstance{})
 		expectEvents(t, events,
@@ -711,7 +718,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{dnsSelector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "4.4.4.4")
+		expectProxyInstances(t, sd, instances, []string{"4.4.4.4"})
 		expectServiceInstances(t, sd, dnsSelector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "dns.selector.com", Namespace: dnsSelector.Namespace},
@@ -723,10 +730,10 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Add a WLE, we expect this to update
 		createConfigs([]*config.Config{dnsWle}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(dnsSelector, "4.4.4.4", 444,
+			makeInstanceWithServiceAccount(dnsSelector, []string{"4.4.4.4"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "dns-wle"}, "default"),
-			makeInstanceWithServiceAccount(dnsSelector, "4.4.4.4", 445,
+			makeInstanceWithServiceAccount(dnsSelector, []string{"4.4.4.4"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "dns-wle"}, "default"),
 		}
@@ -734,7 +741,7 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 			i.Endpoint.WorkloadName = "dnswl"
 			i.Endpoint.Namespace = dnsSelector.Namespace
 		}
-		expectProxyInstances(t, sd, instances, "4.4.4.4")
+		expectProxyInstances(t, sd, instances, []string{"4.4.4.4"})
 		expectServiceInstances(t, sd, dnsSelector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "eds cache", ID: "dns.selector.com", Namespace: dnsSelector.Namespace},
@@ -745,20 +752,20 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Add a different WLE
 		createConfigs([]*config.Config{wle2}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 		for _, i := range instances {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		instances = append(instances,
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 444,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 445,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"))
 		for _, i := range instances[2:] {
 			i.Endpoint.WorkloadName = "wl2"
@@ -775,20 +782,20 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Add a WLE with host address. Should be ignored by static service entry.
 		createConfigs([]*config.Config{wle3}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 		for _, i := range instances {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		instances = append(instances,
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 444,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 445,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"))
 		for _, i := range instances[2:] {
 			i.Endpoint.WorkloadName = "wl2"
@@ -804,16 +811,16 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Delete the configs, it should be gone
 		deleteConfigs([]*config.Config{wle2}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 		for _, i := range instances {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 2})
 
@@ -821,22 +828,22 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		deleteConfigs([]*config.Config{wle}, store, t)
 		instances = []*model.ServiceInstance{}
 		expectServiceInstances(t, sd, selector, 0, instances)
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 0})
 
 		// Add the config back
 		createConfigs([]*config.Config{wle}, store, t)
 		instances = []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 		for _, i := range instances {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "2.2.2.2"},
@@ -854,9 +861,9 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 		// Update the configs
 		createConfigs([]*config.Config{updated}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "9.9.9.9", 444,
+			makeInstanceWithServiceAccount(selector, []string{"9.9.9.9"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "9.9.9.9", 445,
+			makeInstanceWithServiceAccount(selector, []string{"9.9.9.9"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 		for _, i := range instances {
@@ -864,8 +871,8 @@ func TestServiceDiscoveryWorkloadUpdate(t *testing.T) {
 			i.Endpoint.Namespace = selector.Name
 		}
 		// Old IP is gone
-		expectProxyInstances(t, sd, nil, "2.2.2.2")
-		expectProxyInstances(t, sd, instances, "9.9.9.9")
+		expectProxyInstances(t, sd, nil, []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances, []string{"9.9.9.9"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "9.9.9.9"},
@@ -915,7 +922,7 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{selector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "selector.com", Namespace: selector.Namespace},
@@ -927,10 +934,10 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 		// Add a WLE, we expect this to update
 		createConfigs([]*config.Config{wle}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -938,7 +945,7 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "2.2.2.2"},
@@ -948,7 +955,7 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 		createConfigs([]*config.Config{wle2}, store, t)
 		instances = []*model.ServiceInstance{}
 		expectServiceInstances(t, sd, selector, 0, instances)
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "2.2.2.2"},
 			Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 0})
@@ -964,16 +971,16 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 		// add a wle, expect this to be an add
 		createConfigs([]*config.Config{wle3}, store, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 444,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 445,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -985,8 +992,8 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 			i.Endpoint.WorkloadName = "wl3"
 			i.Endpoint.Namespace = selector.Name
 		}
-		expectProxyInstances(t, sd, instances[:2], "2.2.2.2")
-		expectProxyInstances(t, sd, instances[2:], "3.3.3.3")
+		expectProxyInstances(t, sd, instances[:2], []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances[2:], []string{"3.3.3.3"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "3.3.3.3"},
@@ -995,10 +1002,10 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 
 		createConfigs([]*config.Config{wle2}, store, t)
 		instances = []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 444,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 445,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -1007,7 +1014,7 @@ func TestServiceDiscoveryWorkloadChangeLabel(t *testing.T) {
 			i.Endpoint.Namespace = selector.Name
 		}
 		expectServiceInstances(t, sd, selector, 0, instances)
-		expectProxyInstances(t, sd, instances, "3.3.3.3")
+		expectProxyInstances(t, sd, instances, []string{"3.3.3.3"})
 		expectEvents(t, events,
 			Event{Type: "proxy", ID: "2.2.2.2"},
 			Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 2})
@@ -1029,7 +1036,7 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 		Name:      "additional-name",
 		Namespace: selectorDNS.Name,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "4.4.4.4",
+			Addresses:      []string{"4.4.4.4"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selectorDNS.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -1040,7 +1047,18 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 		Name:      "another-name",
 		Namespace: selectorDNS.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "2.2.2.2",
+			Addresses:      []string{"2.2.2.2"},
+			Labels:         map[string]string{"app": "wle"},
+			ServiceAccount: genTestSpiffe(selector.Name, "default"),
+			TLSMode:        model.IstioMutualTLSModeLabel,
+		},
+	}
+
+	fiwithmulAddrs := &model.WorkloadInstance{
+		Name:      "additional-name-with-mulAddrs",
+		Namespace: selectorDNS.Name,
+		Endpoint: &model.IstioEndpoint{
+			Addresses:      []string{"3.3.3.3", "2001:1::1"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selectorDNS.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -1051,7 +1069,7 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{selectorDNS}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "4.4.4.4")
+		expectProxyInstances(t, sd, instances, []string{"4.4.4.4"})
 		expectServiceInstances(t, sd, selectorDNS, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "selector.com", Namespace: selectorDNS.Namespace},
@@ -1064,10 +1082,10 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 		createConfigs([]*config.Config{wle}, store, t)
 
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 444,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 444,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0],
 				map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 445,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 445,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1],
 				map[string]string{"app": "wle"}, "default"),
 		}
@@ -1075,7 +1093,7 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 			i.Endpoint.WorkloadName = "wl"
 			i.Endpoint.Namespace = selectorDNS.Name
 		}
-		expectProxyInstances(t, sd, instances, "postman-echo.com")
+		expectProxyInstances(t, sd, instances, []string{"postman-echo.com"})
 		expectServiceInstances(t, sd, selectorDNS, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "eds cache", ID: "selector.com", Namespace: selectorDNS.Namespace},
@@ -1086,13 +1104,13 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 	t.Run("full push for new instance", func(t *testing.T) {
 		callInstanceHandlers([]*model.WorkloadInstance{fi1}, sd, model.EventAdd, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selectorDNS, "4.4.4.4", 444,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"4.4.4.4"}, 444,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "4.4.4.4", 445,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"4.4.4.4"}, 445,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 444,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 444,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 445,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 445,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 
@@ -1101,8 +1119,8 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 			i.Endpoint.Namespace = selectorDNS.Name
 		}
 
-		expectProxyInstances(t, sd, instances[:2], "4.4.4.4")
-		expectProxyInstances(t, sd, instances[2:], "postman-echo.com")
+		expectProxyInstances(t, sd, instances[:2], []string{"4.4.4.4"})
+		expectProxyInstances(t, sd, instances[2:], []string{"postman-echo.com"})
 		expectServiceInstances(t, sd, selectorDNS, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "eds", ID: "selector.com", Namespace: selectorDNS.Namespace, EndpointCount: len(instances)},
@@ -1116,16 +1134,55 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 			Event{Type: "xds full", ID: "selector.com"})
 	})
 
+	t.Run("full push for new instance with multiple addresses", func(t *testing.T) {
+		callInstanceHandlers([]*model.WorkloadInstance{fiwithmulAddrs}, sd, model.EventAdd, t)
+		expectEvents(t, events,
+			Event{Type: "eds", ID: "selector.com", Namespace: selectorDNS.Namespace, EndpointCount: 8},
+			Event{Type: "xds full", ID: "selector.com"})
+	})
+
 	t.Run("full push on delete workload instance", func(t *testing.T) {
 		callInstanceHandlers([]*model.WorkloadInstance{fi1}, sd, model.EventDelete, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selectorDNS, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"2.2.2.2"}, 444,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"2.2.2.2"}, 445,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 444,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"3.3.3.3", "2001:1::1"}, 444,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selectorDNS, "postman-echo.com", 445,
+			makeInstanceWithServiceAccount(selectorDNS, []string{"3.3.3.3", "2001:1::1"}, 445,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 444,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 445,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+		}
+
+		for _, i := range instances[4:] {
+			i.Endpoint.WorkloadName = "wl"
+			i.Endpoint.Namespace = selectorDNS.Name
+		}
+
+		expectProxyInstances(t, sd, instances[:2], []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances[2:4], []string{"3.3.3.3", "2001:1::1"})
+		expectProxyInstances(t, sd, instances[4:], []string{"postman-echo.com"})
+		expectServiceInstances(t, sd, selectorDNS, 0, instances)
+
+		expectEvents(t, events,
+			Event{Type: "eds", ID: "selector.com", Namespace: selectorDNS.Namespace, EndpointCount: len(instances)},
+			Event{Type: "xds full", ID: "selector.com"})
+	})
+
+	t.Run("full push on delete workload instance with multiple addresses", func(t *testing.T) {
+		callInstanceHandlers([]*model.WorkloadInstance{fiwithmulAddrs}, sd, model.EventDelete, t)
+		instances := []*model.ServiceInstance{
+			makeInstanceWithServiceAccount(selectorDNS, []string{"2.2.2.2"}, 444,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selectorDNS, []string{"2.2.2.2"}, 445,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 444,
+				selectorDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selectorDNS, []string{"postman-echo.com"}, 445,
 				selectorDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
 
@@ -1134,8 +1191,8 @@ func TestWorkloadInstanceFullPush(t *testing.T) {
 			i.Endpoint.Namespace = selectorDNS.Name
 		}
 
-		expectProxyInstances(t, sd, instances[:2], "2.2.2.2")
-		expectProxyInstances(t, sd, instances[2:], "postman-echo.com")
+		expectProxyInstances(t, sd, instances[:2], []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances[2:], []string{"postman-echo.com"})
 		expectServiceInstances(t, sd, selectorDNS, 0, instances)
 
 		expectEvents(t, events,
@@ -1152,7 +1209,7 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		Name:      selector.Name,
 		Namespace: selector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "2.2.2.2",
+			Addresses:      []string{"2.2.2.2"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -1163,7 +1220,7 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		Name:      "some-other-name",
 		Namespace: selector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "3.3.3.3",
+			Addresses:      []string{"3.3.3.3"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -1174,9 +1231,20 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		Name:      "another-name",
 		Namespace: dnsSelector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "2.2.2.2",
+			Addresses:      []string{"2.2.2.2"},
 			Labels:         map[string]string{"app": "dns-wle"},
 			ServiceAccount: genTestSpiffe(dnsSelector.Name, "default"),
+			TLSMode:        model.IstioMutualTLSModeLabel,
+		},
+	}
+
+	fi4 := &model.WorkloadInstance{
+		Name:      "workload-with-muladdrs",
+		Namespace: selector.Namespace,
+		Endpoint: &model.IstioEndpoint{
+			Addresses:      []string{"4.4.4.4", "2001:1::1"},
+			Labels:         map[string]string{"app": "wle"},
+			ServiceAccount: genTestSpiffe(selector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
 		},
 	}
@@ -1185,7 +1253,7 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{selector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "selector.com", Namespace: selector.Namespace},
@@ -1196,7 +1264,7 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 	t.Run("add another service entry", func(t *testing.T) {
 		createConfigs([]*config.Config{dnsSelector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, dnsSelector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "dns.selector.com", Namespace: dnsSelector.Namespace},
@@ -1208,12 +1276,12 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		// Add a workload instance, we expect this to update
 		callInstanceHandlers([]*model.WorkloadInstance{fi1}, sd, model.EventAdd, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 2})
 	})
@@ -1222,31 +1290,72 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		// Add a different instance
 		callInstanceHandlers([]*model.WorkloadInstance{fi2}, sd, model.EventAdd, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		instances = append(instances,
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 444,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "3.3.3.3", 445,
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"))
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 4})
+	})
+
+	t.Run("add workload instance with multiple addresses", func(t *testing.T) {
+		// Add a workload instance, we expect this to update
+		callInstanceHandlers([]*model.WorkloadInstance{fi4}, sd, model.EventAdd, t)
+		instances := []*model.ServiceInstance{
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
+				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
+				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 444,
+				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"3.3.3.3"}, 445,
+				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"4.4.4.4", "2001:1::1"}, 444,
+				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"4.4.4.4", "2001:1::1"}, 445,
+				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+		}
+		expectProxyInstances(t, sd, instances[:2], []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances[2:4], []string{"3.3.3.3"})
+		expectProxyInstances(t, sd, instances[4:], []string{"4.4.4.4", "2001:1::1"})
+		expectServiceInstances(t, sd, selector, 0, instances)
+		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 6})
 	})
 
 	t.Run("delete workload instance", func(t *testing.T) {
 		// Delete the instances, it should be gone
 		callInstanceHandlers([]*model.WorkloadInstance{fi2}, sd, model.EventDelete, t)
 		instances := []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
 				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-			makeInstanceWithServiceAccount(selector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
+				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"4.4.4.4", "2001:1::1"}, 444,
+				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"4.4.4.4", "2001:1::1"}, 445,
 				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances[:2], []string{"2.2.2.2"})
+		expectProxyInstances(t, sd, instances[2:], []string{"4.4.4.4", "2001:1::1"})
+		expectServiceInstances(t, sd, selector, 0, instances)
+		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 4})
+
+		// Delete the instance with multiple addresses, it should be gone
+		callInstanceHandlers([]*model.WorkloadInstance{fi4}, sd, model.EventDelete, t)
+		instances = []*model.ServiceInstance{
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 444,
+				selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+			makeInstanceWithServiceAccount(selector, []string{"2.2.2.2"}, 445,
+				selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+		}
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 2})
 
@@ -1268,13 +1377,13 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		//
 		// Delete f3 event
 		callInstanceHandlers([]*model.WorkloadInstance{fi3}, sd, model.EventDelete, t)
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 
 		// Delete f1 event
 		callInstanceHandlers([]*model.WorkloadInstance{fi1}, sd, model.EventDelete, t)
 		instances = []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "selector.com", Namespace: selector.Namespace, EndpointCount: 0})
 
@@ -1291,12 +1400,12 @@ func TestServiceDiscoveryWorkloadInstance(t *testing.T) {
 		// Add f3 event
 		callInstanceHandlers([]*model.WorkloadInstance{fi3}, sd, model.EventAdd, t)
 		instances = []*model.ServiceInstance{
-			makeInstanceWithServiceAccount(dnsSelector, "2.2.2.2", 444,
+			makeInstanceWithServiceAccount(dnsSelector, []string{"2.2.2.2"}, 444,
 				dnsSelector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "dns-wle"}, "default"),
-			makeInstanceWithServiceAccount(dnsSelector, "2.2.2.2", 445,
+			makeInstanceWithServiceAccount(dnsSelector, []string{"2.2.2.2"}, 445,
 				dnsSelector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "dns-wle"}, "default"),
 		}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, dnsSelector, 0, instances)
 		expectEvents(t, events, Event{Type: "eds", ID: "dns.selector.com", Namespace: dnsSelector.Namespace, EndpointCount: 2})
 	})
@@ -1324,7 +1433,7 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 		// Add just the ServiceEntry with selector. We should see no instances
 		createConfigs([]*config.Config{selector}, store, t)
 		instances := []*model.ServiceInstance{}
-		expectProxyInstances(t, sd, instances, "2.2.2.2")
+		expectProxyInstances(t, sd, instances, []string{"2.2.2.2"})
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{Type: "service", ID: "selector.com", Namespace: selector.Namespace},
@@ -1349,8 +1458,12 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 					expectedProxyInstances: []expectedProxyInstances{
 						{
 							instancesWithSA: []*model.ServiceInstance{
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 444, selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 445, selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 444,
+									selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 445,
+									selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 							},
 							address: "2.2.2.2",
 						},
@@ -1385,8 +1498,12 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 					expectedProxyInstances: []expectedProxyInstances{
 						{
 							instancesWithSA: []*model.ServiceInstance{
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 444, selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 445, selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 444,
+									selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 445,
+									selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 							},
 							address: "2.2.2.2",
 						},
@@ -1402,15 +1519,23 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 					expectedProxyInstances: []expectedProxyInstances{
 						{
 							instancesWithSA: []*model.ServiceInstance{
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 444, selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-								makeInstanceWithServiceAccount(selector, "2.2.2.2", 445, selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 444,
+									selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"2.2.2.2"}, 445,
+									selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 							},
 							address: "2.2.2.2",
 						},
 						{
 							instancesWithSA: []*model.ServiceInstance{
-								makeInstanceWithServiceAccount(selector, "3.3.3.3", 444, selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-								makeInstanceWithServiceAccount(selector, "3.3.3.3", 445, selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"3.3.3.3"}, 444,
+									selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"3.3.3.3"}, 445,
+									selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 							},
 							address: "3.3.3.3",
 						},
@@ -1426,8 +1551,12 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 					expectedProxyInstances: []expectedProxyInstances{
 						{
 							instancesWithSA: []*model.ServiceInstance{
-								makeInstanceWithServiceAccount(selector, "3.3.3.3", 444, selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
-								makeInstanceWithServiceAccount(selector, "3.3.3.3", 445, selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"3.3.3.3"}, 444,
+									selector.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"app": "wle"}, "default"),
+								makeInstanceWithServiceAccount(selector,
+									[]string{"3.3.3.3"}, 445,
+									selector.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"app": "wle"}, "default"),
 							},
 							address: "3.3.3.3",
 						},
@@ -1445,7 +1574,7 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 					Name:      instance.name,
 					Namespace: instance.namespace,
 					Endpoint: &model.IstioEndpoint{
-						Address:        instance.address,
+						Addresses:      []string{instance.address},
 						Labels:         instance.labels,
 						ServiceAccount: genTestSpiffe(selector.Name, instance.serviceAccount),
 						TLSMode:        instance.tlsmode,
@@ -1456,7 +1585,7 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 
 				totalInstances := []*model.ServiceInstance{}
 				for _, expectedProxyInstance := range instance.expectedProxyInstances {
-					expectProxyInstances(t, sd, expectedProxyInstance.instancesWithSA, expectedProxyInstance.address)
+					expectProxyInstances(t, sd, expectedProxyInstance.instancesWithSA, []string{expectedProxyInstance.address})
 					totalInstances = append(totalInstances, expectedProxyInstance.instancesWithSA...)
 				}
 
@@ -1468,16 +1597,16 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 	}
 }
 
-func expectProxyInstances(t testing.TB, sd *Controller, expected []*model.ServiceInstance, ip string) {
+func expectProxyInstances(t testing.TB, sd *Controller, expected []*model.ServiceInstance, ips []string) {
 	t.Helper()
-	expectProxyTargets(t, sd, slices.Map(expected, model.ServiceInstanceToTarget), ip)
+	expectProxyTargets(t, sd, slices.Map(expected, model.ServiceInstanceToTarget), ips)
 }
 
-func expectProxyTargets(t testing.TB, sd *Controller, expected []model.ServiceTarget, ip string) {
+func expectProxyTargets(t testing.TB, sd *Controller, expected []model.ServiceTarget, ips []string) {
 	t.Helper()
 	// The system is eventually consistent, so add some retries
 	retry.UntilSuccessOrFail(t, func() error {
-		instances := sd.GetProxyServiceTargets(&model.Proxy{IPAddresses: []string{ip}, Metadata: &model.NodeMetadata{}})
+		instances := sd.GetProxyServiceTargets(&model.Proxy{IPAddresses: ips, Metadata: &model.NodeMetadata{}})
 		sortServiceTargets(instances)
 		sortServiceTargets(expected)
 		if err := compare(t, instances, expected); err != nil {
@@ -1494,7 +1623,7 @@ func expectEvents(t testing.TB, ch *xdsfake.Updater, events ...Event) {
 
 func expectServiceInstances(t testing.TB, sd *Controller, cfg *config.Config, port int, expected ...[]*model.ServiceInstance) {
 	t.Helper()
-	svcs := convertServices(*cfg, "")
+	svcs := convertServices(*cfg)
 	if len(svcs) != len(expected) {
 		t.Fatalf("got more services than expected: %v vs %v", len(svcs), len(expected))
 	}
@@ -1509,7 +1638,7 @@ func expectServiceInstances(t testing.TB, sd *Controller, cfg *config.Config, po
 	// The system is eventually consistent, so add some retries
 	retry.UntilSuccessOrFail(t, func() error {
 		for i, svc := range svcs {
-			endpoints := GetEndpointsForPort(svc, sd.XdsUpdater.(*xdsfake.Updater).Delegate.(*model.EndpointIndexUpdater).Index, port)
+			endpoints := GetEndpointsForPort(svc, sd.XdsUpdater.(*xdsfake.Updater).Delegate.(*model.FakeEndpointIndexUpdater).Index, port)
 			if endpoints == nil {
 				endpoints = []*model.IstioEndpoint{} // To simplify tests a bit
 			}
@@ -1529,10 +1658,10 @@ func TestServiceDiscoveryGetProxyServiceTargets(t *testing.T) {
 	createConfigs([]*config.Config{httpStatic, tcpStatic}, store, t)
 
 	expectProxyInstances(t, sd, []*model.ServiceInstance{
-		makeInstance(httpStatic, "2.2.2.2", 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpStatic, "2.2.2.2", 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
-		makeInstance(tcpStatic, "2.2.2.2", 444, tcpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-	}, "2.2.2.2")
+		makeInstance(httpStatic, []string{"2.2.2.2"}, 7080, httpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpStatic, []string{"2.2.2.2"}, 18080, httpStatic.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
+		makeInstance(tcpStatic, []string{"2.2.2.2"}, 444, tcpStatic.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+	}, []string{"2.2.2.2"})
 }
 
 // Keeping this test for legacy - but it never happens in real life.
@@ -1542,12 +1671,12 @@ func TestServiceDiscoveryInstances(t *testing.T) {
 	createConfigs([]*config.Config{httpDNS, tcpStatic}, store, t)
 
 	expectServiceInstances(t, sd, httpDNS, 0, []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "us.google.com", 18080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "uk.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
-		makeInstance(httpDNS, "de.google.com", 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}, MTLS),
+		makeInstance(httpDNS, []string{"us.google.com"}, 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"us.google.com"}, 18080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
+		makeInstance(httpDNS, []string{"uk.google.com"}, 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"uk.google.com"}, 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], nil, MTLS),
+		makeInstance(httpDNS, []string{"de.google.com"}, 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
+		makeInstance(httpDNS, []string{"de.google.com"}, 8080, httpDNS.Spec.(*networking.ServiceEntry).Ports[1], map[string]string{"foo": "bar"}, MTLS),
 	})
 }
 
@@ -1558,9 +1687,9 @@ func TestServiceDiscoveryInstances1Port(t *testing.T) {
 	createConfigs([]*config.Config{httpDNS, tcpStatic}, store, t)
 
 	expectServiceInstances(t, sd, httpDNS, 80, []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
+		makeInstance(httpDNS, []string{"us.google.com"}, 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"uk.google.com"}, 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"de.google.com"}, 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
 	})
 }
 
@@ -1588,9 +1717,9 @@ func TestNonServiceConfig(t *testing.T) {
 	// Now create some service entries and verify that it's added to the registry.
 	createConfigs([]*config.Config{httpDNS, tcpStatic}, store, t)
 	expectServiceInstances(t, sd, httpDNS, 80, []*model.ServiceInstance{
-		makeInstance(httpDNS, "us.google.com", 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "uk.google.com", 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
-		makeInstance(httpDNS, "de.google.com", 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
+		makeInstance(httpDNS, []string{"us.google.com"}, 7080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"uk.google.com"}, 1080, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], nil, MTLS),
+		makeInstance(httpDNS, []string{"de.google.com"}, 80, httpDNS.Spec.(*networking.ServiceEntry).Ports[0], map[string]string{"foo": "bar"}, MTLS),
 	})
 }
 
@@ -1728,8 +1857,8 @@ func TestServicesDiff(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			as := convertServices(*tt.current, "")
-			bs := convertServices(*tt.new, "")
+			as := convertServices(*tt.current)
+			bs := convertServices(*tt.new)
 			added, deleted, updated, unchanged := servicesDiff(as, bs)
 			for i, item := range []struct {
 				hostnames []host.Name
@@ -1779,7 +1908,7 @@ func sortServiceInstances(instances []*model.ServiceInstance) {
 	sort.Slice(instances, func(i, j int) bool {
 		if instances[i].Service.Hostname == instances[j].Service.Hostname {
 			if instances[i].Endpoint.EndpointPort == instances[j].Endpoint.EndpointPort {
-				if instances[i].Endpoint.Address == instances[j].Endpoint.Address {
+				if instances[i].Endpoint.FirstAddressOrNil() == instances[j].Endpoint.FirstAddressOrNil() {
 					if len(instances[i].Endpoint.Labels) == len(instances[j].Endpoint.Labels) {
 						iLabels := labelsToSlice(instances[i].Endpoint.Labels)
 						jLabels := labelsToSlice(instances[j].Endpoint.Labels)
@@ -1791,7 +1920,7 @@ func sortServiceInstances(instances []*model.ServiceInstance) {
 					}
 					return len(instances[i].Endpoint.Labels) < len(instances[j].Endpoint.Labels)
 				}
-				return instances[i].Endpoint.Address < instances[j].Endpoint.Address
+				return instances[i].Endpoint.FirstAddressOrNil() < instances[j].Endpoint.FirstAddressOrNil()
 			}
 			return instances[i].Endpoint.EndpointPort < instances[j].Endpoint.EndpointPort
 		}
@@ -1811,7 +1940,7 @@ func sortEndpoints(endpoints []*model.IstioEndpoint) {
 
 	sort.Slice(endpoints, func(i, j int) bool {
 		if endpoints[i].EndpointPort == endpoints[j].EndpointPort {
-			if endpoints[i].Address == endpoints[j].Address {
+			if endpoints[i].FirstAddressOrNil() == endpoints[j].FirstAddressOrNil() {
 				if len(endpoints[i].Labels) == len(endpoints[j].Labels) {
 					iLabels := labelsToSlice(endpoints[i].Labels)
 					jLabels := labelsToSlice(endpoints[j].Labels)
@@ -1823,7 +1952,7 @@ func sortEndpoints(endpoints []*model.IstioEndpoint) {
 				}
 				return len(endpoints[i].Labels) < len(endpoints[j].Labels)
 			}
-			return endpoints[i].Address < endpoints[j].Address
+			return endpoints[i].FirstAddressOrNil() < endpoints[j].FirstAddressOrNil()
 		}
 		return endpoints[i].EndpointPort < endpoints[j].EndpointPort
 	})
@@ -1841,7 +1970,9 @@ func sortPorts(ports []*model.Port) {
 	})
 }
 
-func Test_autoAllocateIP_conditions(t *testing.T) {
+func Test_legacyAutoAllocateIP_conditions(t *testing.T) {
+	// We are testing the old IP allocation which turns off if the new one is enabled
+	test.SetForTest(t, &features.EnableIPAutoallocate, false)
 	tests := []struct {
 		name         string
 		inServices   []*model.Service
@@ -2040,7 +2171,9 @@ func Test_autoAllocateIP_conditions(t *testing.T) {
 	}
 }
 
-func Test_autoAllocateIP_values(t *testing.T) {
+func Test_legacyAutoAllocateIP_values(t *testing.T) {
+	// We are testing the old IP allocation which turns off if the new one is enabled
+	test.SetForTest(t, &features.EnableIPAutoallocate, false)
 	ips := maxIPs
 	inServices := make([]*model.Service, ips)
 	for i := 0; i < ips; i++ {
@@ -2118,7 +2251,9 @@ func BenchmarkAutoAllocateIPs(t *testing.B) {
 }
 
 // Validate that ipaddress allocation is deterministic based on hash.
-func Test_autoAllocateIP_deterministic(t *testing.T) {
+func Test_legacyAutoAllocateIP_deterministic(t *testing.T) {
+	// We are testing the old IP allocation which turns off if the new one is enabled
+	test.SetForTest(t, &features.EnableIPAutoallocate, false)
 	inServices := make([]*model.Service, 0)
 	originalServices := map[string]string{
 		"a.com": "240.240.109.8",
@@ -2202,6 +2337,9 @@ func Test_autoAllocateIP_deterministic(t *testing.T) {
 }
 
 func Test_autoAllocateIP_with_duplicated_host(t *testing.T) {
+	// Only the old IP auto-allocator has this functionality
+	// TODO(https://github.com/istio/istio/issues/53676): implement this in the new one, and test both
+	test.SetForTest(t, &features.EnableIPAutoallocate, false)
 	inServices := make([]*model.Service, 0)
 	originalServices := map[string]string{
 		"a.com": "240.240.109.8",
@@ -2307,7 +2445,7 @@ func BenchmarkWorkloadInstanceHandler(b *testing.B) {
 		Name:      selector.Name,
 		Namespace: selector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "2.2.2.2",
+			Addresses:      []string{"2.2.2.2"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -2318,7 +2456,7 @@ func BenchmarkWorkloadInstanceHandler(b *testing.B) {
 		Name:      "some-other-name",
 		Namespace: selector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "3.3.3.3",
+			Addresses:      []string{"3.3.3.3"},
 			Labels:         map[string]string{"app": "wle"},
 			ServiceAccount: genTestSpiffe(selector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,
@@ -2329,7 +2467,7 @@ func BenchmarkWorkloadInstanceHandler(b *testing.B) {
 		Name:      "another-name",
 		Namespace: dnsSelector.Namespace,
 		Endpoint: &model.IstioEndpoint{
-			Address:        "2.2.2.2",
+			Addresses:      []string{"2.2.2.2"},
 			Labels:         map[string]string{"app": "dns-wle"},
 			ServiceAccount: genTestSpiffe(dnsSelector.Name, "default"),
 			TLSMode:        model.IstioMutualTLSModeLabel,

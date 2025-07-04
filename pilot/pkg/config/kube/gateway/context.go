@@ -22,10 +22,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/util/sets"
 )
@@ -88,7 +88,9 @@ func (gc GatewayContext) ResolveGatewayInstances(
 			instances := gc.ps.ServiceEndpointsByPort(svc, port, nil)
 			if len(instances) > 0 {
 				foundInternal.Insert(fmt.Sprintf("%s:%d", g, port))
-				foundInternalIP.InsertAll(svc.GetAddresses(&model.Proxy{Metadata: &model.NodeMetadata{ClusterID: gc.cluster}})...)
+				dummyProxy := &model.Proxy{Metadata: &model.NodeMetadata{ClusterID: gc.cluster}}
+				dummyProxy.SetIPMode(model.Dual)
+				foundInternalIP.InsertAll(svc.GetAllAddressesForProxy(dummyProxy)...)
 				if svc.Attributes.ClusterExternalAddresses.Len() > 0 {
 					// Fetch external IPs from all clusters
 					svc.Attributes.ClusterExternalAddresses.ForEach(func(c cluster.ID, externalIPs []string) {
@@ -119,7 +121,7 @@ func (gc GatewayContext) ResolveGatewayInstances(
 							port, g, sets.SortedList(hintPort)))
 						foundUnusable = true
 					} else {
-						_, isManaged := svc.Attributes.Labels[constants.ManagedGatewayLabel]
+						_, isManaged := svc.Attributes.Labels[label.GatewayManaged.Name]
 						var portExistsOnService bool
 						for _, p := range svc.Ports {
 							if p.Port == port {

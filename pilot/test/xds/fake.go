@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -55,12 +56,14 @@ import (
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/gvr"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/keepalive"
 	kubelib "istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
@@ -113,14 +116,15 @@ type FakeOptions struct {
 
 type FakeDiscoveryServer struct {
 	*core.ConfigGenTest
-	t            test.Failer
-	Discovery    *xds.DiscoveryServer
-	Listener     net.Listener
-	BufListener  *bufconn.Listener
-	kubeClient   kubelib.Client
-	KubeRegistry *kube.FakeController
-	XdsUpdater   model.XDSUpdater
-	MemRegistry  *memregistry.ServiceDiscovery
+	t              test.Failer
+	Discovery      *xds.DiscoveryServer
+	DiscoveryDebug *http.ServeMux
+	Listener       net.Listener
+	BufListener    *bufconn.Listener
+	kubeClient     kubelib.Client
+	KubeRegistry   *kube.FakeController
+	XdsUpdater     model.XDSUpdater
+	MemRegistry    *memregistry.ServiceDiscovery
 }
 
 func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServer {
@@ -130,7 +134,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	}
 
 	// Init with a dummy environment, since we have a circular dependency with the env creation.
-	s := xds.NewDiscoveryServer(model.NewEnvironment(), map[string]string{})
+	s := xds.NewDiscoveryServer(model.NewEnvironment(), map[string]string{}, krt.GlobalDebugHandler)
 	// Disable debounce to reduce test times
 	s.DebounceOptions.DebounceAfter = opts.DebounceTime
 	// Setup time to Now instead of process start to make logs not misleading
@@ -158,6 +162,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 			s.ConfigUpdate(&model.PushRequest{
 				Full:   true,
 				Reason: model.NewReasonStats(model.NetworksTrigger),
+				Forced: true,
 			})
 		})
 	}
@@ -189,14 +194,19 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 			NetworksWatcher: opts.NetworksWatcher,
 			SkipRun:         true,
 			ConfigCluster:   k8sCluster == opts.DefaultClusterName,
-			MeshWatcher:     mesh.NewFixedWatcher(m),
+			MeshWatcher:     meshwatcher.NewTestWatcher(m),
 			CRDs: []schema.GroupVersionResource{
 				// Install all CRDs used (mostly in Ambient)
 				gvr.AuthorizationPolicy,
 				gvr.PeerAuthentication,
-				gvr.KubernetesGateway,
-				gvr.KubernetesGateway,
 				gvr.WorkloadEntry,
+				gvr.GatewayClass,
+				gvr.KubernetesGateway,
+				gvr.HTTPRoute,
+				gvr.GRPCRoute,
+				gvr.TCPRoute,
+				gvr.TLSRoute,
+				gvr.ReferenceGrant,
 				gvr.ServiceEntry,
 			},
 		})
@@ -216,9 +226,9 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	}
 
 	stop := test.NewStop(t)
-	ingr := ingress.NewController(defaultKubeClient, mesh.NewFixedWatcher(m), kube.Options{
+	ingr := ingress.NewController(defaultKubeClient, meshwatcher.NewTestWatcher(m), kube.Options{
 		DomainSuffix: "cluster.local",
-	})
+	}, xdsUpdater)
 	defaultKubeClient.RunAndWait(stop)
 
 	var gwc *gateway.Controller
@@ -233,11 +243,11 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		ServiceRegistries:   registries,
 		ConfigStoreCaches:   []model.ConfigStoreController{ingr},
 		CreateConfigStore: func(c model.ConfigStoreController) model.ConfigStoreController {
-			g := gateway.NewController(defaultKubeClient, c, func(class schema.GroupVersionResource, stop <-chan struct{}) bool {
+			g := gateway.NewController(defaultKubeClient, func(class schema.GroupVersionResource, stop <-chan struct{}) bool {
 				return true
-			}, nil, kube.Options{
+			}, kube.Options{
 				DomainSuffix: "cluster.local",
-			})
+			}, xdsUpdater)
 			gwc = g
 			return gwc
 		},
@@ -257,6 +267,10 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	s.Generators[v3.SecretType] = xds.NewSecretGen(creds, s.Cache, opts.DefaultClusterName, nil)
 	s.Generators[v3.ExtensionConfigurationType].(*xds.EcdsGenerator).SetCredController(creds)
 
+	debugMux := s.InitDebug(http.NewServeMux(), false, func() map[string]string {
+		return nil
+	})
+
 	memRegistry := cg.MemRegistry
 	memRegistry.XdsUpdater = s
 
@@ -265,7 +279,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	configHandler := func(_, curr config.Config, event model.Event) {
 		pushReq := &model.PushRequest{
 			Full:           true,
-			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.MustFromGVK(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
+			ConfigsUpdated: sets.New(model.ConfigKey{Kind: gvk.MustToKind(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
 			Reason:         model.NewReasonStats(model.ConfigUpdate),
 		}
 		s.ConfigUpdate(pushReq)
@@ -331,7 +345,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 
 	// Send an update. This ensures that even if there are no configs provided, the push context is
 	// initialized.
-	s.ConfigUpdate(&model.PushRequest{Full: true})
+	s.ConfigUpdate(&model.PushRequest{Full: true, Forced: true})
 
 	// Wait until initial updates are committed
 	c := s.InboundUpdates.Load()
@@ -344,15 +358,16 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 
 	bufListener, _ := listener.(*bufconn.Listener)
 	fake := &FakeDiscoveryServer{
-		t:             t,
-		Discovery:     s,
-		Listener:      listener,
-		BufListener:   bufListener,
-		ConfigGenTest: cg,
-		kubeClient:    defaultKubeClient,
-		KubeRegistry:  defaultKubeController,
-		XdsUpdater:    xdsUpdater,
-		MemRegistry:   memRegistry,
+		t:              t,
+		Discovery:      s,
+		DiscoveryDebug: debugMux,
+		Listener:       listener,
+		BufListener:    bufListener,
+		ConfigGenTest:  cg,
+		kubeClient:     defaultKubeClient,
+		KubeRegistry:   defaultKubeController,
+		XdsUpdater:     xdsUpdater,
+		MemRegistry:    memRegistry,
 	}
 
 	return fake

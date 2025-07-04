@@ -17,6 +17,7 @@ package waypoint
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gateway "sigs.k8s.io/gateway-api/apis/v1"
@@ -47,6 +48,8 @@ var (
 	revision      = ""
 	waitReady     bool
 	allNamespaces bool
+
+	waypointTimeout time.Duration
 
 	deleteAll bool
 
@@ -102,11 +105,15 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				gw.Labels = map[string]string{}
 			}
 
-			gw.Labels[constants.AmbientWaypointForTrafficTypeLabel] = trafficType
+			gw.Labels[label.IoIstioWaypointFor.Name] = trafficType
 		}
 
 		if revision != "" {
-			gw.Labels = map[string]string{label.IoIstioRev.Name: revision}
+			if gw.Labels == nil {
+				gw.Labels = map[string]string{}
+			}
+
+			gw.Labels[label.IoIstioRev.Name] = revision
 		}
 		return &gw, nil
 	}
@@ -116,10 +123,10 @@ func Cmd(ctx cli.Context) *cobra.Command {
 		Short: "Show the status of waypoints in a namespace",
 		Long:  "Show the status of waypoints for the namespace provided or default namespace if none is provided",
 		Example: `  # Show the status of the waypoint in the default namespace
-		 istioctl waypoint status
-		  
-		 # Show the status of the waypoint in a specific namespace
-  		 istioctl waypoint status --namespace default`,
+  istioctl waypoint status
+
+  # Show the status of the waypoint in a specific namespace
+  istioctl waypoint status --namespace default`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) != 0 {
 				return fmt.Errorf("unknown subcommand %q", args[0])
@@ -215,7 +222,7 @@ func Cmd(ctx cli.Context) *cobra.Command {
 			// NOTE: This is a warning and not an error because the user may not intend to label their namespace as ambient.
 			//
 			// e.g. Users are handling ambient redirection per workload rather than at the namespace level.
-			hasWaypoint, err := namespaceHasLabel(kubeClient, ns, constants.AmbientUseWaypointLabel)
+			hasWaypoint, err := namespaceHasLabel(kubeClient, ns, label.IoIstioUseWaypoint.Name)
 			if err != nil {
 				return err
 			}
@@ -223,16 +230,16 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				if !overwrite && hasWaypoint {
 					// we don't want to error on the user when they don't explicitly overwrite namespaced Waypoints,
 					// we just warn them and provide a suggestion
-					fmt.Fprintf(cmd.OutOrStdout(), "Warning: namespace (%s) already has an enrolled Waypoint. Consider "+
+					fmt.Fprintf(cmd.OutOrStdout(), "⚠️ Warning: namespace (%s) already has an enrolled Waypoint. Consider "+
 						"adding the `"+"--overwrite"+"` flag to your apply command.\n", ns)
 					return nil
 				}
-				namespaceIsLabeledAmbient, err := namespaceHasLabelWithValue(kubeClient, ns, constants.DataplaneModeLabel, constants.DataplaneModeAmbient)
+				namespaceIsLabeledAmbient, err := namespaceHasLabelWithValue(kubeClient, ns, label.IoIstioDataplaneMode.Name, constants.DataplaneModeAmbient)
 				if err != nil {
 					return fmt.Errorf("failed to check if namespace is labeled ambient: %v", err)
 				}
 				if !namespaceIsLabeledAmbient {
-					fmt.Fprintf(cmd.OutOrStdout(), "Warning: namespace is not enrolled in ambient. Consider running\t"+
+					fmt.Fprintf(cmd.OutOrStdout(), "⚠️ Warning: namespace is not enrolled in ambient. Consider running\t"+
 						"`"+"kubectl label namespace %s istio.io/dataplane-mode=ambient"+"`\n", ns)
 				}
 			}
@@ -250,11 +257,13 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				FieldManager: "istioctl",
 			})
 			if err != nil {
-				if errors.IsNotFound(err) {
+				if kerrors.IsNotFound(err) {
 					return fmt.Errorf("missing Kubernetes Gateway CRDs need to be installed before applying a waypoint: %s", err)
 				}
 				return err
 			}
+
+			fmt.Fprintf(cmd.OutOrStdout(), "✅ waypoint %v/%v applied\n", gw.Namespace, gw.Name)
 
 			if waitReady {
 				startTime := time.Now()
@@ -275,12 +284,13 @@ func Cmd(ctx cli.Context) *cobra.Command {
 					if programmed {
 						break
 					}
-					if time.Since(startTime) > waitTimeout {
+					if time.Since(startTime) > waypointTimeout {
 						return errorWithMessage("timed out while waiting for waypoint", gwc, err)
 					}
 				}
+
+				fmt.Fprintf(cmd.OutOrStdout(), "✅ waypoint %v/%v is ready!\n", gw.Namespace, gw.Name)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "waypoint %v/%v applied\n", gw.Namespace, gw.Name)
 
 			// If a user decides to enroll their namespace with a waypoint, label the namespace with the waypoint name
 			// after the waypoint has been applied.
@@ -289,8 +299,8 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("failed to label namespace with waypoint: %v", err)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "namespace %v labeled with \"%v: %v\"\n", ctx.NamespaceOrDefault(ctx.Namespace()),
-					constants.AmbientUseWaypointLabel, gw.Name)
+				fmt.Fprintf(cmd.OutOrStdout(), "✅ namespace %v labeled with \"%v: %v\"\n", ctx.NamespaceOrDefault(ctx.Namespace()),
+					label.IoIstioUseWaypoint.Name, gw.Name)
 			}
 			return nil
 		},
@@ -312,23 +322,23 @@ func Cmd(ctx cli.Context) *cobra.Command {
 		Use:   "delete",
 		Short: "Delete a waypoint configuration",
 		Long:  "Delete a waypoint configuration from the cluster",
-		Example: `  # Delete a waypoint from the default namespace
-  istioctl waypoint delete
-
-  # Delete a waypoint by name, which can obtain from istioctl waypoint list
+		Example: `  # Delete a waypoint by name, which can obtain from istioctl waypoint list
   istioctl waypoint delete waypoint-name --namespace default
 
   # Delete several waypoints by name
   istioctl waypoint delete waypoint-name1 waypoint-name2 --namespace default
 
   # Delete all waypoints in a specific namespace
-  istioctl waypoint delete --all --namespace default`,
+  istioctl waypoint delete --all --namespace default
+
+  # Delete specific revision waypoints in a namespace
+  istioctl waypoint delete --revision v1 --namespace default`,
 		Args: func(cmd *cobra.Command, args []string) error {
-			if deleteAll && len(args) > 0 {
+			if (deleteAll || revision != "") && len(args) > 0 {
 				return fmt.Errorf("cannot specify waypoint names when deleting all waypoints")
 			}
-			if !deleteAll && len(args) == 0 {
-				return fmt.Errorf("must either specify a waypoint name or delete all using --all")
+			if !(deleteAll || revision != "") && len(args) == 0 {
+				return fmt.Errorf("must specify a waypoint name or delete all using --all or delete specific revision using --revision")
 			}
 			return nil
 		},
@@ -340,15 +350,16 @@ func Cmd(ctx cli.Context) *cobra.Command {
 			ns := ctx.NamespaceOrDefault(ctx.Namespace())
 
 			// Delete all waypoints if the --all flag is set
-			if deleteAll {
-				return deleteWaypoints(cmd, kubeClient, ns, nil)
+			if deleteAll || revision != "" {
+				return deleteWaypoints(cmd, kubeClient, ns, nil, revision)
 			}
 
 			// Delete waypoints by names if provided
-			return deleteWaypoints(cmd, kubeClient, ns, args)
+			return deleteWaypoints(cmd, kubeClient, ns, args, revision)
 		},
 	}
 	waypointDeleteCmd.Flags().BoolVar(&deleteAll, "all", false, "Delete all waypoints in the namespace")
+	waypointDeleteCmd.Flags().StringVarP(&revision, "revision", "r", "", "Delete the specified version of the waypoint in the namespace")
 
 	waypointListCmd := &cobra.Command{
 		Use:   "list",
@@ -395,9 +406,9 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				filteredGws = append(filteredGws, gw)
 			}
 			if allNamespaces {
-				fmt.Fprintln(w, "NAMESPACE\tNAME\tREVISION\tPROGRAMMED")
+				fmt.Fprintln(w, "NAMESPACE\tNAME\tREVISION\tTRAFFIC TYPE\tPROGRAMMED")
 			} else {
-				fmt.Fprintln(w, "NAME\tREVISION\tPROGRAMMED")
+				fmt.Fprintln(w, "NAME\tREVISION\tTRAFFIC TYPE\tPROGRAMMED")
 			}
 			for _, gw := range filteredGws {
 				programmed := kstatus.StatusFalse
@@ -405,15 +416,19 @@ func Cmd(ctx cli.Context) *cobra.Command {
 				if rev == "" {
 					rev = "default"
 				}
+				typeTraffic := gw.Labels[label.IoIstioWaypointFor.Name]
+				if typeTraffic == "" {
+					typeTraffic = "none"
+				}
 				for _, cond := range gw.Status.Conditions {
 					if cond.Type == string(gateway.GatewayConditionProgrammed) {
 						programmed = string(cond.Status)
 					}
 				}
 				if allNamespaces {
-					_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", gw.Namespace, gw.Name, rev, programmed)
+					_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", gw.Namespace, gw.Name, rev, typeTraffic, programmed)
 				} else {
-					_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", gw.Name, rev, programmed)
+					_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", gw.Name, rev, typeTraffic, programmed)
 				}
 			}
 			return w.Flush()
@@ -447,7 +462,9 @@ func Cmd(ctx cli.Context) *cobra.Command {
 
 	waypointApplyCmd.Flags().StringVarP(&revision, "revision", "r", "", "The revision to label the waypoint with")
 	waypointApplyCmd.Flags().BoolVarP(&waitReady, "wait", "w", false, "Wait for the waypoint to be ready")
+	waypointApplyCmd.Flags().DurationVar(&waypointTimeout, "waypoint-timeout", waitTimeout, "Timeout for waiting for waypoint ready")
 	waypointGenerateCmd.Flags().StringVarP(&revision, "revision", "r", "", "The revision to label the waypoint with")
+	waypointStatusCmd.Flags().DurationVar(&waypointTimeout, "waypoint-timeout", waitTimeout, "Timeout for retrieving status for waypoint")
 	waypointCmd.AddCommand(waypointGenerateCmd)
 	waypointCmd.AddCommand(waypointDeleteCmd)
 	waypointCmd.AddCommand(waypointListCmd)
@@ -459,29 +476,59 @@ func Cmd(ctx cli.Context) *cobra.Command {
 }
 
 // deleteWaypoints handles the deletion of waypoints based on the provided names, or all if names is nil
-func deleteWaypoints(cmd *cobra.Command, kubeClient kube.CLIClient, namespace string, names []string) error {
+func deleteWaypoints(cmd *cobra.Command, kubeClient kube.CLIClient, namespace string, names []string, revision string) error {
 	var multiErr *multierror.Error
+	var nameList []string
 	if names == nil {
-		// If names is nil, delete all waypoints
+		var selector string
+		if revision != "" {
+			selector = "istio.io/rev=" + revision
+		}
+		// If names is nil, delete all or the specified revision waypoints
 		waypoints, err := kubeClient.GatewayAPI().GatewayV1().Gateways(namespace).
-			List(context.Background(), metav1.ListOptions{})
+			List(context.Background(), metav1.ListOptions{
+				LabelSelector: selector,
+			})
 		if err != nil {
 			return err
 		}
 		for _, gw := range waypoints.Items {
-			names = append(names, gw.Name)
+			if gw.Spec.GatewayClassName != constants.WaypointGatewayClassName {
+				continue
+			}
+			nameList = append(nameList, gw.Name)
+		}
+	} else {
+		gws, err := kubeClient.GatewayAPI().GatewayV1().Gateways(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return err
+		}
+		waypoints := make(map[string]gateway.Gateway)
+		for _, gw := range gws.Items {
+			if gw.Spec.GatewayClassName != constants.WaypointGatewayClassName {
+				continue
+			}
+			waypoints[gw.Name] = gw
+		}
+
+		for _, name := range names {
+			if _, ok := waypoints[name]; ok {
+				nameList = append(nameList, name)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "waypoint %s/%s not found\n", namespace, name)
+			}
 		}
 	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	for _, name := range names {
+	for _, name := range nameList {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
 			if err := kubeClient.GatewayAPI().GatewayV1().Gateways(namespace).
 				Delete(context.Background(), name, metav1.DeleteOptions{}); err != nil {
-				if errors.IsNotFound(err) {
+				if kerrors.IsNotFound(err) {
 					fmt.Fprintf(cmd.OutOrStdout(), "waypoint %v/%v not found\n", namespace, name)
 				} else {
 					mu.Lock()
@@ -506,7 +553,7 @@ func labelNamespaceWithWaypoint(kubeClient kube.CLIClient, ns string) error {
 	if nsObj.Labels == nil {
 		nsObj.Labels = map[string]string{}
 	}
-	nsObj.Labels[constants.AmbientUseWaypointLabel] = waypointName
+	nsObj.Labels[label.IoIstioUseWaypoint.Name] = waypointName
 	if _, err := kubeClient.Kube().CoreV1().Namespaces().Update(context.Background(), nsObj, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("failed to update namespace %s: %v", ns, err)
 	}
@@ -537,7 +584,7 @@ func namespaceHasLabelWithValue(kubeClient kube.CLIClient, ns string, label, lab
 
 func getNamespace(kubeClient kube.CLIClient, ns string) (*corev1.Namespace, error) {
 	nsObj, err := kubeClient.Kube().CoreV1().Namespaces().Get(context.Background(), ns, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
+	if kerrors.IsNotFound(err) {
 		return nil, fmt.Errorf("namespace: %s not found", ns)
 	} else if err != nil {
 		return nil, fmt.Errorf("failed to get namespace %s: %v", ns, err)
@@ -550,7 +597,7 @@ func errorWithMessage(errMsg string, gwc *gateway.Gateway, err error) error {
 	if err != nil {
 		errorMsg += fmt.Sprintf(": %s", err)
 	}
-	return fmt.Errorf(errorMsg)
+	return errors.New(errorMsg)
 }
 
 func printWaypointStatus(ctx cli.Context, w *tabwriter.Writer, kubeClient kube.CLIClient, gw []gateway.Gateway) error {
@@ -585,7 +632,8 @@ func printWaypointStatus(ctx cli.Context, w *tabwriter.Writer, kubeClient kube.C
 			if programmed {
 				break
 			}
-			if time.Since(startTime) > waitTimeout {
+
+			if time.Since(startTime) > waypointTimeout {
 				return errorWithMessage("timed out while retrieving status for waypoint", gwc, err)
 			}
 		}

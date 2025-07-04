@@ -44,7 +44,7 @@ import (
 	"istio.io/api/annotation"
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	opconfig "istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/pilot/cmd/pilot-agent/status"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
@@ -58,7 +58,6 @@ import (
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
-	iptablesconstants "istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
 var (
@@ -218,10 +217,10 @@ func NewWebhook(p WebhookParameters) (*Webhook, error) {
 	wh.MultiCast = mc
 	sidecarConfig, valuesConfig, err := p.Watcher.Get()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get initial configuration: %v", err)
 	}
 	if err := wh.updateConfig(sidecarConfig, valuesConfig); err != nil {
-		log.Errorf("failed to process webhook config: %v", err)
+		return nil, fmt.Errorf("failed to process webhook config: %v", err)
 	}
 
 	p.Mux.HandleFunc("/inject", wh.serveInject)
@@ -247,7 +246,7 @@ func (wh *Webhook) updateConfig(sidecarConfig *Config, valuesConfig string) erro
 	wh.Config = sidecarConfig
 	vc, err := NewValuesConfig(valuesConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create new values config: %v", err)
 	}
 	wh.valuesConfig = vc
 	return nil
@@ -264,7 +263,6 @@ const (
 func moveContainer(from, to []corev1.Container, name string) ([]corev1.Container, []corev1.Container) {
 	var container *corev1.Container
 	for i, c := range from {
-		c := c
 		if from[i].Name == name {
 			from = slices.Delete(from, i)
 			container = &c
@@ -281,7 +279,6 @@ func modifyContainers(cl []corev1.Container, name string, modifier ContainerReor
 	containers := []corev1.Container{}
 	var match *corev1.Container
 	for _, c := range cl {
-		c := c
 		if c.Name != name {
 			containers = append(containers, c)
 		} else {
@@ -612,7 +609,7 @@ func adjustInitContainerUser(finalPod *corev1.Pod, originalPod *corev1.Pod, prox
 	tproxy := false
 	if proxyConfig.InterceptionMode == meshconfig.ProxyConfig_TPROXY {
 		tproxy = true
-	} else if mode, found := finalPod.Annotations[annotation.SidecarInterceptionMode.Name]; found && mode == iptablesconstants.TPROXY {
+	} else if mode, found := finalPod.Annotations[annotation.SidecarInterceptionMode.Name]; found && mode == "TPROXY" {
 		tproxy = true
 	}
 
@@ -868,7 +865,7 @@ func mergeOrAppendProbers(previouslyInjected bool, envVars []corev1.EnvVar, newP
 			return envVars
 		}
 	}
-	return envVars
+	return append(envVars, corev1.EnvVar{Name: status.KubeAppProberEnvName, Value: newProbers})
 }
 
 var emptyScrape = status.PrometheusScrapeConfiguration{}
@@ -1094,10 +1091,11 @@ func applyOverlay(target *corev1.Pod, overlayJSON []byte) (*corev1.Pod, error) {
 }
 
 func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.AdmissionResponse {
+	log := log.WithLabels("path", path)
 	req := ar.Request
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
-		handleError(fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
+		handleError(log, fmt.Sprintf("Could not unmarshal raw object: %v %s", err,
 			string(req.Object.Raw)))
 		return toAdmissionResponse(err)
 	}
@@ -1110,13 +1108,15 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 	if pod.ObjectMeta.Namespace == "" {
 		pod.ObjectMeta.Namespace = req.Namespace
 	}
-	log.Infof("Sidecar injection request for %v/%v", req.Namespace, podName)
+
+	log = log.WithLabels("pod", pod.Namespace+"/"+podName)
+	log.Infof("Process sidecar injection request")
 	log.Debugf("Object: %v", string(req.Object.Raw))
 	log.Debugf("OldObject: %v", string(req.OldObject.Raw))
 
 	wh.mu.RLock()
 	if !injectRequired(IgnoredNamespaces.UnsortedList(), wh.Config, &pod.Spec, pod.ObjectMeta) {
-		log.Infof("Skipping %s/%s due to policy check", pod.ObjectMeta.Namespace, podName)
+		log.Infof("Skipping due to policy check")
 		totalSkippedInjections.Increment()
 		wh.mu.RUnlock()
 		return &kube.AdmissionResponse{
@@ -1153,12 +1153,28 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 		} else {
 			log.Warnf("unable to fetch namespace, failed to get client for %q", clusterID)
 		}
+
+		// OpenShift automatically assigns a SecurityContext.RunAsUser to all containers in the Pod, even if the Pod's
+		// YAML does not explicitly set this value. Istio treats the values specified in the istio-proxy container as
+		// overrides and preserves them in the final Pod yaml as expected. However, the RunAsUser value which is
+		// automatically set by OpenShift would be the same for all containers within the Pod, which is a problem.
+		// Because the RunAsUser is identical for both the application container and the proxy container, traffic
+		// interception fails for the pod. Here, we ignore the RunAsUser value on the sidecar proxy if it matches the
+		// application container's value. At the same time, if user explicitly configures a RunAsUser in the istio-proxy
+		// container which is different to the application container's value, that setting is still honored.
+		if sideCarProxy := FindSidecar(params.pod); sideCarProxy != nil && sideCarProxy.SecurityContext != nil {
+			if isSidecarUserMatchingAppUser(params.pod.Spec.Containers) {
+				log.Infof("Resetting the UserID of sideCar proxy as it matches with the app container for Pod %q", params.pod.Name)
+				sideCarProxy.SecurityContext.RunAsUser = nil
+				sideCarProxy.SecurityContext.RunAsGroup = nil
+			}
+		}
 	}
 	wh.mu.RUnlock()
 
 	patchBytes, err := injectPod(params)
 	if err != nil {
-		handleError(fmt.Sprintf("Pod injection failed: %v", err))
+		handleError(log, fmt.Sprintf("Pod injection failed: %v", err))
 		return toAdmissionResponse(err)
 	}
 
@@ -1170,11 +1186,28 @@ func (wh *Webhook) inject(ar *kube.AdmissionReview, path string) *kube.Admission
 			return &pt
 		}(),
 	}
-	totalSuccessfulInjections.Increment()
 	return &reviewResponse
 }
 
+func isSidecarUserMatchingAppUser(containers []corev1.Container) bool {
+	var sideCarUser, appUser int64
+	for i := range containers {
+		if containers[i].Name == ProxyContainerName {
+			if containers[i].SecurityContext != nil && containers[i].SecurityContext.RunAsUser != nil {
+				sideCarUser = *containers[i].SecurityContext.RunAsUser
+			}
+		} else if containers[i].Name != ValidationContainerName && containers[i].Name != InitContainerName {
+			if containers[i].SecurityContext != nil && containers[i].SecurityContext.RunAsUser != nil {
+				appUser = *containers[i].SecurityContext.RunAsUser
+			}
+		}
+	}
+
+	return sideCarUser == appUser
+}
+
 func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
+	log := log.WithLabels("path", r.URL.Path)
 	totalInjections.Increment()
 	t0 := time.Now()
 	defer func() { injectionTime.Record(time.Since(t0).Seconds()) }()
@@ -1183,12 +1216,13 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 		if data, err := kube.HTTPConfigReader(r); err == nil {
 			body = data
 		} else {
+			handleError(log, err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
 	if len(body) == 0 {
-		handleError("no body found")
+		handleError(log, "no body found")
 		http.Error(w, "no body found", http.StatusBadRequest)
 		return
 	}
@@ -1196,7 +1230,7 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 	// verify the content type is accurate
 	contentType := r.Header.Get("Content-Type")
 	if contentType != "application/json" {
-		handleError(fmt.Sprintf("contentType=%s, expect application/json", contentType))
+		handleError(log, fmt.Sprintf("contentType=%s, expect application/json", contentType))
 		http.Error(w, "invalid Content-Type, want `application/json`", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -1210,13 +1244,13 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 	var obj runtime.Object
 	var ar *kube.AdmissionReview
 	if out, _, err := deserializer.Decode(body, nil, obj); err != nil {
-		handleError(fmt.Sprintf("Could not decode body: %v", err))
+		handleError(log, fmt.Sprintf("Could not decode body: %v", err))
 		reviewResponse = toAdmissionResponse(err)
 	} else {
 		log.Debugf("AdmissionRequest for path=%s\n", path)
 		ar, err = kube.AdmissionReviewKubeToAdapter(out)
 		if err != nil {
-			handleError(fmt.Sprintf("Could not decode object: %v", err))
+			handleError(log, fmt.Sprintf("Could not decode object: %v", err))
 			reviewResponse = toAdmissionResponse(err)
 		} else {
 			reviewResponse = wh.inject(ar, path)
@@ -1239,14 +1273,17 @@ func (wh *Webhook) serveInject(w http.ResponseWriter, r *http.Request) {
 	responseKube = kube.AdmissionReviewAdapterToKube(&response, apiVersion)
 	resp, err := json.Marshal(responseKube)
 	if err != nil {
-		log.Errorf("Could not encode response: %v", err)
+		handleError(log, fmt.Sprintf("Could not encode response: %v", err))
 		http.Error(w, fmt.Sprintf("could not encode response: %v", err), http.StatusInternalServerError)
 		return
 	}
 	if _, err := w.Write(resp); err != nil {
 		log.Errorf("Could not write response: %v", err)
+		handleError(log, fmt.Sprintf("could not write response: %v", err))
 		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
+		return
 	}
+	totalSuccessfulInjections.Increment()
 }
 
 // parseInjectEnvs parse new envs from inject url path. format: /inject/k1/v1/k2/v2
@@ -1305,7 +1342,7 @@ func parseInjectEnvs(path string) map[string]string {
 	return newEnvs
 }
 
-func handleError(message string) {
-	log.Errorf(message)
+func handleError(l *log.Scope, message string) {
+	l.Errorf(message)
 	totalFailedInjections.Increment()
 }

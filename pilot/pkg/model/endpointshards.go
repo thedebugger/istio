@@ -18,7 +18,6 @@ import (
 	"sort"
 	"sync"
 
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/schema/kind"
@@ -273,6 +272,7 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	hostname string,
 	namespace string,
 	istioEndpoints []*IstioEndpoint,
+	logPushType bool,
 ) PushType {
 	if len(istioEndpoints) == 0 {
 		// Should delete the service EndpointShards when endpoints become zero to prevent memory leak,
@@ -280,7 +280,11 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 		// unnecessary full push which can become a real problem if a pod is in crashloop and thus endpoints
 		// flip flopping between 1 and 0.
 		e.DeleteServiceShard(shard, hostname, namespace, true)
-		log.Infof("Incremental push, service %s at shard %v has no endpoints", hostname, shard)
+		if logPushType {
+			log.Infof("Incremental push, service %s at shard %v has no endpoints", hostname, shard)
+		} else {
+			log.Infof("Cache Update, Service %s at shard %v has no endpoints", hostname, shard)
+		}
 		return IncrementalPush
 	}
 
@@ -289,66 +293,18 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	ep, created := e.GetOrCreateEndpointShard(hostname, namespace)
 	// If we create a new endpoint shard, that means we have not seen the service earlier. We should do a full push.
 	if created {
-		log.Infof("Full push, new service %s/%s", namespace, hostname)
+		if logPushType {
+			log.Infof("Full push, new service %s/%s", namespace, hostname)
+		} else {
+			log.Infof("Cache Update, new service %s/%s", namespace, hostname)
+		}
 		pushType = FullPush
 	}
 
 	ep.Lock()
 	defer ep.Unlock()
-	newIstioEndpoints := istioEndpoints
-
 	oldIstioEndpoints := ep.Shards[shard]
-	needPush := false
-	if oldIstioEndpoints == nil {
-		// If there are no old endpoints, we should push with incoming endpoints as there is nothing to compare.
-		needPush = true
-	} else {
-		newIstioEndpoints = make([]*IstioEndpoint, 0, len(istioEndpoints))
-		// Check if new Endpoints are ready to be pushed. This check
-		// will ensure that if a new pod comes with a non ready endpoint,
-		// we do not unnecessarily push that config to Envoy.
-		// Please note that address is not a unique key. So this may not accurately
-		// identify based on health status and push too many times - which is ok since its an optimization.
-		omap := make(map[string]*IstioEndpoint, len(oldIstioEndpoints))
-		nmap := make(map[string]*IstioEndpoint, len(newIstioEndpoints))
-		// Add new endpoints only if they are ever ready once to shards
-		// so that full push does not send them from shards.
-		for _, oie := range oldIstioEndpoints {
-			omap[oie.Address] = oie
-		}
-		for _, nie := range istioEndpoints {
-			nmap[nie.Address] = nie
-		}
-		for _, nie := range istioEndpoints {
-			if oie, exists := omap[nie.Address]; exists {
-				// If endpoint exists already, we should push if it's changed.
-				// Skip this check if we already decide we need to push to avoid expensive checks
-				if !needPush && !oie.Equals(nie) {
-					needPush = true
-				}
-				newIstioEndpoints = append(newIstioEndpoints, nie)
-			} else {
-				// If the endpoint does not exist in shards that means it is a
-				// new endpoint. Always send new healthy endpoints.
-				// Also send new unhealthy endpoints when SendUnhealthyEndpoints is enabled.
-				// This is OK since we disable panic threshold when SendUnhealthyEndpoints is enabled.
-				if nie.HealthStatus != UnHealthy || features.SendUnhealthyEndpoints.Load() {
-					needPush = true
-				}
-				newIstioEndpoints = append(newIstioEndpoints, nie)
-			}
-		}
-		// Next, check for endpoints that were in old but no longer exist. If there are any, there is a
-		// removal so we need to push an update.
-		if !needPush {
-			for _, oie := range oldIstioEndpoints {
-				if _, f := nmap[oie.Address]; !f {
-					needPush = true
-					break
-				}
-			}
-		}
-	}
+	newIstioEndpoints, needPush := endpointUpdateRequiresPush(oldIstioEndpoints, istioEndpoints)
 
 	if pushType != FullPush && !needPush {
 		log.Debugf("No push, either old endpoint health status did not change or new endpoint came with unhealthy status, %v", hostname)
@@ -363,7 +319,11 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	// For existing endpoints, we need to do full push if service accounts change.
 	if saUpdated && pushType != FullPush {
 		// Avoid extra logging if already a full push
-		log.Infof("Full push, service accounts changed, %v", hostname)
+		if logPushType {
+			log.Infof("Full push, service accounts changed, %v", hostname)
+		} else {
+			log.Infof("Cache Update, service accounts changed, %v", hostname)
+		}
 		pushType = FullPush
 	}
 
@@ -377,6 +337,60 @@ func (e *EndpointIndex) UpdateServiceEndpoints(
 	e.clearCacheForService(hostname, namespace)
 
 	return pushType
+}
+
+// endpointUpdateRequiresPush determines if an endpoint update is required.
+func endpointUpdateRequiresPush(oldIstioEndpoints []*IstioEndpoint, incomingEndpoints []*IstioEndpoint) ([]*IstioEndpoint, bool) {
+	if oldIstioEndpoints == nil {
+		// If there are no old endpoints, we should push with incoming endpoints as there is nothing to compare.
+		return incomingEndpoints, true
+	}
+	needPush := false
+	newIstioEndpoints := make([]*IstioEndpoint, 0, len(incomingEndpoints))
+	// Check if new Endpoints are ready to be pushed. This check
+	// will ensure that if a new pod comes with a non ready endpoint,
+	// we do not unnecessarily push that config to Envoy.
+	omap := make(map[string]*IstioEndpoint, len(oldIstioEndpoints))
+	nmap := make(map[string]*IstioEndpoint, len(newIstioEndpoints))
+	// Add new endpoints only if they are ever ready once to shards
+	// so that full push does not send them from shards.
+	for _, oie := range oldIstioEndpoints {
+		omap[oie.Key()] = oie
+	}
+	for _, nie := range incomingEndpoints {
+		nmap[nie.Key()] = nie
+	}
+	for _, nie := range incomingEndpoints {
+		if oie, exists := omap[nie.Key()]; exists {
+			// If endpoint exists already, we should push if it's changed.
+			// Skip this check if we already decide we need to push to avoid expensive checks
+			if !needPush && !oie.Equals(nie) {
+				needPush = true
+			}
+			newIstioEndpoints = append(newIstioEndpoints, nie)
+		} else {
+			// If the endpoint does not exist in shards that means it is a
+			// new endpoint. Always send new healthy endpoints.
+			// Also send new unhealthy endpoints when SendUnhealthyEndpoints is enabled.
+			// This is OK since we disable panic threshold when SendUnhealthyEndpoints is enabled.
+			if nie.HealthStatus != UnHealthy || nie.SendUnhealthyEndpoints {
+				needPush = true
+			}
+			newIstioEndpoints = append(newIstioEndpoints, nie)
+		}
+	}
+	// Next, check for endpoints that were in old but no longer exist. If there are any, there is a
+	// removal so we need to push an update.
+	if !needPush {
+		for _, oie := range oldIstioEndpoints {
+			if _, f := nmap[oie.Key()]; !f {
+				needPush = true
+				break
+			}
+		}
+	}
+
+	return newIstioEndpoints, needPush
 }
 
 // updateShardServiceAccount updates the service endpoints' sa when service/endpoint event happens.
@@ -400,47 +414,4 @@ func updateShardServiceAccount(shards *EndpointShards, serviceName string) bool 
 	}
 
 	return false
-}
-
-// EndpointIndexUpdater is an updater that will keep an EndpointIndex in sync. This is intended for tests only.
-type EndpointIndexUpdater struct {
-	Index *EndpointIndex
-	// Optional; if set, we will trigger ConfigUpdates in response to EDS updates as appropriate
-	ConfigUpdateFunc func(req *PushRequest)
-}
-
-var _ XDSUpdater = &EndpointIndexUpdater{}
-
-func NewEndpointIndexUpdater(ei *EndpointIndex) *EndpointIndexUpdater {
-	return &EndpointIndexUpdater{Index: ei}
-}
-
-func (f *EndpointIndexUpdater) ConfigUpdate(*PushRequest) {}
-
-func (f *EndpointIndexUpdater) EDSUpdate(shard ShardKey, serviceName string, namespace string, eps []*IstioEndpoint) {
-	pushType := f.Index.UpdateServiceEndpoints(shard, serviceName, namespace, eps)
-	if f.ConfigUpdateFunc != nil && (pushType == IncrementalPush || pushType == FullPush) {
-		// Trigger a push
-		f.ConfigUpdateFunc(&PushRequest{
-			Full:           pushType == FullPush,
-			ConfigsUpdated: sets.New(ConfigKey{Kind: kind.ServiceEntry, Name: serviceName, Namespace: namespace}),
-			Reason:         NewReasonStats(EndpointUpdate),
-		})
-	}
-}
-
-func (f *EndpointIndexUpdater) EDSCacheUpdate(shard ShardKey, serviceName string, namespace string, eps []*IstioEndpoint) {
-	f.Index.UpdateServiceEndpoints(shard, serviceName, namespace, eps)
-}
-
-func (f *EndpointIndexUpdater) SvcUpdate(shard ShardKey, hostname string, namespace string, event Event) {
-	if event == EventDelete {
-		f.Index.DeleteServiceShard(shard, hostname, namespace, false)
-	}
-}
-
-func (f *EndpointIndexUpdater) ProxyUpdate(_ cluster.ID, _ string) {}
-
-func (f *EndpointIndexUpdater) RemoveShard(shardKey ShardKey) {
-	f.Index.DeleteShard(shardKey)
 }

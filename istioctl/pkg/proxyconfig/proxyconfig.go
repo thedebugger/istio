@@ -15,7 +15,11 @@
 package proxyconfig
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +104,21 @@ const (
 	TraceLevel
 )
 
+const (
+	// edsPath get eds info
+	edsPath = "?include_eds=true"
+	// secretPath get secrets info
+	secretPath = "?mask=dynamic_active_secrets,dynamic_warming_secrets"
+	// clusterPath get cluster info
+	clusterPath = "?mask=dynamic_active_clusters,dynamic_warming_clusters,static_clusters"
+	// listenerPath get listener info
+	listenerPath = "?mask=dynamic_listeners,static_listeners"
+	// routePath get route info
+	routePath = "?mask=dynamic_route_configs,static_route_configs"
+	// bootstrapPath get bootstrap info
+	bootstrapPath = "?mask=bootstrap"
+)
+
 var levelToString = map[Level]string{
 	TraceLevel:    "trace",
 	DebugLevel:    "debug",
@@ -126,11 +145,8 @@ var (
 	reset             = false
 )
 
-func extractConfigDump(kubeClient kube.CLIClient, podName, podNamespace string, eds bool) ([]byte, error) {
-	path := "config_dump"
-	if eds {
-		path += "?include_eds=true"
-	}
+func extractConfigDump(kubeClient kube.CLIClient, podName, podNamespace string, additionPath string) ([]byte, error) {
+	path := "config_dump" + additionPath
 	debug, err := kubeClient.EnvoyDoWithPort(context.TODO(), podName, podNamespace, "GET", path, proxyAdminPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute command on %s.%s sidecar: %v", podName, podNamespace, err)
@@ -138,8 +154,8 @@ func extractConfigDump(kubeClient kube.CLIClient, podName, podNamespace string, 
 	return debug, err
 }
 
-func setupPodConfigdumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, includeEds bool, out io.Writer) (*configdump.ConfigWriter, error) {
-	debug, err := extractConfigDump(kubeClient, podName, podNamespace, includeEds)
+func setupPodConfigdumpWriter(kubeClient kube.CLIClient, podName, podNamespace string, additionPath string, out io.Writer) (*configdump.ConfigWriter, error) {
+	debug, err := extractConfigDump(kubeClient, podName, podNamespace, additionPath)
 	if err != nil {
 		return nil, err
 	}
@@ -182,9 +198,13 @@ func setupConfigdumpEnvoyConfigWriter(debug []byte, out io.Writer) (*configdump.
 
 func setupEnvoyClusterStatsConfig(kubeClient kube.CLIClient, podName, podNamespace string, outputFormat string) (string, error) {
 	path := "clusters"
-	if outputFormat == jsonOutput || outputFormat == yamlOutput {
+	switch outputFormat {
+	case "", summaryOutput:
+	case jsonOutput, yamlOutput:
 		// for yaml output we will convert the json to yaml when printed
 		path += "?format=json"
+	default:
+		return "", fmt.Errorf("unable to match a printer suitable for the output format %s, allowed formats are: json,yaml,short", outputFormat)
 	}
 	result, err := kubeClient.EnvoyDoWithPort(context.TODO(), podName, podNamespace, "GET", path, proxyAdminPort)
 	if err != nil {
@@ -195,12 +215,14 @@ func setupEnvoyClusterStatsConfig(kubeClient kube.CLIClient, podName, podNamespa
 
 func setupEnvoyServerStatsConfig(kubeClient kube.CLIClient, podName, podNamespace string, outputFormat string) (string, error) {
 	path := "stats"
-	if outputFormat == jsonOutput || outputFormat == yamlOutput {
+	switch outputFormat {
+	case "", summaryOutput:
+	case jsonOutput, yamlOutput:
 		// for yaml output we will convert the json to yaml when printed
 		path += "?format=json"
-	} else if outputFormat == prometheusOutput {
+	case prometheusOutput:
 		path += "/prometheus"
-	} else if outputFormat == prometheusMergedOutput {
+	case prometheusMergedOutput:
 		pod, err := kubeClient.Kube().CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
 		if err != nil {
 			return "", fmt.Errorf("failed to retrieve Pod %s/%s: %v", podNamespace, podName, err)
@@ -212,6 +234,8 @@ func setupEnvoyServerStatsConfig(kubeClient kube.CLIClient, podName, podNamespac
 		}
 		path = promPath
 		port = promPort
+	default:
+		return "", fmt.Errorf("unable to match a printer suitable for the output format %s, allowed formats are: json,yaml,short,prom,prom-merged", outputFormat)
 	}
 
 	result, err := kubeClient.EnvoyDoWithPort(context.Background(), podName, podNamespace, "GET", path, proxyAdminPort)
@@ -231,6 +255,47 @@ func setupEnvoyLogConfig(kubeClient kube.CLIClient, param, podName, podNamespace
 		return "", fmt.Errorf("failed to execute command on Envoy: %v", err)
 	}
 	return string(result), nil
+}
+
+func printStatus(c *cobra.Command, kubeClient kube.CLIClient, statsType, podName, podNamespace string) error {
+	var stats string
+	var err error
+
+	switch statsType {
+	case "", "server":
+		stats, err = setupEnvoyServerStatsConfig(kubeClient, podName, podNamespace, outputFormat)
+		if err != nil {
+			return err
+		}
+	case "cluster", "clusters":
+		stats, err = setupEnvoyClusterStatsConfig(kubeClient, podName, podNamespace, outputFormat)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown stats type %s", statsType)
+	}
+
+	fmt.Fprintf(c.OutOrStdout(), "\nThe result of pod %s:\n\n", podName)
+	switch outputFormat {
+	// convert the json output to yaml
+	case yamlOutput:
+		var out []byte
+		if out, err = yaml.JSONToYAML([]byte(stats)); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprint(c.OutOrStdout(), string(out))
+	case jsonOutput:
+		var prettyJSON bytes.Buffer
+		err := json.Indent(&prettyJSON, []byte(stats), "", "    ")
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprint(c.OutOrStdout(), prettyJSON.String()+"\n")
+	default:
+		_, _ = fmt.Fprint(c.OutOrStdout(), stats)
+	}
+	return nil
 }
 
 func getLogLevelFromConfigMap(ctx cli.Context) (string, error) {
@@ -291,6 +356,9 @@ func clusterConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve summary about cluster configuration for a given pod from Envoy.
   istioctl proxy-config clusters <pod-name[.namespace]>
 
+  # Retrieve summary about cluster configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config clusters deployment/<deployment-name[.namespace]>
+
   # Retrieve cluster summary for clusters with port 9080.
   istioctl proxy-config clusters <pod-name[.namespace]> --port 9080
 
@@ -319,7 +387,7 @@ func clusterConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, clusterPath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}
@@ -363,6 +431,9 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve summary about all configuration for a given pod from Envoy.
   istioctl proxy-config all <pod-name[.namespace]>
 
+  # Retrieve summary about all configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config all deployment/<deployment-name[.namespace]>
+
   # Retrieve full cluster dump as JSON
   istioctl proxy-config all <pod-name[.namespace]> -o json
 
@@ -395,7 +466,7 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 					if err != nil {
 						return err
 					}
-					dump, err = extractConfigDump(kubeClient, podName, podNamespace, true)
+					dump, err = extractConfigDump(kubeClient, podName, podNamespace, edsPath)
 					if err != nil {
 						return err
 					}
@@ -420,7 +491,7 @@ func allConfigCmd(ctx cli.Context) *cobra.Command {
 						return err
 					}
 
-					configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, true, c.OutOrStdout())
+					configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, edsPath, c.OutOrStdout())
 					if err != nil {
 						return err
 					}
@@ -498,6 +569,9 @@ func listenerConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve summary about listener configuration for a given pod from Envoy.
   istioctl proxy-config listeners <pod-name[.namespace]>
 
+  # Retrieve summary about listener configuration a pod under a deployment from Envoy.
+  istioctl proxy-config deployment/<deployment-name[.namespace]>
+
   # Retrieve listener summary for listeners with port 9080.
   istioctl proxy-config listeners <pod-name[.namespace]> --port 9080
 
@@ -526,7 +600,7 @@ func listenerConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, listenerPath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}
@@ -570,7 +644,8 @@ func listenerConfigCmd(ctx cli.Context) *cobra.Command {
 }
 
 func StatsConfigCmd(ctx cli.Context) *cobra.Command {
-	var podName, podNamespace string
+	var podNamespace string
+	var podNames []string
 
 	statsConfigCmd := &cobra.Command{
 		Use:   "envoy-stats [<type>/]<name>[.<namespace>]",
@@ -597,41 +672,31 @@ func StatsConfigCmd(ctx cli.Context) *cobra.Command {
 				cmd.Println(cmd.UsageString())
 				return fmt.Errorf("stats requires pod name or label selector")
 			}
+			if len(args) == 1 && (labelSelector != "") {
+				cmd.Println(cmd.UsageString())
+				return fmt.Errorf("name cannot be provided when the label selector is specified")
+			}
 			return nil
 		},
 		RunE: func(c *cobra.Command, args []string) error {
-			var stats string
 			kubeClient, err := ctx.CLIClient()
 			if err != nil {
 				return err
 			}
-			if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
-				return err
-			}
-			if statsType == "" || statsType == "server" {
-				stats, err = setupEnvoyServerStatsConfig(kubeClient, podName, podNamespace, outputFormat)
-				if err != nil {
-					return err
-				}
-			} else if statsType == "cluster" || statsType == "clusters" {
-				stats, err = setupEnvoyClusterStatsConfig(kubeClient, podName, podNamespace, outputFormat)
-				if err != nil {
+			if labelSelector != "" {
+				if podNames, podNamespace, err = getPodNameBySelector(ctx, kubeClient, labelSelector); err != nil {
 					return err
 				}
 			} else {
-				return fmt.Errorf("unknown stats type %s", statsType)
-			}
-
-			switch outputFormat {
-			// convert the json output to yaml
-			case yamlOutput:
-				var out []byte
-				if out, err = yaml.JSONToYAML([]byte(stats)); err != nil {
+				if podNames, podNamespace, err = getPodNames(ctx, args[0], ctx.Namespace()); err != nil {
 					return err
 				}
-				_, _ = fmt.Fprint(c.OutOrStdout(), string(out))
-			default:
-				_, _ = fmt.Fprint(c.OutOrStdout(), stats)
+			}
+			for _, pod := range podNames {
+				err := printStatus(c, kubeClient, statsType, pod, podNamespace)
+				if err != nil {
+					return err
+				}
 			}
 
 			return nil
@@ -640,6 +705,7 @@ func StatsConfigCmd(ctx cli.Context) *cobra.Command {
 	}
 	statsConfigCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", summaryOutput, "Output format: one of json|yaml|short|prom|prom-merged")
 	statsConfigCmd.PersistentFlags().StringVarP(&statsType, "type", "t", "server", "Where to grab the stats: one of server|clusters")
+	statsConfigCmd.PersistentFlags().StringVarP(&labelSelector, "selector", "l", "", "Label selector")
 	statsConfigCmd.PersistentFlags().IntVar(&proxyAdminPort, "proxy-admin-port", defaultProxyAdminPort, "Envoy proxy admin port")
 
 	return statsConfigCmd
@@ -801,6 +867,9 @@ func routeConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve summary about route configuration for a given pod from Envoy.
   istioctl proxy-config routes <pod-name[.namespace]>
 
+  # Retrieve summary about route configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config routes deployment/<deployment-name[.namespace]>
+
   # Retrieve route summary for route 9080.
   istioctl proxy-config route <pod-name[.namespace]> --name 9080
 
@@ -829,7 +898,7 @@ func routeConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, routePath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}
@@ -870,6 +939,9 @@ func endpointConfigCmd(ctx cli.Context) *cobra.Command {
 		Long:  `Retrieve information about endpoint configuration for the Envoy instance in the specified pod.`,
 		Example: `  # Retrieve full endpoint configuration for a given pod from Envoy.
   istioctl proxy-config endpoint <pod-name[.namespace]>
+
+  # Retrieve full endpoint configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config endpoint deployment/<deployment-name[.namespace]>
 
   # Retrieve endpoint summary for endpoint with port 9080.
   istioctl proxy-config endpoint <pod-name[.namespace]> --port 9080
@@ -958,6 +1030,9 @@ func edsConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve full endpoint configuration for a given pod from Envoy.
   istioctl proxy-config eds <pod-name[.namespace]>
 
+  # Retrieve full endpoint configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config eds deployment/<deployment-name[.namespace]>
+
   # Retrieve endpoint summary for endpoint with port 9080.
   istioctl proxy-config eds <pod-name[.namespace]> --port 9080
 
@@ -990,7 +1065,7 @@ func edsConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, true, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, edsPath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}
@@ -1041,6 +1116,9 @@ func bootstrapConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve full bootstrap configuration for a given pod from Envoy.
   istioctl proxy-config bootstrap <pod-name[.namespace]>
 
+  # Retrieve full bootstrap configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config bootstrap deployment/<deployment-name[.namespace]>
+
   # Retrieve full bootstrap without using Kubernetes API
   ssh <user@hostname> 'curl localhost:15000/config_dump' > envoy-config.json
   istioctl proxy-config bootstrap --file envoy-config.json
@@ -1066,7 +1144,7 @@ func bootstrapConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, bootstrapPath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}
@@ -1103,6 +1181,9 @@ func secretConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve full secret configuration for a given pod from Envoy.
   istioctl proxy-config secret <pod-name[.namespace]>
 
+  # Retrieve full secret configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config secret deployment/<deployment-name[.namespace]>
+
   # Retrieve full bootstrap without using Kubernetes API
   ssh <user@hostname> 'curl localhost:15000/config_dump' > envoy-config.json
   istioctl proxy-config secret --file envoy-config.json`,
@@ -1124,7 +1205,7 @@ func secretConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				cw, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, false, c.OutOrStdout())
+				cw, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, secretPath, c.OutOrStdout())
 			} else {
 				cw, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 				if err != nil {
@@ -1175,12 +1256,12 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 				return err
 			}
 
-			var rootCA1, rootCA2 string
+			var rootCAPod1, rootCAPod2 []byte
 			if len(args) == 2 {
 				if podName1, podNamespace1, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				rootCA1, err = extractRootCA(kubeClient, podName1, podNamespace1, c.OutOrStdout())
+				rootCAPod1, err = extractRootCA(kubeClient, podName1, podNamespace1, c.OutOrStdout())
 				if err != nil {
 					return err
 				}
@@ -1188,7 +1269,7 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName2, podNamespace2, err = getPodName(ctx, args[1]); err != nil {
 					return err
 				}
-				rootCA2, err = extractRootCA(kubeClient, podName2, podNamespace2, c.OutOrStdout())
+				rootCAPod2, err = extractRootCA(kubeClient, podName2, podNamespace2, c.OutOrStdout())
 				if err != nil {
 					return err
 				}
@@ -1197,18 +1278,20 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 				return fmt.Errorf("rootca-compare requires 2 pods as an argument")
 			}
 
-			var returnErr error
-			if rootCA1 == rootCA2 {
+			rootCACertMatch, rootCACertMatchErr := checkRootCACertMatchExist(rootCAPod1, rootCAPod2)
+			if rootCACertMatchErr != nil {
+				return rootCACertMatchErr
+			}
+
+			if rootCACertMatch {
 				report := fmt.Sprintf("Both [%s.%s] and [%s.%s] have the identical ROOTCA, theoretically the connectivity between them is available",
 					podName1, podNamespace1, podName2, podNamespace2)
 				c.Println(report)
-				returnErr = nil
-			} else {
-				report := fmt.Sprintf("Both [%s.%s] and [%s.%s] have the non identical ROOTCA, theoretically the connectivity between them is unavailable",
-					podName1, podNamespace1, podName2, podNamespace2)
-				returnErr = fmt.Errorf(report)
+				return nil
 			}
-			return returnErr
+			report := fmt.Sprintf("Both [%s.%s] and [%s.%s] have the non identical ROOTCA, theoretically the connectivity between them is unavailable",
+				podName1, podNamespace1, podName2, podNamespace2)
+			return errors.New(report)
 		},
 		ValidArgsFunction: completion.ValidPodsNameArgs(ctx),
 	}
@@ -1217,10 +1300,50 @@ func rootCACompareConfigCmd(ctx cli.Context) *cobra.Command {
 	return rootCACompareConfigCmd
 }
 
-func extractRootCA(client kube.CLIClient, podName, podNamespace string, out io.Writer) (string, error) {
-	configWriter, err := setupPodConfigdumpWriter(client, podName, podNamespace, false, out)
+// checkRootCACertMatchExist compares rootCA certs, returns true if rootCA cert match exist
+func checkRootCACertMatchExist(rootCAPod1 []byte, rootCAPod2 []byte) (bool, error) {
+	rootCACerts1, parseRootCAPod1Err := parsePEMCerts(rootCAPod1)
+	if parseRootCAPod1Err != nil {
+		return false, parseRootCAPod1Err
+	}
+
+	rootCACerts2, parseRootCAPod2Err := parsePEMCerts(rootCAPod2)
+	if parseRootCAPod2Err != nil {
+		return false, parseRootCAPod2Err
+	}
+
+	for _, cert1 := range rootCACerts1 {
+		for _, cert2 := range rootCACerts2 {
+			if cert1.Equal(cert2) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// Parse the PEM data and extract the certificates
+func parsePEMCerts(certData []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	block, rest := pem.Decode(certData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse certificates: %s", certData)
+	}
+	for block != nil {
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse certificate: %v", err)
+		}
+		certs = append(certs, cert)
+		block, rest = pem.Decode(rest)
+	}
+	return certs, nil
+}
+
+func extractRootCA(client kube.CLIClient, podName, podNamespace string, out io.Writer) ([]byte, error) {
+	configWriter, err := setupPodConfigdumpWriter(client, podName, podNamespace, secretPath, out)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	return configWriter.PrintPodRootCAFromDynamicSecretDump()
 }
@@ -1231,7 +1354,7 @@ func ProxyConfig(ctx cli.Context) *cobra.Command {
 		Short: "Retrieve information about proxy configuration from Envoy [kube only]",
 		Long:  `A group of commands used to retrieve information about proxy configuration from the Envoy config dump`,
 		Example: `  # Retrieve information about proxy configuration from an Envoy instance.
-  istioctl proxy-config <clusters|listeners|routes|endpoints|bootstrap|log|secret> <pod-name[.namespace]>`,
+  istioctl proxy-config <clusters|listeners|routes|endpoints|ecds|bootstrap|log|secret> <pod-name[.namespace]>`,
 		Aliases: []string{"pc"},
 	}
 
@@ -1305,6 +1428,9 @@ func ecdsConfigCmd(ctx cli.Context) *cobra.Command {
 		Example: `  # Retrieve full typed extension configuration for a given pod from Envoy.
   istioctl proxy-config ecds <pod-name[.namespace]>
 
+  # Retrieve full typed extension configuration for a pod under a deployment from Envoy.
+  istioctl proxy-config ecds deployment/<deployment-name[.namespace]>
+
   # Retrieve endpoint summary without using Kubernetes API
   ssh <user@hostname> 'curl localhost:15000/config_dump' > envoy-config.json
   istioctl proxy-config ecds --file envoy-config.json
@@ -1326,7 +1452,7 @@ func ecdsConfigCmd(ctx cli.Context) *cobra.Command {
 				if podName, podNamespace, err = getPodName(ctx, args[0]); err != nil {
 					return err
 				}
-				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, true, c.OutOrStdout())
+				configWriter, err = setupPodConfigdumpWriter(kubeClient, podName, podNamespace, edsPath, c.OutOrStdout())
 			} else {
 				configWriter, err = setupFileConfigdumpWriter(configDumpFile, c.OutOrStdout())
 			}

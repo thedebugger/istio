@@ -256,7 +256,6 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				option := Option{
 					IsCustomBuilder: tc.meshConfig != nil,
-					UseExtendedJwt:  extended,
 				}
 				push := push(t, baseDir+tc.input, tc.meshConfig)
 				proxy := node(tc.version)
@@ -264,7 +263,7 @@ func TestGenerator_GenerateHTTP(t *testing.T) {
 				policies := push.AuthzPolicies.ListAuthorizationPolicies(selectionOpts)
 				g := New(tc.tdBundle, push, policies, option)
 				if g == nil {
-					t.Fatalf("failed to create generator")
+					t.Fatal("failed to create generator")
 				}
 				got := g.BuildHTTP()
 				wants := tc.want
@@ -338,7 +337,7 @@ func TestGenerator_GenerateTCP(t *testing.T) {
 			policies := push.AuthzPolicies.ListAuthorizationPolicies(selectionOpts)
 			g := New(tc.tdBundle, push, policies, option)
 			if g == nil {
-				t.Fatalf("failed to create generator")
+				t.Fatal("failed to create generator")
 			}
 			got := g.BuildTCP()
 			verify(t, convertTCP(got), baseDir, tc.want, true /* forTCP */)

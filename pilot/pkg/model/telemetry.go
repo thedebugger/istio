@@ -21,13 +21,11 @@ import (
 	"sync"
 	"time"
 
-	udpa "github.com/cncf/xds/go/udpa/type/v1"
 	accesslog "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/structpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -95,6 +93,7 @@ type loggingKey struct {
 	telemetryKey
 	Class    networking.ListenerClass
 	Protocol networking.ListenerProtocol
+	Version  string
 }
 
 // metricsKey defines a key into the computedMetricsFilters cache.
@@ -103,6 +102,7 @@ type metricsKey struct {
 	Class     networking.ListenerClass
 	Protocol  networking.ListenerProtocol
 	ProxyType NodeType
+	Service   types.NamespacedName
 }
 
 // getTelemetries returns the Telemetry configurations for the given environment.
@@ -205,6 +205,7 @@ type TracingSpec struct {
 	RandomSamplingPercentage     *float64
 	CustomTags                   map[string]*tpb.Tracing_CustomTag
 	UseRequestIDForTraceSampling bool
+	EnableIstioTags              bool
 }
 
 type LoggingConfig struct {
@@ -239,7 +240,7 @@ func workloadMode(class networking.ListenerClass) tpb.WorkloadMode {
 // If nil or empty configuration is returned, access logs are not configured via Telemetry and should use fallback mechanisms.
 // If access logging is explicitly disabled, a configuration with disabled set to true is returned.
 func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class networking.ListenerClass, svc *Service) []LoggingConfig {
-	ct := t.applicableTelemetries(proxy, nil)
+	ct := t.applicableTelemetries(proxy, svc)
 	if len(ct.Logging) == 0 && len(t.meshConfig.GetDefaultProviders().GetAccessLogging()) == 0 {
 		// No Telemetry API configured, fall back to legacy mesh config setting
 		return nil
@@ -248,6 +249,7 @@ func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class netwo
 	key := loggingKey{
 		telemetryKey: ct.telemetryKey,
 		Class:        class,
+		Version:      proxy.GetIstioVersion(),
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -270,7 +272,7 @@ func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class netwo
 			Disabled: v.Disabled,
 		}
 
-		al := telemetryAccessLog(push, fp)
+		al := telemetryAccessLog(push, proxy, fp)
 		if al == nil {
 			// stackdriver will be handled in HTTPFilters/TCPFilters
 			continue
@@ -278,6 +280,11 @@ func (t *Telemetries) AccessLogging(push *PushContext, proxy *Proxy, class netwo
 		cfg.AccessLog = al
 		cfgs = append(cfgs, cfg)
 	}
+
+	// Sort the access logs by provider name for deterministic ordering
+	sort.Slice(cfgs, func(i, j int) bool {
+		return cfgs[i].Provider.Name < cfgs[j].Provider.Name
+	})
 
 	t.computedLoggingConfig[key] = cfgs
 	return cfgs
@@ -297,8 +304,8 @@ func (t *Telemetries) Tracing(proxy *Proxy, svc *Service) *TracingConfig {
 		return nil
 	}
 
-	clientSpec := TracingSpec{UseRequestIDForTraceSampling: true}
-	serverSpec := TracingSpec{UseRequestIDForTraceSampling: true}
+	clientSpec := TracingSpec{UseRequestIDForTraceSampling: true, EnableIstioTags: true}
+	serverSpec := TracingSpec{UseRequestIDForTraceSampling: true, EnableIstioTags: true}
 
 	if hasDefaultProvider {
 		// todo: what do we want to do with more than one default provider?
@@ -352,6 +359,11 @@ func (t *Telemetries) Tracing(proxy *Proxy, svc *Service) *TracingConfig {
 		if m.UseRequestIdForTraceSampling != nil {
 			for _, spec := range specs {
 				spec.UseRequestIDForTraceSampling = m.UseRequestIdForTraceSampling.Value
+			}
+		}
+		if m.EnableIstioTags != nil {
+			for _, spec := range specs {
+				spec.EnableIstioTags = m.EnableIstioTags.Value
 			}
 		}
 	}
@@ -441,11 +453,11 @@ func (t *Telemetries) applicableTelemetries(proxy *Proxy, svc *Service) computed
 		Tracing:      ts,
 	}
 
-	matcher := PolicyMatcherForProxy(proxy).WithService(svc)
+	matcher := PolicyMatcherForProxy(proxy).WithService(svc).WithRootNamespace(t.RootNamespace)
 	for _, telemetry := range t.NamespaceToTelemetries[namespace] {
 		spec := telemetry.Spec
-		// TODO in many other places, empty selector matches all policy
-		if len(spec.GetSelector().GetMatchLabels()) == 0 {
+		// Namespace wide policy; already handled above
+		if len(spec.GetSelector().GetMatchLabels()) == 0 && len(GetTargetRefs(spec)) == 0 {
 			continue
 		}
 		if matcher.ShouldAttachPolicy(gvk.Telemetry, telemetry.NamespacedName(), spec) {
@@ -490,6 +502,9 @@ func (t *Telemetries) telemetryFilters(proxy *Proxy, class networking.ListenerCl
 		Class:        class,
 		Protocol:     protocol,
 		ProxyType:    proxy.Type,
+	}
+	if svc != nil {
+		key.Service = types.NamespacedName{Name: svc.Attributes.Name, Namespace: svc.Attributes.Namespace}
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -656,7 +671,7 @@ func matchWorkloadMode(selector *tpb.AccessLogging_LogSelector, mode tpb.Workloa
 
 func (t *Telemetries) namespaceWideTelemetryConfig(namespace string) Telemetry {
 	for _, tel := range t.NamespaceToTelemetries[namespace] {
-		if len(tel.Spec.GetSelector().GetMatchLabels()) == 0 {
+		if len(tel.Spec.GetSelector().GetMatchLabels()) == 0 && len(GetTargetRefs(tel.Spec)) == 0 {
 			return tel
 		}
 	}
@@ -904,43 +919,22 @@ func getMatches(match *tpb.MetricSelector) []string {
 	}
 }
 
-var waypointStatsConfig = protoconv.MessageToAny(&udpa.TypedStruct{
-	TypeUrl: "type.googleapis.com/stats.PluginConfig",
-	Value: &structpb.Struct{
-		Fields: map[string]*structpb.Value{
-			"reporter": {
-				Kind: &structpb.Value_StringValue{
-					StringValue: "SERVER_GATEWAY",
-				},
-			},
-		},
-	},
-})
-
 // telemetryFilterHandled contains the number of providers we handle below.
 // This is to ensure this stays in sync as new handlers are added
 // STOP. DO NOT UPDATE THIS WITHOUT UPDATING buildHTTPTelemetryFilter and buildTCPTelemetryFilter.
-const telemetryFilterHandled = 14
+const telemetryFilterHandled = 15
 
 func buildHTTPTelemetryFilter(class networking.ListenerClass, metricsCfg []telemetryFilterConfig) []*hcm.HttpFilter {
 	res := make([]*hcm.HttpFilter, 0, len(metricsCfg))
 	for _, cfg := range metricsCfg {
 		switch cfg.Provider.GetProvider().(type) {
 		case *meshconfig.MeshConfig_ExtensionProvider_Prometheus:
-			if cfg.NodeType == Waypoint {
+			if statsCfg := generateStatsConfig(class, cfg, cfg.NodeType == Waypoint); statsCfg != nil {
 				f := &hcm.HttpFilter{
 					Name:       xds.StatsFilterName,
-					ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: waypointStatsConfig},
+					ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: statsCfg},
 				}
 				res = append(res, f)
-			} else {
-				if statsCfg := generateStatsConfig(class, cfg); statsCfg != nil {
-					f := &hcm.HttpFilter{
-						Name:       xds.StatsFilterName,
-						ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: statsCfg},
-					}
-					res = append(res, f)
-				}
 			}
 		default:
 			// Only prometheus and SD supported currently
@@ -955,23 +949,15 @@ func buildTCPTelemetryFilter(class networking.ListenerClass, telemetryConfigs []
 	for _, telemetryCfg := range telemetryConfigs {
 		switch telemetryCfg.Provider.GetProvider().(type) {
 		case *meshconfig.MeshConfig_ExtensionProvider_Prometheus:
-			if telemetryCfg.NodeType == Waypoint {
+			if cfg := generateStatsConfig(class, telemetryCfg, telemetryCfg.NodeType == Waypoint); cfg != nil {
 				f := &listener.Filter{
 					Name:       xds.StatsFilterName,
-					ConfigType: &listener.Filter_TypedConfig{TypedConfig: waypointStatsConfig},
+					ConfigType: &listener.Filter_TypedConfig{TypedConfig: cfg},
 				}
 				res = append(res, f)
-			} else {
-				if cfg := generateStatsConfig(class, telemetryCfg); cfg != nil {
-					f := &listener.Filter{
-						Name:       xds.StatsFilterName,
-						ConfigType: &listener.Filter_TypedConfig{TypedConfig: cfg},
-					}
-					res = append(res, f)
-				}
 			}
 		default:
-			// Only prometheus and SD supported currently
+			// Only prometheus  supported currently
 			continue
 		}
 	}
@@ -991,7 +977,7 @@ var metricToPrometheusMetric = map[string]string{
 	"GRPC_RESPONSE_MESSAGES": "response_messages_total",
 }
 
-func generateStatsConfig(class networking.ListenerClass, filterConfig telemetryFilterConfig) *anypb.Any {
+func generateStatsConfig(class networking.ListenerClass, filterConfig telemetryFilterConfig, isWaypoint bool) *anypb.Any {
 	if !filterConfig.Metrics {
 		// No metric for prometheus
 		return nil
@@ -1008,6 +994,9 @@ func generateStatsConfig(class networking.ListenerClass, filterConfig telemetryF
 		TcpReportingDuration:      filterConfig.ReportingInterval,
 		RotationInterval:          filterConfig.RotationInterval,
 		GracefulDeletionInterval:  filterConfig.GracefulDeletionInterval,
+	}
+	if isWaypoint {
+		cfg.Reporter = stats.Reporter_SERVER_GATEWAY
 	}
 
 	for _, override := range listenerCfg.Overrides {

@@ -18,6 +18,7 @@ import (
 	"istio.io/istio/pkg/config/analysis"
 	"istio.io/istio/pkg/config/analysis/analyzers/annotations"
 	"istio.io/istio/pkg/config/analysis/analyzers/authz"
+	"istio.io/istio/pkg/config/analysis/analyzers/conditions"
 	"istio.io/istio/pkg/config/analysis/analyzers/deployment"
 	"istio.io/istio/pkg/config/analysis/analyzers/deprecation"
 	"istio.io/istio/pkg/config/analysis/analyzers/destinationrule"
@@ -34,6 +35,7 @@ import (
 	"istio.io/istio/pkg/config/analysis/analyzers/telemetry"
 	"istio.io/istio/pkg/config/analysis/analyzers/virtualservice"
 	"istio.io/istio/pkg/config/analysis/analyzers/webhook"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // All returns all analyzers
@@ -42,9 +44,13 @@ func All() []analysis.Analyzer {
 		// Please keep this list sorted alphabetically by pkg.name for convenience
 		&annotations.K8sAnalyzer{},
 		&authz.AuthorizationPoliciesAnalyzer{},
+		&conditions.ConditionAnalyzer{},
 		&deployment.ServiceAssociationAnalyzer{},
 		&deployment.ApplicationUIDAnalyzer{},
+		&destinationrule.CaCertificateAnalyzer{},
+		&destinationrule.PodNotSelectedAnalyzer{},
 		&deprecation.FieldAnalyzer{},
+		&envoyfilter.EnvoyPatchAnalyzer{},
 		&externalcontrolplane.ExternalControlPlaneAnalyzer{},
 		&gateway.IngressGatewayPortAnalyzer{},
 		&gateway.CertificateAnalyzer{},
@@ -55,6 +61,7 @@ func All() []analysis.Analyzer {
 		&injection.ImageAutoAnalyzer{},
 		&k8sgateway.SelectorAnalyzer{},
 		&multicluster.MeshNetworksAnalyzer{},
+		&multicluster.ServiceAnalyzer{},
 		&service.PortNameAnalyzer{},
 		&sidecar.SelectorAnalyzer{},
 		&virtualservice.ConflictingMeshGatewayHostsAnalyzer{},
@@ -62,15 +69,12 @@ func All() []analysis.Analyzer {
 		&virtualservice.DestinationRuleAnalyzer{},
 		&virtualservice.GatewayAnalyzer{},
 		&virtualservice.JWTClaimRouteAnalyzer{},
-		&destinationrule.CaCertificateAnalyzer{},
 		&serviceentry.ProtocolAddressesAnalyzer{},
 		&webhook.Analyzer{},
-		&envoyfilter.EnvoyPatchAnalyzer{},
-		&telemetry.ProdiverAnalyzer{},
+		&telemetry.ProviderAnalyzer{},
 		&telemetry.SelectorAnalyzer{},
 		&telemetry.DefaultSelectorAnalyzer{},
 		&telemetry.LightstepAnalyzer{},
-		&multicluster.ServiceAnalyzer{},
 	}
 
 	analyzers = append(analyzers, schema.AllValidationAnalyzers()...)
@@ -93,4 +97,20 @@ func AllCombined() analysis.CombinedAnalyzer {
 // AllMultiClusterCombined returns all multi-cluster analyzers combined as one
 func AllMultiClusterCombined() analysis.CombinedAnalyzer {
 	return analysis.Combine("all-multi-cluster", AllMultiCluster()...)
+}
+
+func NamedCombined(names ...string) analysis.CombinedAnalyzer {
+	selected := make([]analysis.Analyzer, 0, len(All()))
+	nameSet := sets.New(names...)
+	for _, a := range All() {
+		if nameSet.Contains(a.Metadata().Name) {
+			selected = append(selected, a)
+		}
+	}
+
+	if len(selected) == 0 {
+		return AllCombined()
+	}
+
+	return analysis.Combine("named", selected...)
 }

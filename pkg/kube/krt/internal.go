@@ -21,18 +21,16 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/cache"
 
 	"istio.io/api/type/v1beta1"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/ptr"
 )
 
 // registerHandlerAsBatched is a helper to register the provided handler as a batched handler. This allows collections to
 // only implement RegisterBatch.
-func registerHandlerAsBatched[T any](c internalCollection[T], f func(o Event[T])) Syncer {
-	return c.RegisterBatch(func(events []Event[T], initialSync bool) {
+func registerHandlerAsBatched[T any](c internalCollection[T], f func(o Event[T])) HandlerRegistration {
+	return c.RegisterBatch(func(events []Event[T]) {
 		for _, o := range events {
 			f(o)
 		}
@@ -55,6 +53,11 @@ func castEvent[I, O any](o Event[I]) Event[O] {
 	return e
 }
 
+func GetStop(opts ...CollectionOption) <-chan struct{} {
+	o := buildCollectionOptions(opts...)
+	return o.stop
+}
+
 func buildCollectionOptions(opts ...CollectionOption) collectionOptions {
 	c := &collectionOptions{}
 	for _, o := range opts {
@@ -68,9 +71,20 @@ func buildCollectionOptions(opts ...CollectionOption) collectionOptions {
 
 // collectionOptions tracks options for a collection
 type collectionOptions struct {
-	name         string
-	augmentation func(o any) any
-	stop         <-chan struct{}
+	name          string
+	augmentation  func(o any) any
+	stop          <-chan struct{}
+	debugger      *DebugHandler
+	joinUnchecked bool
+
+	indexCollectionFromString func(string) any
+	metadata                  Metadata
+}
+
+type indexedDependency struct {
+	id  collectionUID
+	key string
+	typ indexedDependencyType
 }
 
 // dependency is a specific thing that can be depended on
@@ -81,40 +95,14 @@ type dependency struct {
 	filter *filter
 }
 
-type erasedEventHandler = func(o []Event[any], initialSync bool)
+type erasedEventHandler = func(o []Event[any])
 
 // registerDependency is an internal interface for things that can register dependencies.
 // This is called from Fetch to Collections, generally.
 type registerDependency interface {
 	// Registers a dependency, returning true if it is finalized
-	registerDependency(*dependency, Syncer, func(f erasedEventHandler))
+	registerDependency(*dependency, Syncer, func(f erasedEventHandler) Syncer)
 	name() string
-}
-
-// tryGetKey returns the Key for an object. If not possible, returns false
-func tryGetKey[O any](a O) (Key[O], bool) {
-	as, ok := any(a).(string)
-	if ok {
-		return Key[O](as), true
-	}
-	ao, ok := any(a).(controllers.Object)
-	if ok {
-		k, _ := cache.MetaNamespaceKeyFunc(ao)
-		return Key[O](k), true
-	}
-	ac, ok := any(a).(config.Config)
-	if ok {
-		return Key[O](keyFunc(ac.Name, ac.Namespace)), true
-	}
-	arn, ok := any(a).(ResourceNamer)
-	if ok {
-		return Key[O](arn.ResourceName()), true
-	}
-	ack := GetApplyConfigKey(a)
-	if ack != nil {
-		return *ack, true
-	}
-	return "", false
 }
 
 // getLabels returns the labels for an object, if possible.
@@ -172,15 +160,19 @@ func getLabelSelector(a any) map[string]string {
 	}
 }
 
-// equal checks if two objects are equal. This is done through a variety of different methods, depending on the input type.
-func equal[O any](a, b O) bool {
-	ak, ok := any(a).(Equaler[O])
-	if ok {
+// Equal checks if two objects are equal. This is done through a variety of different methods, depending on the input type.
+func Equal[O any](a, b O) bool {
+	if ak, ok := any(a).(Equaler[O]); ok {
 		return ak.Equals(b)
 	}
-	pk, ok := any(&a).(Equaler[O])
-	if ok {
+	if ak, ok := any(a).(Equaler[*O]); ok {
+		return ak.Equals(&b)
+	}
+	if pk, ok := any(&a).(Equaler[O]); ok {
 		return pk.Equals(b)
+	}
+	if pk, ok := any(&a).(Equaler[*O]); ok {
+		return pk.Equals(&b)
 	}
 	// Future improvement: add a default Kubernetes object implementation
 	// ResourceVersion is tempting but probably not safe. If we are comparing objects from the API server its fine,

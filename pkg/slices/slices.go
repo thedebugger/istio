@@ -19,8 +19,6 @@ import (
 	"cmp"
 	"slices" // nolint: depguard
 	"strings"
-
-	"golang.org/x/exp/constraints"
 )
 
 // Equal reports whether two slices are equal: the same length and all
@@ -82,7 +80,7 @@ func SortStableFunc[E any](x []E, less func(a, b E) int) []E {
 
 // SortBy is a helper to sort a slice by some value. Typically, this would be sorting a struct
 // by a single field. If you need to have multiple fields, see the ExampleSort.
-func SortBy[E any, A constraints.Ordered](x []E, extract func(a E) A) []E {
+func SortBy[E any, A cmp.Ordered](x []E, extract func(a E) A) []E {
 	if len(x) <= 1 {
 		return x
 	}
@@ -94,7 +92,7 @@ func SortBy[E any, A constraints.Ordered](x []E, extract func(a E) A) []E {
 
 // Sort sorts a slice of any ordered type in ascending order.
 // The slice is modified in place but returned.
-func Sort[E constraints.Ordered](x []E) []E {
+func Sort[E cmp.Ordered](x []E) []E {
 	if len(x) <= 1 {
 		return x
 	}
@@ -118,6 +116,46 @@ func Delete[S ~[]E, E any](s S, i int) S {
 // Contains reports whether v is present in s.
 func Contains[E comparable](s []E, v E) bool {
 	return slices.Contains(s, v)
+}
+
+// Max returns the maximal value in x. It panics if x is empty.
+// For floating-point E, Max propagates NaNs (any NaN value in x
+// forces the output to be NaN).
+func Max[S ~[]E, E cmp.Ordered](x S) E {
+	return slices.Max(x)
+}
+
+// MaxFunc returns the maximal value in x, using cmp to compare elements.
+// It panics if x is empty. If there is more than one maximal element
+// according to the cmp function, MaxFunc returns the first one.
+func MaxFunc[S ~[]E, E any](x S, cmp func(a, b E) int) E {
+	return slices.MaxFunc(x, cmp)
+}
+
+// Min returns the minimal value in x. It panics if x is empty.
+// For floating-point numbers, Min propagates NaNs (any NaN value in x
+// forces the output to be NaN).
+func Min[S ~[]E, E cmp.Ordered](x S) E {
+	return slices.Min(x)
+}
+
+// MinFunc returns the minimal value in x, using cmp to compare elements.
+// It panics if x is empty. If there is more than one minimal element
+// according to the cmp function, MinFunc returns the first one.
+func MinFunc[S ~[]E, E any](x S, cmp func(a, b E) int) E {
+	return slices.MinFunc(x, cmp)
+}
+
+// Index returns the index of the first occurrence of v in s,
+// or -1 if not present.
+func Index[S ~[]E, E comparable](s S, v E) int {
+	return slices.Index(s, v)
+}
+
+// IndexFunc returns the first index i satisfying f(s[i]),
+// or -1 if none do.
+func IndexFunc[S ~[]E, E any](s S, f func(E) bool) int {
+	return slices.IndexFunc(s, f)
 }
 
 // FindFunc finds the first element matching the function, or nil if none do
@@ -149,27 +187,40 @@ func BinarySearch[S ~[]E, E cmp.Ordered](x S, target E) (int, bool) {
 	return slices.BinarySearch(x, target)
 }
 
-// FilterInPlace retains all elements in []E that f(E) returns true for.
+// FilterInPlace retains all elements in []E that keep(E) returns true for.
 // The array is *mutated in place* and returned.
 // Use Filter to avoid mutation
-func FilterInPlace[E any](s []E, f func(E) bool) []E {
-	n := 0
-	for _, val := range s {
-		if f(val) {
-			s[n] = val
-			n++
+func FilterInPlace[E any](s []E, keep func(E) bool) []E {
+	// find the first to filter index
+	i := slices.IndexFunc(s, func(e E) bool {
+		return !keep(e)
+	})
+	if i == -1 {
+		return s
+	}
+
+	// don't start copying elements until we find one to filter
+	for j := i + 1; j < len(s); j++ {
+		if v := s[j]; keep(v) {
+			s[i] = v
+			i++
 		}
 	}
 
-	// If those elements contain pointers you might consider zeroing those elements
-	// so that objects they reference can be garbage collected."
-	var empty E
-	for i := n; i < len(s); i++ {
-		s[i] = empty
-	}
+	clear(s[i:]) // zero/nil out the obsolete elements, for GC
+	return s[:i]
+}
 
-	s = s[:n]
-	return s
+func FilterDuplicates[E comparable](s []E) []E {
+	seen := make(map[E]struct{})
+	result := make([]E, 0)
+	for _, item := range s {
+		if _, ok := seen[item]; !ok {
+			result = append(result, item)
+			seen[item] = struct{}{}
+		}
+	}
+	return result
 }
 
 // FilterDuplicatesPresorted retains all unique elements in []E.
@@ -247,7 +298,6 @@ func MapFilter[E any, O any](s []E, f func(E) *O) []O {
 func Reference[E any](s []E) []*E {
 	res := make([]*E, 0, len(s))
 	for _, v := range s {
-		v := v
 		res = append(res, &v)
 	}
 	return res

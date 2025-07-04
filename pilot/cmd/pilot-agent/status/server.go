@@ -79,6 +79,10 @@ const (
 	maxRespBodyLength = 10 * 1 << 10
 )
 
+// probes is a logging scope for probe responses. Since these logs are about the application, not Istio, users may need
+// to configure them to meet their preferences.
+var probes = log.RegisterScope("probes", "Status of forwarded application probes")
+
 var (
 	UpstreamLocalAddressIPv4 = &net.TCPAddr{IP: net.ParseIP("127.0.0.6")}
 	UpstreamLocalAddressIPv6 = &net.TCPAddr{IP: net.ParseIP("::6")}
@@ -87,7 +91,7 @@ var (
 var PrometheusScrapingConfig = env.Register("ISTIO_PROMETHEUS_ANNOTATIONS", "", "")
 
 var (
-	appProberPattern = regexp.MustCompile(`^/app-health/[^/]+/(livez|readyz|startupz)$`)
+	appProberPattern = regexp.MustCompile(`^/(app-health|app-lifecycle)/[^/]+/(livez|readyz|startupz|prestopz|poststartz)$`)
 
 	EnableHTTP2Probing = env.Register("ISTIO_ENABLE_HTTP2_PROBING", true,
 		"If enabled, HTTP2 probes will be enabled for HTTPS probes, following Kubernetes").Get()
@@ -134,8 +138,9 @@ type Options struct {
 	EnableProfiling     bool
 	// PrometheusRegistry to use. Just for testing.
 	PrometheusRegistry prometheus.Gatherer
-	Shutdown           context.CancelFunc
+	Shutdown           context.CancelCauseFunc
 	TriggerDrain       func()
+	DisableDrain       func()
 }
 
 // Server provides an endpoint for handling status probes.
@@ -155,8 +160,9 @@ type Server struct {
 	http                  *http.Client
 	enableProfiling       bool
 	registry              prometheus.Gatherer
-	shutdown              context.CancelFunc
+	shutdown              context.CancelCauseFunc
 	drain                 func()
+	disableDrain          func()
 }
 
 func initializeMonitoring() (prometheus.Gatherer, error) {
@@ -222,10 +228,9 @@ func NewServer(config Options) (*Server, error) {
 		config:                config,
 		enableProfiling:       config.EnableProfiling,
 		registry:              registry,
-		shutdown: func() {
-			config.Shutdown()
-		},
-		drain: config.TriggerDrain,
+		shutdown:              config.Shutdown,
+		drain:                 config.TriggerDrain,
+		disableDrain:          config.DisableDrain,
 	}
 	if LegacyLocalhostProbeDestination.Get() {
 		s.appProbersDestination = "localhost"
@@ -352,13 +357,15 @@ func validateAppKubeProber(path string, prober *Prober) error {
 
 // FormatProberURL returns a set of HTTP URLs that pilot agent will serve to take over Kubernetes
 // app probers.
-func FormatProberURL(container string) (string, string, string) {
+func FormatProberURL(container string) (string, string, string, string, string) {
 	return fmt.Sprintf("/app-health/%v/readyz", container),
 		fmt.Sprintf("/app-health/%v/livez", container),
-		fmt.Sprintf("/app-health/%v/startupz", container)
+		fmt.Sprintf("/app-health/%v/startupz", container),
+		fmt.Sprintf("/app-lifecycle/%v/prestopz", container),
+		fmt.Sprintf("/app-lifecycle/%v/poststartz", container)
 }
 
-// Run opens a the status port and begins accepting probes.
+// Run opens the status port and begins accepting probes.
 func (s *Server) Run(ctx context.Context) {
 	log.Infof("Opening status port %d", s.statusPort)
 
@@ -374,6 +381,7 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc(drainPath, s.handleDrain)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
+	mux.HandleFunc("/app-lifecycle/", s.handleAppProbe)
 
 	if s.enableProfiling {
 		// Add the handler for pprof.
@@ -540,7 +548,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	// Gather all the metrics we will merge
 	if !s.config.NoEnvoy {
-		if envoy, envoyCancel, _, err = s.scrape(fmt.Sprintf("http://localhost:%d/stats/prometheus", s.envoyStatsPort), r.Header); err != nil {
+		scrapeURL := fmt.Sprintf("http://localhost:%d/stats/prometheus", s.envoyStatsPort)
+		if r.URL != nil && len(r.URL.RawQuery) > 0 {
+			scrapeURL = fmt.Sprintf("%s?%s", scrapeURL, r.URL.RawQuery)
+		}
+		if envoy, envoyCancel, _, err = s.scrape(scrapeURL, r.Header); err != nil {
 			log.Errorf("failed scraping envoy metrics: %v", err)
 			metrics.EnvoyScrapeErrors.Increment()
 		}
@@ -690,7 +702,9 @@ func (s *Server) handleQuit(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("OK"))
 	log.Infof("handling %s, notifying pilot-agent to exit", quitPath)
-	s.shutdown()
+	s.disableDrain()
+	// Notify the agent to exit.
+	s.shutdown(fmt.Errorf("%v called", quitPath))
 }
 
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
@@ -776,7 +790,7 @@ func (s *Server) handleAppProbeHTTPGet(w http.ResponseWriter, req *http.Request,
 	// Send the request.
 	response, err := httpClient.Do(appReq)
 	if err != nil {
-		log.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, proberPath)
+		probes.Errorf("Request to probe app failed: %v, original URL path = %v\napp URL path = %v", err, path, proberPath)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -813,7 +827,7 @@ func (s *Server) handleAppProbeTCPSocket(w http.ResponseWriter, prober *Prober) 
 		w.WriteHeader(http.StatusOK)
 		err = conn.Close()
 		if err != nil {
-			log.Infof("tcp connection is not closed: %v", err)
+			probes.Infof("tcp connection is not closed: %v", err)
 		}
 	}
 }
@@ -845,7 +859,7 @@ func (s *Server) handleAppProbeGRPC(w http.ResponseWriter, req *http.Request, pr
 	addr := net.JoinHostPort(s.appProbersDestination, strconv.Itoa(int(prober.GRPC.Port)))
 	conn, err := grpc.DialContext(ctx, addr, opts...)
 	if err != nil {
-		log.Errorf("Failed to create grpc connection to probe app: %v", err)
+		probes.Errorf("Failed to create grpc connection to probe app: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -865,14 +879,14 @@ func (s *Server) handleAppProbeGRPC(w http.ResponseWriter, req *http.Request, pr
 		if ok {
 			switch status.Code() {
 			case codes.Unimplemented:
-				log.Errorf("server does not implement the grpc health protocol (grpc.health.v1.Health): %v", err)
+				probes.Errorf("server does not implement the grpc health protocol (grpc.health.v1.Health): %v", err)
 			case codes.DeadlineExceeded:
-				log.Errorf("grpc request not finished within timeout: %v", err)
+				probes.Errorf("grpc request not finished within timeout: %v", err)
 			default:
-				log.Errorf("grpc probe failed: %v", err)
+				probes.Errorf("grpc probe failed: %v", err)
 			}
 		} else {
-			log.Errorf("grpc probe failed: %v", err)
+			probes.Errorf("grpc probe failed: %v", err)
 		}
 		w.WriteHeader(http.StatusInternalServerError)
 		return

@@ -15,9 +15,8 @@
 package sets
 
 import (
+	"cmp"
 	"fmt"
-
-	"golang.org/x/exp/constraints"
 
 	"istio.io/istio/pkg/slices"
 )
@@ -61,6 +60,15 @@ func (s Set[T]) Delete(item T) Set[T] {
 // DeleteAll removes items from the set.
 func (s Set[T]) DeleteAll(items ...T) Set[T] {
 	for _, item := range items {
+		delete(s, item)
+	}
+	return s
+}
+
+// DeleteAllSet removes items from the set.
+// Note: this differs from Difference() as this is in-place
+func (s Set[T]) DeleteAllSet(other Set[T]) Set[T] {
+	for item := range other {
 		delete(s, item)
 	}
 	return s
@@ -200,7 +208,7 @@ func (s Set[T]) UnsortedList() []T {
 }
 
 // SortedList returns the slice with contents sorted.
-func SortedList[T constraints.Ordered](s Set[T]) []T {
+func SortedList[T cmp.Ordered](s Set[T]) []T {
 	res := s.UnsortedList()
 	slices.Sort(res)
 	return res
@@ -218,6 +226,20 @@ func (s Set[T]) InsertContains(item T) bool {
 	}
 	s[item] = struct{}{}
 	return false
+}
+
+// DeleteContains deletes the item from the set and returns if it was already present.
+// Example:
+//
+//	if set.DeleteContains(item) {
+//		fmt.Println("item was delete", item)
+//	}
+func (s Set[T]) DeleteContains(item T) bool {
+	if !s.Contains(item) {
+		return false
+	}
+	delete(s, item)
+	return true
 }
 
 // Contains returns whether the given item is in the set.

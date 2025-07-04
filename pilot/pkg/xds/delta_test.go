@@ -29,8 +29,8 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 	xdsserver "istio.io/istio/pkg/xds"
@@ -79,6 +79,7 @@ func TestDeltaCDS(t *testing.T) {
 		assert.Equal(t, sets.New(got...), sets.New(names...).Merge(base))
 	}
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+	spamDebugEndpointsToDetectRace(t, s)
 	addTestClientEndpoints(s.MemRegistry)
 	s.MemRegistry.AddHTTPService(edsIncSvc, edsIncVip, 8080)
 	s.MemRegistry.SetEndpoints(edsIncSvc, "",
@@ -282,7 +283,7 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	}
 
 	// A push should get a response
-	s.Discovery.ConfigUpdate(&model.PushRequest{Full: true})
+	s.Discovery.ConfigUpdate(&model.PushRequest{Full: true, Forced: true})
 	ads.ExpectResponse()
 
 	// Close the connection
@@ -329,8 +330,11 @@ func TestDeltaReconnectRequests(t *testing.T) {
 	}
 }
 
+func init() {
+	features.EnableAmbient = true
+}
+
 func TestDeltaWDS(t *testing.T) {
-	test.SetForTest(t, &features.EnableAmbient, true)
 	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
 	wlA := &model.WorkloadInfo{
 		Workload: &workloadapi.Workload{
@@ -394,9 +398,7 @@ func TestDeltaWDS(t *testing.T) {
 
 	// simulate a svc update
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		ConfigsUpdated: sets.New(model.ConfigKey{
-			Kind: kind.Address, Name: svcA.ResourceName(), Namespace: svcA.Namespace,
-		}),
+		AddressesUpdated: sets.New(svcA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
@@ -410,9 +412,7 @@ func TestDeltaWDS(t *testing.T) {
 	// simulate a svc delete
 	s.MemRegistry.RemoveServiceInfo(svcA)
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		ConfigsUpdated: sets.New(model.ConfigKey{
-			Kind: kind.Address, Name: svcA.ResourceName(), Namespace: svcA.Namespace,
-		}),
+		AddressesUpdated: sets.New(svcA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
@@ -425,17 +425,48 @@ func TestDeltaWDS(t *testing.T) {
 
 	// delete workload
 	s.MemRegistry.RemoveWorkloadInfo(wlA)
-	// a full push and a pod delete event
-	// This is a merged push request
+	// a pod delete event
 	s.XdsUpdater.ConfigUpdate(&model.PushRequest{
-		Full: true,
+		AddressesUpdated: sets.New(wlA.ResourceName()),
 	})
 
 	resp = ads.ExpectResponse()
 	if len(resp.RemovedResources) != 1 || resp.RemovedResources[0] != wlA.ResourceName() {
-		t.Fatalf("received unexpected removed eds resource %v", resp.RemovedResources)
+		t.Fatalf("received unexpected removed wds resource %v", resp.RemovedResources)
 	}
-	if len(resp.Resources) != 4 {
-		t.Fatalf("received unexpected eds resource %v", resp.Resources)
+	if len(resp.Resources) != 0 {
+		t.Fatalf("received unexpected wds resource %v", resp.Resources)
 	}
+}
+
+func TestDeltaUnsub(t *testing.T) {
+	s := xds.NewFakeDiscoveryServer(t, xds.FakeOptions{})
+
+	ads := s.ConnectDeltaADS().WithID("sidecar~127.0.0.1~test.default~default.svc.cluster.local")
+
+	runAssert := func(nonce string) {
+		t.Helper()
+		retry.UntilSuccessOrFail(t, func() error {
+			sync := getSyncStatus(t, s.Discovery)
+			if len(sync) != 1 {
+				return fmt.Errorf("got %v sync status", len(sync))
+			}
+			if sync[0].ClusterSent != nonce {
+				return fmt.Errorf("want %q, got %q for send", nonce, sync[0].ClusterSent)
+			}
+			if sync[0].ClusterAcked != nonce {
+				return fmt.Errorf("want %q, got %q for ack", nonce, sync[0].ClusterAcked)
+			}
+			return nil
+		})
+	}
+	// Initially we get everything
+	resp := ads.RequestResponseAck(&discovery.DeltaDiscoveryRequest{
+		ResourceNamesSubscribe: []string{},
+	})
+	runAssert(resp.Nonce)
+	ads.Request(&discovery.DeltaDiscoveryRequest{
+		ResourceNamesUnsubscribe: []string{"something"},
+	})
+	runAssert(resp.Nonce)
 }

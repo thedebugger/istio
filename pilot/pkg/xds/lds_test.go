@@ -293,7 +293,6 @@ func TestLDSEnvoyFilterWithWorkloadSelector(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			adsc := s.Connect(&model.Proxy{
 				ConfigNamespace: "consumerns",
@@ -324,7 +323,7 @@ func expectLuaFilter(t *testing.T, l *listener.Listener, expected bool) {
 			}
 		}
 		if chain == nil {
-			t.Fatalf("Failed to find http_connection_manager")
+			t.Fatal("Failed to find http_connection_manager")
 		}
 		if len(chain.Filters) != 1 {
 			t.Fatalf("Expected 1 filter in first filter chain, got %d", len(l.FilterChains))

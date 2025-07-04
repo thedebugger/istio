@@ -34,13 +34,14 @@ import (
 	gwfeatures "sigs.k8s.io/gateway-api/pkg/features"
 	"sigs.k8s.io/yaml"
 
+	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/config/kube/gateway"
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework"
 	ambientComponent "istio.io/istio/pkg/test/framework/components/ambient"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/prow"
 	"istio.io/istio/pkg/test/scopes"
@@ -53,6 +54,7 @@ import (
 type GatewayConformanceInputs struct {
 	Client  kube.CLIClient
 	Cleanup bool
+	Cluster cluster.Cluster
 }
 
 var gatewayConformanceInputs GatewayConformanceInputs
@@ -82,29 +84,31 @@ func TestGatewayConformance(t *testing.T) {
 			}
 
 			mapper, _ := gatewayConformanceInputs.Client.UtilFactory().ToRESTMapper()
-			c, err := client.New(gatewayConformanceInputs.Client.RESTConfig(), client.Options{
+			clientOptions := client.Options{
 				Scheme: kube.IstioScheme,
 				Mapper: mapper,
-			})
+			}
+			c, err := client.New(gatewayConformanceInputs.Client.RESTConfig(), clientOptions)
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			hostnameType := v1.AddressType("Hostname")
 			istioVersion, _ := env.ReadVersion()
-			supported := gateway.SupportedFeatures.Clone().Delete(gwfeatures.SupportMeshConsumerRoute)
+			supported := gateway.SupportedFeatures.Clone().Delete(gwfeatures.MeshConsumerRouteFeature)
 			opts := suite.ConformanceOptions{
 				Client:                   c,
+				ClientOptions:            clientOptions,
 				Clientset:                gatewayConformanceInputs.Client.Kube(),
 				RestConfig:               gatewayConformanceInputs.Client.RESTConfig(),
 				GatewayClassName:         "istio",
 				Debug:                    scopes.Framework.DebugEnabled(),
 				CleanupBaseResources:     gatewayConformanceInputs.Cleanup,
 				ManifestFS:               []fs.FS{&conformance.Manifests},
-				SupportedFeatures:        supported,
+				SupportedFeatures:        gwfeatures.SetsToNamesSet(supported),
 				SkipTests:                maps.Keys(skippedTests),
-				UsableNetworkAddresses:   []v1.GatewayAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
-				UnusableNetworkAddresses: []v1.GatewayAddress{{Value: "foo", Type: &hostnameType}},
+				UsableNetworkAddresses:   []v1.GatewaySpecAddress{{Value: "infra-backend-v1.gateway-conformance-infra.svc.cluster.local", Type: &hostnameType}},
+				UnusableNetworkAddresses: []v1.GatewaySpecAddress{{Value: "foo", Type: &hostnameType}},
 				ConformanceProfiles: k8ssets.New(
 					suite.GatewayHTTPConformanceProfileName,
 					suite.GatewayTLSConformanceProfileName,
@@ -119,7 +123,7 @@ func TestGatewayConformance(t *testing.T) {
 					Contact:      []string{"@istio/maintainers"},
 				},
 				NamespaceLabels: map[string]string{
-					constants.DataplaneModeLabel: "ambient",
+					label.IoIstioDataplaneMode.Name: "ambient",
 				},
 				TimeoutConfig: ctx.Settings().GatewayConformanceTimeoutConfig,
 			}
@@ -147,24 +151,25 @@ func TestGatewayConformance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ns.RemoveLabel(constants.DataplaneModeLabel)
+			ns.RemoveLabel(label.IoIstioDataplaneMode.Name)
 
 			// create a waypoint for mesh conformance
 			meshNS := namespace.Static("gateway-conformance-mesh")
-			ambientComponent.NewWaypointProxyOrFail(ctx, meshNS, "namespace")
-			for _, k := range ctx.AllClusters() {
-				ns, err := k.Kube().CoreV1().Namespaces().Get(ctx.Context(), meshNS.Name(), metav1.GetOptions{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				labels := ns.Labels
-				if labels == nil {
-					labels = make(map[string]string)
-				}
-				labels[constants.AmbientUseWaypointLabel] = "namespace"
-				ns.Labels = labels
-				k.Kube().CoreV1().Namespaces().Update(ctx.Context(), ns, metav1.UpdateOptions{})
+			cls := gatewayConformanceInputs.Cluster
+			ambientComponent.NewWaypointProxyOrFailForCluster(ctx, meshNS, "namespace", cls)
+
+			// TODO: Should we even run this in multiple clusters?
+			concreteNS, err := cls.Kube().CoreV1().Namespaces().Get(ctx.Context(), meshNS.Name(), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
 			}
+			labels := concreteNS.Labels
+			if labels == nil {
+				labels = make(map[string]string)
+			}
+			labels[label.IoIstioUseWaypoint.Name] = "namespace"
+			concreteNS.Labels = labels
+			cls.Kube().CoreV1().Namespaces().Update(ctx.Context(), concreteNS, metav1.UpdateOptions{})
 
 			assert.NoError(t, csuite.Run(t, tests.ConformanceTests))
 			report, err := csuite.Report()

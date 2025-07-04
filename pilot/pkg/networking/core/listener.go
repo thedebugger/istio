@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -91,6 +92,8 @@ var (
 	allIstioMtlsALPNs = []string{"istio", "istio-peer-exchange", "istio-http/1.0", "istio-http/1.1", "istio-h2"}
 
 	mtlsTCPWithMxcALPNs = []string{"istio-peer-exchange", "istio"}
+
+	defaultGatewayTransportSocketConnectTimeout = 15 * time.Second
 )
 
 // BuildListeners produces a list of listeners and referenced clusters for all proxies
@@ -98,7 +101,6 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 	push *model.PushContext,
 ) []*listener.Listener {
 	builder := NewListenerBuilder(node, push)
-
 	switch node.Type {
 	case model.SidecarProxy:
 		builder = configgen.buildSidecarListeners(builder)
@@ -111,7 +113,11 @@ func (configgen *ConfigGeneratorImpl) BuildListeners(node *model.Proxy,
 	builder.patchListeners()
 	l := builder.getListeners()
 	if features.EnableHBONESend && !builder.node.IsWaypointProxy() {
-		l = append(l, buildConnectOriginateListener())
+		class := istionetworking.ListenerClassSidecarOutbound
+		if node.Type == model.Router {
+			class = istionetworking.ListenerClassGateway
+		}
+		l = append(l, buildConnectOriginateListener(push, node, class))
 	}
 
 	return l
@@ -156,21 +162,25 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 
 	switch {
 	case serverTLSSettings.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL:
-		authnmodel.ApplyToCommonTLSContext(ctx.CommonTlsContext, proxy, serverTLSSettings.SubjectAltNames, serverTLSSettings.CaCrl, []string{}, validateClient)
-	// If credential name is specified at gateway config, create  SDS config for gateway to fetch key/cert from Istiod.
-	case serverTLSSettings.CredentialName != "":
+		authnmodel.ApplyToCommonTLSContext(
+			ctx.CommonTlsContext, proxy, serverTLSSettings.SubjectAltNames, serverTLSSettings.CaCrl,
+			[]string{}, validateClient, nil)
+	// If credential name(s) are specified at gateway config, create SDS config for gateway to fetch key/cert from Istiod.
+	case len(serverTLSSettings.GetCredentialNames()) > 0 || serverTLSSettings.CredentialName != "":
 		authnmodel.ApplyCredentialSDSToServerCommonTLSContext(ctx.CommonTlsContext, serverTLSSettings, credentialSocketExist)
 	default:
 		certProxy := &model.Proxy{}
 		certProxy.IstioVersion = proxy.IstioVersion
-		// If certificate files are specified in gateway configuration, use file based SDS.
 		certProxy.Metadata = &model.NodeMetadata{
 			TLSServerCertChain: serverTLSSettings.ServerCertificate,
 			TLSServerKey:       serverTLSSettings.PrivateKey,
 			TLSServerRootCert:  serverTLSSettings.CaCertificates,
+			Raw:                proxy.Metadata.Raw,
 		}
 
-		authnmodel.ApplyToCommonTLSContext(ctx.CommonTlsContext, certProxy, serverTLSSettings.SubjectAltNames, serverTLSSettings.CaCrl, []string{}, validateClient)
+		authnmodel.ApplyToCommonTLSContext(
+			ctx.CommonTlsContext, certProxy, serverTLSSettings.SubjectAltNames, serverTLSSettings.CaCrl,
+			[]string{}, validateClient, serverTLSSettings.TlsCertificates)
 	}
 
 	if isSimpleOrMutual(serverTLSSettings.Mode) {
@@ -264,10 +274,10 @@ func (l listenerBinding) Primary() string {
 
 // Extra returns any additional bindings. This is always empty if dual stack is disabled
 func (l listenerBinding) Extra() []string {
-	if !features.EnableDualStack || len(l.binds) == 1 {
-		return nil
+	if len(l.binds) > 1 {
+		return l.binds[1:]
 	}
-	return l.binds[1:]
+	return nil
 }
 
 type outboundListenerEntry struct {
@@ -494,16 +504,27 @@ func (lb *ListenerBuilder) buildSidecarOutboundListeners(node *model.Proxy,
 							// Make sure each endpoint address is a valid address
 							// as service entries could have NONE resolution with label selectors for workload
 							// entries (which could technically have hostnames).
-							if !netutil.IsValidIPAddress(instance.Address) {
+							isValidInstance := true
+							for _, addr := range instance.Addresses {
+								if !netutil.IsValidIPAddress(addr) {
+									isValidInstance = false
+									break
+								}
+							}
+							if !isValidInstance {
 								continue
 							}
 							// Skip build outbound listener to the node itself,
 							// as when app access itself by pod ip will not flow through this listener.
 							// Simultaneously, it will be duplicate with inbound listener.
-							if instance.Address == node.IPAddresses[0] {
+							// should continue if current IstioEndpoint instance has the same ip with the
+							// first ip of node IPaddresses.
+							// The comparison works because both IstioEndpoint and Proxy always use the first PodIP (as provided by Kubernetes)
+							// as the first entry of their respective lists.
+							if instance.FirstAddressOrNil() == node.IPAddresses[0] {
 								continue
 							}
-							listenerOpts.bind.binds = []string{instance.Address}
+							listenerOpts.bind.binds = instance.Addresses
 							lb.buildSidecarOutboundListener(listenerOpts, listenerMap, virtualServices, actualWildcards)
 						}
 					} else {
@@ -567,15 +588,7 @@ func buildListenerFromEntry(builder *ListenerBuilder, le *outboundListenerEntry,
 		}
 	}
 
-	// We add a TLS inspector when http inspector is needed for outbound only. This
-	// is because if we ever set ALPN in the match without
-	// transport_protocol=raw_buffer, Envoy will automatically inject a tls
-	// inspector: https://github.com/envoyproxy/envoy/issues/13601. This leads to
-	// excessive logging and loss of control over the config. For inbound this is not
-	// needed, since we are explicitly setting transport protocol in every single
-	// match. We can do this for outbound as well, at which point this could be
-	// removed, but have not yet
-	if needTLSInspector || needHTTPInspector {
+	if needTLSInspector {
 		l.ListenerFilters = append(l.ListenerFilters, xdsfilters.TLSInspector)
 	}
 
@@ -596,12 +609,16 @@ func buildListenerFromEntry(builder *ListenerBuilder, le *outboundListenerEntry,
 		chain := &listener.FilterChain{
 			Metadata:        opt.metadata,
 			TransportSocket: buildDownstreamTLSTransportSocket(opt.tlsContext),
+			// Setting this timeout enables the proxy to enhance its resistance against memory exhaustion attacks,
+			// such as slow TLS Handshake attacks.
+			TransportSocketConnectTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout),
 		}
 		if opt.httpOpts == nil {
 			// we are building a network filter chain (no http connection manager) for this filter chain
 			chain.Filters = opt.networkFilters
 		} else {
-			opt.httpOpts.statPrefix = strings.ToLower(l.TrafficDirection.String()) + "_" + l.Name
+			statsPrefix := strings.ToLower(l.TrafficDirection.String()) + "_" + l.Name
+			opt.httpOpts.statPrefix = util.DelimitedStatsPrefix(statsPrefix)
 			opt.httpOpts.port = le.servicePort.Port
 			hcm := builder.buildHTTPConnectionManager(opt.httpOpts)
 			filter := &listener.Filter{
@@ -817,9 +834,8 @@ func (lb *ListenerBuilder) buildSidecarOutboundListener(listenerOpts outboundLis
 				} else {
 					// Address is a CIDR. Fall back to 0.0.0.0 and
 					// filter chain match
-					// TODO: this probably needs to handle dual stack better
 					listenerOpts.bind.binds = actualWildcards
-					listenerOpts.cidr = svcListenAddress
+					listenerOpts.cidr = append([]string{svcListenAddress}, svcExtraListenAddresses...)
 				}
 			}
 		}
@@ -1058,7 +1074,7 @@ type outboundListenerOpts struct {
 	proxy *model.Proxy
 
 	bind listenerBinding
-	cidr string
+	cidr []string
 
 	port    *model.Port
 	service *model.Service
@@ -1100,6 +1116,9 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		filterChains = append(filterChains, &listener.FilterChain{
 			FilterChainMatch: match,
 			TransportSocket:  transportSocket,
+			// Setting this timeout enables the proxy to enhance its resistance against memory exhaustion attacks,
+			// such as slow TLS Handshake attacks.
+			TransportSocketConnectTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout),
 		})
 	}
 
@@ -1107,11 +1126,12 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		TrafficDirection: core.TrafficDirection_OUTBOUND,
 		ListenerFilters:  listenerFilters,
 		FilterChains:     filterChains,
-		// For Gateways, we want no timeout. We should wait indefinitely for the TLS if we are sniffing.
-		// The timeout is useful for sidecars, where we may operate on server first traffic; for gateways if we have listener filters
-		// we know those filters are required.
-		ContinueOnListenerFiltersTimeout: false,
-		ListenerFiltersTimeout:           durationpb.New(0),
+		// No listener filter timeout is set for the gateway here; it will default to 15 seconds in Envoy.
+		// This timeout setting helps prevent memory leaks in Envoy when a TLS inspector filter is present,
+		// by avoiding slow requests that could otherwise lead to such issues.
+		// Note that this timer only takes effect when a listener filter is present.
+
+		MaxConnectionsToAcceptPerSocketEvent: maxConnectionsToAcceptPerSocketEvent(),
 	}
 	switch transport {
 	case istionetworking.TransportProtocolTCP:

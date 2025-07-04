@@ -20,8 +20,8 @@ const (
 	// UnspecifiedIPv6 constant for empty IPv6 address
 	UnspecifiedIPv6 = "::"
 
-	// ClusterAltStatNameDelimeter constant for the stat delimer
-	ClusterAltStatNameDelimeter = ";"
+	// StatPrefixDelimiter constant for the stat delimer
+	StatPrefixDelimiter = ";"
 
 	// PilotWellKnownDNSCertPath is the path location for Pilot dns serving cert, often used with custom CA integrations
 	PilotWellKnownDNSCertPath   = "./var/run/secrets/istiod/tls/"
@@ -89,6 +89,9 @@ const (
 	// The data name in the ConfigMap of each namespace storing the root cert of non-Kube CA.
 	CACertNamespaceConfigMapDataName = "root-cert.pem"
 
+	// CACRLNamespaceConfigMapDataName in the ConfigMap of each namespace storing the CRL of plugged in CA certificates.
+	CACRLNamespaceConfigMapDataName = "ca-crl.pem"
+
 	// PodInfoLabelsPath is the filepath that pod labels will be stored
 	// This is typically set by the downward API
 	PodInfoLabelsPath = "./etc/istio/pod/labels"
@@ -126,7 +129,9 @@ const (
 	// InternalParentNames declares the original resources of an internally-generated config.
 	// This is used by k8s gateway-api.
 	// It is a comma separated list. For example, "HTTPRoute/foo.default,HTTPRoute/bar.default"
-	InternalParentNames      = "internal.istio.io/parents"
+	InternalParentNames = "internal.istio.io/parents"
+	// InternalParentNamespace contains, for internally-generated resource, the namespace of the parent, if different then current.
+	InternalParentNamespace  = "internal.istio.io/parent-namespace"
 	InternalRouteSemantics   = "internal.istio.io/route-semantics"
 	RouteSemanticsIngress    = "ingress"
 	RouteSemanticsGateway    = "gateway"
@@ -154,34 +159,33 @@ const (
 	// testing the validation webhook.
 	AlwaysReject = "internal.istio.io/webhook-always-reject"
 
-	ManagedGatewayLabel               = "gateway.istio.io/managed"
-	UnmanagedGatewayController        = "istio.io/unmanaged-gateway"
-	ManagedGatewayControllerLabel     = "istio.io-gateway-controller"
-	ManagedGatewayMeshControllerLabel = "istio.io-mesh-controller"
-	ManagedGatewayMeshController      = "istio.io/mesh-controller"
+	UnmanagedGatewayController            = "istio.io/unmanaged-gateway"
+	ManagedGatewayControllerLabel         = "istio.io-gateway-controller"
+	ManagedGatewayMeshControllerLabel     = "istio.io-mesh-controller"
+	ManagedGatewayMeshController          = "istio.io/mesh-controller"
+	ManagedGatewayEastWestController      = "istio.io/eastwest-controller"
+	ManagedGatewayEastWestControllerLabel = "istio.io-eastwest-controller"
+
+	// WaypointSandwichListenerProxyProtocol defines the protocol which is defined on the listener used by a waypoint sandwich
+	// This listener should align to the proto/port defined by the  "ambient.istio.io/waypoint-inbound-binding" annotation
+	WaypointSandwichListenerProxyProtocol = "istio.io/PROXY"
 
 	RemoteGatewayClassName   = "istio-remote"
 	WaypointGatewayClassName = "istio-waypoint"
-
-	// DeprecatedGatewayNameLabel indicates the gateway managing a particular proxy instances. Only populated for Gateway API gateways
-	DeprecatedGatewayNameLabel = "istio.io/gateway-name"
-	// GatewayNameLabel indicates the gateway managing a particular proxy instances. Only populated for Gateway API gateways
-	GatewayNameLabel = "gateway.networking.k8s.io/gateway-name"
+	EastWestGatewayClassName = "istio-east-west"
 
 	// TODO formalize this API
 	// TODO additional values to represent passthrough and hbone or both
 	ListenerModeOption          = "gateway.istio.io/listener-protocol"
 	ListenerModeAutoPassthrough = "auto-passthrough"
 
-	// DataplaneMode namespace label for determining ambient mesh behavior
-	DataplaneModeLabel = "istio.io/dataplane-mode"
 	// Set by users to indicate that the (namespace|pod) should be captured for ambient
 	DataplaneModeAmbient = "ambient"
 	// Set by users to indicate that the (namespace|pod) should NOT be captured for ambient
 	DataplaneModeNone = "none"
 
 	// AmbientRedirection specifies whether a pod has ambient redirection (to ztunnel) configured.
-	AmbientRedirection = "ambient.istio.io/redirection"
+	//AmbientRedirection = annotation.AmbientRedirection.Name
 	// AmbientRedirectionEnabled indicates redirection is configured. This is set by the CNI on pods
 	// when it actually has successfully set up pod redirection, rather than by the user.
 	//
@@ -189,20 +193,10 @@ const (
 	// Anything else indicates it is not.
 	AmbientRedirectionEnabled = "enabled"
 
-	// AmbientUseWaypointLabel is the label used to specify which waypoint should be used for a given pod, service, etc...
-	// `istio.io/use-waypoint: none` means skipping using any waypoint specified from higher scope, namespace/service, etc...
-	AmbientUseWaypointLabel = "istio.io/use-waypoint"
-	// AmbientUseWaypointNamespaceLabel is a label used to indicate the namespace of the waypoint (referred to by AmbientUseWaypointLabel).
-	// This allows cross-namespace waypoint references. If unset, the same namespace is assumed.
-	AmbientUseWaypointNamespaceLabel = "istio.io/use-waypoint-namespace"
-	// AmbientWaypointForTrafficTypeLabel is the label used to specify which traffic is allowed through the Waypoint.
-	// This label is applied to the Waypoint. Valid traffic types are "service", "workload", "all", and "none".
-	AmbientWaypointForTrafficTypeLabel = "istio.io/waypoint-for"
-
-	// AmbientWaypointInboundBinding has the format `<protocol>` or `<protocol>/<port>`. If the waypoint is
-	// captured by a zTunnel, the zTunnel  will send traffic to the specified port with tunnel information
-	// such as source/destination addresses, identity and HBONE target host using the specified protocol.
-	AmbientWaypointInboundBinding = "ambient.istio.io/waypoint-inbound-binding"
+	// The presence of this annotation with this specific value indicates the pod is
+	// *partially* captured but no ztunnel has accepted it for proxying yet.
+	// Pods in this state will not egress/ingress traffic until an active ztunnel begins proxying them.
+	AmbientRedirectionPending = "pending"
 
 	// ServiceTraffic indicates that service traffic should go through the intended waypoint.
 	ServiceTraffic = "service"
@@ -212,6 +206,4 @@ const (
 	AllTraffic = "all"
 	// NoTraffic indicates that no traffic should go through the intended waypoint.
 	NoTraffic = "none"
-
-	EnableV2AutoAllocationLabel = "networking.istio.io/enable-autoallocate-ip"
 )

@@ -23,6 +23,7 @@
 package model
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -32,13 +33,16 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/mitchellh/copystructure"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"istio.io/api/annotation"
 	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pilot/pkg/util/protoconv"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
@@ -49,7 +53,9 @@ import (
 	"istio.io/istio/pkg/maps"
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 	"istio.io/istio/pkg/workloadapi/security"
@@ -139,6 +145,28 @@ func (s *Service) CmpOpts() []cmp.Option {
 	return serviceCmpOpts
 }
 
+func (s *Service) SupportsDrainingEndpoints() bool {
+	return (features.PersistentSessionLabel != "" && s.Attributes.Labels[features.PersistentSessionLabel] != "") ||
+		(features.PersistentSessionHeaderLabel != "" && s.Attributes.Labels[features.PersistentSessionHeaderLabel] != "")
+}
+
+// SupportsUnhealthyEndpoints marks if this service should send unhealthy endpoints
+func (s *Service) SupportsUnhealthyEndpoints() bool {
+	if features.GlobalSendUnhealthyEndpoints.Load() {
+		// Enable process-wide
+		return true
+	}
+	if s != nil && s.Attributes.TrafficDistribution != TrafficDistributionAny {
+		// When we are doing location aware routing, we need some way to indicate if endpoints are healthy, otherwise we don't
+		// know when to spill over to other zones.
+		// For the older DestinationRule localityLB, we do this by requiring outlier detection.
+		// If they use the newer Kubernetes-native TrafficDistribution we don't want to require an Istio-specific outlier rule,
+		// and instead will use endpoint health which requires sending unhealthy endpoints.
+		return true
+	}
+	return false
+}
+
 // Resolution indicates how the service instances need to be resolved before routing traffic.
 type Resolution int
 
@@ -216,7 +244,16 @@ const (
 )
 
 func SupportsTunnel(labels map[string]string, tunnelType string) bool {
-	return sets.New(strings.Split(labels[TunnelLabel], ",")...).Contains(tunnelType)
+	tl, f := labels[TunnelLabel]
+	if !f {
+		return false
+	}
+	if tl == tunnelType {
+		// Fast-path the case where we have only one label
+		return true
+	}
+	// Else check everything. Tunnel label is a comma-separated list.
+	return sets.New(strings.Split(tl, ",")...).Contains(tunnelType)
 }
 
 // Port represents a network port where a service is listening for
@@ -301,10 +338,6 @@ type ServiceTarget struct {
 	Port    ServiceInstancePort
 }
 
-func (st ServiceTarget) NamespacedName() types.NamespacedName {
-	return st.Service.NamespacedName()
-}
-
 type (
 	ServicePort = *Port
 	// ServiceInstancePort defines a port that has both a port and targetPort (which distinguishes it from model.Port)
@@ -375,13 +408,10 @@ func (instance *WorkloadInstance) CmpOpts() []cmp.Option {
 
 // DeepCopy creates a copy of WorkloadInstance.
 func (instance *WorkloadInstance) DeepCopy() *WorkloadInstance {
-	return &WorkloadInstance{
-		Name:      instance.Name,
-		Namespace: instance.Namespace,
-		Kind:      instance.Kind,
-		PortMap:   maps.Clone(instance.PortMap),
-		Endpoint:  instance.Endpoint.DeepCopy(),
-	}
+	out := *instance
+	out.PortMap = maps.Clone(instance.PortMap)
+	out.Endpoint = instance.Endpoint.DeepCopy()
+	return &out
 }
 
 // WorkloadInstancesEqual is a custom comparison of workload instances based on the fields that we need.
@@ -390,9 +420,11 @@ func WorkloadInstancesEqual(first, second *WorkloadInstance) bool {
 	if first.Endpoint == nil || second.Endpoint == nil {
 		return first.Endpoint == second.Endpoint
 	}
-	if first.Endpoint.Address != second.Endpoint.Address {
+
+	if !slices.EqualUnordered(first.Endpoint.Addresses, second.Endpoint.Addresses) {
 		return false
 	}
+
 	if first.Endpoint.Network != second.Endpoint.Network {
 		return false
 	}
@@ -441,16 +473,21 @@ type Locality struct {
 	ClusterID cluster.ID
 }
 
-// Endpoint health status.
+// HealthStatus indicates the status of the Endpoint.
 type HealthStatus int32
 
 const (
-	// Healthy.
+	// Healthy indicates an endpoint is ready to accept traffic
 	Healthy HealthStatus = 1
-	// Unhealthy.
+	// UnHealthy indicates an endpoint is not ready to accept traffic
 	UnHealthy HealthStatus = 2
-	// Draining - the constant matches envoy
+	// Draining is a special case, which is used only when persistent sessions are enabled. This indicates an endpoint
+	// was previously healthy, but is now shutting down.
+	// Without persistent sessions, an endpoint that is shutting down will be marked as Terminating.
 	Draining HealthStatus = 3
+	// Terminating marks an endpoint as shutting down. Similar to "unhealthy", this means we should not send it traffic.
+	// But unlike "unhealthy", this means we do not consider it when calculating failover.
+	Terminating HealthStatus = 4
 )
 
 // IstioEndpoint defines a network address (IP:port) associated with an instance of the
@@ -471,14 +508,26 @@ const (
 //
 //	--> 172.16.0.1:55446 (with ServicePort pointing to 80) and
 //	--> 172.16.0.1:33333 (with ServicePort pointing to 8080)
-//
-// TODO: Investigate removing ServiceInstance entirely.
 type IstioEndpoint struct {
 	// Labels points to the workload or deployment labels.
 	Labels labels.Instance
 
-	// Address is the address of the endpoint, using envoy proto.
-	Address string
+	// Addresses are the addresses of the endpoint, using envoy proto:
+	// https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/endpoint/v3/endpoint_components.proto#config-endpoint-v3-endpoint-additionaladdress
+	// This field can support multiple addresses for an Dual Stack endpoint, especially for an endpoint which contains both ipv4 or ipv6 addresses.
+	// There should be some constraints below:
+	// 1. Each address of the endpoint must have the same metadata.
+	// 2. The function Key() of IstioEndpoint returns the first IP address of this field in string format.
+	// 3. The IP address of field `address` in Envoy Endpoint is equal to the first address of this field.
+	// When the additional_addresses field is populated for EDS in Envoy configuration, Envoy will use an Happy Eyeballs algorithm.
+	// Therefore Envoy will first attempt connecting to the IP address in the `address` field of Envoy Endpoint.
+	// If the first attempt fails, then it will interleave IP addresses in the `additional_addresses` field based on IP version, as described in rfc8305,
+	// and attempt connections with them with a delay of 300ms each. The first connection to succeed will be used.
+	// Note: it uses Hash Based Load Balancing Policies for multiple addresses support Endpoint, and only the first address of the
+	// endpoint will be used as the hash key for the ring or maglev list, however, the upstream address that load balancer ends up
+	// connecting to will depend on the one that ends up "winning" using the Happy Eyeballs algorithm.
+	// Please refer to https://docs.google.com/document/d/1AjmTcMWwb7nia4rAgqE-iqIbSbfiXCI4h1vk-FONFdM/ for more details.
+	Addresses []string
 
 	// ServicePortName tracks the name of the port, this is used to select the IstioEndpoint by service port.
 	ServicePortName string
@@ -523,6 +572,11 @@ type IstioEndpoint struct {
 
 	// Indicates the endpoint health status.
 	HealthStatus HealthStatus
+
+	// SendUnhealthyEndpoints indicates whether this endpoint should be sent when it is unhealthy
+	// Note: this is more appropriate at the Service level, but some codepaths require this in areas without the service
+	// object present.
+	SendUnhealthyEndpoints bool
 
 	// If in k8s, the node where the pod resides
 	NodeName string
@@ -579,6 +633,18 @@ var istioEndpointCmpOpts = []cmp.Option{cmpopts.IgnoreUnexported(IstioEndpoint{}
 
 func (ep *IstioEndpoint) CmpOpts() []cmp.Option {
 	return istioEndpointCmpOpts
+}
+
+func (ep *IstioEndpoint) FirstAddressOrNil() string {
+	if ep == nil || len(ep.Addresses) == 0 {
+		return ""
+	}
+	return ep.Addresses[0]
+}
+
+// Key returns a function suitable for usage to distinguish this IstioEndpoint from another
+func (ep *IstioEndpoint) Key() string {
+	return ep.FirstAddressOrNil() + "/" + ep.WorkloadName + "/" + ep.ServicePortName
 }
 
 // EndpointMetadata represents metadata set on Envoy LbEndpoint used for telemetry purposes.
@@ -710,6 +776,52 @@ type K8sAttributes struct {
 	// NodeLocal means the proxy will only forward traffic to node local endpoints
 	// spec.InternalTrafficPolicy == Local
 	NodeLocal bool
+
+	// TrafficDistribution determines the service-level traffic distribution.
+	// This may be overridden by locality load balancing settings.
+	TrafficDistribution TrafficDistribution
+
+	// ObjectName is the object name of the underlying object. This may differ from the Service.Attributes.Name for legacy semantics.
+	ObjectName string
+
+	// spec.PublishNotReadyAddresses
+	PublishNotReadyAddresses bool
+}
+
+type TrafficDistribution int
+
+const (
+	// TrafficDistributionAny allows any destination
+	TrafficDistributionAny TrafficDistribution = iota
+	// TrafficDistributionPreferPreferSameZone prefers traffic in same zone, failing over to same region and then network.
+	TrafficDistributionPreferSameZone
+	// TrafficDistributionPreferNode prefers traffic in same node, failing over to same subzone, then zone, region, and network.
+	TrafficDistributionPreferSameNode
+)
+
+func GetTrafficDistribution(specValue *string, annotations map[string]string) TrafficDistribution {
+	if specValue != nil {
+		switch *specValue {
+		case corev1.ServiceTrafficDistributionPreferSameZone, corev1.ServiceTrafficDistributionPreferClose:
+			return TrafficDistributionPreferSameZone
+		case corev1.ServiceTrafficDistributionPreferSameNode:
+			return TrafficDistributionPreferSameNode
+		}
+	}
+	// The TrafficDistribution field is quite new, so we allow a legacy annotation option as well
+	// This also has some custom types
+	trafficDistributionAnnotationValue := strings.ToLower(annotations[annotation.NetworkingTrafficDistribution.Name])
+	switch trafficDistributionAnnotationValue {
+	case strings.ToLower(corev1.ServiceTrafficDistributionPreferClose), strings.ToLower(corev1.ServiceTrafficDistributionPreferSameZone):
+		return TrafficDistributionPreferSameZone
+	case strings.ToLower(corev1.ServiceTrafficDistributionPreferSameNode):
+		return TrafficDistributionPreferSameNode
+	default:
+		if trafficDistributionAnnotationValue != "" {
+			log.Warnf("Unknown traffic distribution annotation, defaulting to any")
+		}
+		return TrafficDistributionAny
+	}
 }
 
 // DeepCopy creates a deep copy of ServiceAttributes, but skips internal mutexes.
@@ -718,42 +830,23 @@ func (s *ServiceAttributes) DeepCopy() ServiceAttributes {
 	// nolint: govet
 	out := *s
 
-	if s.Labels != nil {
-		out.Labels = make(map[string]string, len(s.Labels))
-		for k, v := range s.Labels {
-			out.Labels[k] = v
-		}
-	}
-
+	out.Labels = maps.Clone(s.Labels)
 	if s.ExportTo != nil {
 		out.ExportTo = s.ExportTo.Copy()
 	}
 
-	if s.LabelSelectors != nil {
-		out.LabelSelectors = make(map[string]string, len(s.LabelSelectors))
-		for k, v := range s.LabelSelectors {
-			out.LabelSelectors[k] = v
-		}
-	}
-
+	out.LabelSelectors = maps.Clone(s.LabelSelectors)
 	out.ClusterExternalAddresses = s.ClusterExternalAddresses.DeepCopy()
 
 	if s.ClusterExternalPorts != nil {
 		out.ClusterExternalPorts = make(map[cluster.ID]map[uint32]uint32, len(s.ClusterExternalPorts))
 		for k, m := range s.ClusterExternalPorts {
-			if m == nil {
-				out.ClusterExternalPorts[k] = nil
-				continue
-			}
-
-			out.ClusterExternalPorts[k] = make(map[uint32]uint32, len(m))
-			for sp, np := range m {
-				out.ClusterExternalPorts[k][sp] = np
-			}
+			out.ClusterExternalPorts[k] = maps.Clone(m)
 		}
 	}
 
 	out.Aliases = slices.Clone(s.Aliases)
+	out.PassthroughTargetPorts = maps.Clone(out.PassthroughTargetPorts)
 
 	// AddressMap contains a mutex, which is safe to return a copy in this case.
 	// nolint: govet
@@ -847,6 +940,7 @@ type ServiceDiscovery interface {
 }
 
 type AmbientIndexes interface {
+	ServicesWithWaypoint(key string) []ServiceWaypointInfo
 	AddressInformation(addresses sets.String) ([]AddressInfo, sets.String)
 	AdditionalPodSubscriptions(
 		proxy *Proxy,
@@ -859,23 +953,53 @@ type AmbientIndexes interface {
 }
 
 // WaypointKey is a multi-address extension of NetworkAddress which is commonly used for lookups in AmbientIndex
-// We likely need to consider alternative keying options internally such as hostname as we look to expand beyong istio-waypoint
+// We likely need to consider alternative keying options internally such as hostname as we look to expand beyond istio-waypoint
 // This extension can ideally support that type of lookup in the interface without introducing scope creep into things
 // like NetworkAddress
 type WaypointKey struct {
+	Namespace string
+	Hostnames []string
+
 	Network   string
 	Addresses []string
 }
 
-// WaypointKey contains all of the VIPs that the Proxy serves.
+// WaypointKeyForProxy builds a key from a proxy to lookup
 func WaypointKeyForProxy(node *Proxy) WaypointKey {
-	// TODO IP based lookup should switch to looking up services by name/ns
+	return waypointKeyForProxy(node, false)
+}
+
+func WaypointKeyForNetworkGatewayProxy(node *Proxy) WaypointKey {
+	return waypointKeyForProxy(node, true)
+}
+
+func waypointKeyForProxy(node *Proxy, externalAddresses bool) WaypointKey {
 	key := WaypointKey{
-		Network: node.Metadata.Network.String(),
+		Namespace: node.ConfigNamespace,
+		Network:   node.Metadata.Network.String(),
 	}
 	for _, svct := range node.ServiceTargets {
-		ips := svct.Service.ClusterVIPs.GetAddressesFor(node.GetClusterID())
-		key.Addresses = append(key.Addresses, ips...)
+		key.Hostnames = append(key.Hostnames, svct.Service.Hostname.String())
+
+		var ips []string
+		if externalAddresses {
+			ips = svct.Service.Attributes.ClusterExternalAddresses.GetAddressesFor(node.GetClusterID())
+		} else {
+			ips = svct.Service.ClusterVIPs.GetAddressesFor(node.GetClusterID())
+		}
+		// if we find autoAllocated addresses then ips should contain constants.UnspecifiedIP which should not be used
+		foundAutoAllocated := false
+		if svct.Service.AutoAllocatedIPv4Address != "" {
+			key.Addresses = append(key.Addresses, svct.Service.AutoAllocatedIPv4Address)
+			foundAutoAllocated = true
+		}
+		if svct.Service.AutoAllocatedIPv6Address != "" {
+			key.Addresses = append(key.Addresses, svct.Service.AutoAllocatedIPv6Address)
+			foundAutoAllocated = true
+		}
+		if !foundAutoAllocated {
+			key.Addresses = append(key.Addresses, ips...)
+		}
 	}
 	return key
 }
@@ -911,10 +1035,19 @@ func (u NoopAmbientIndexes) WorkloadsForWaypoint(WaypointKey) []WorkloadInfo {
 	return nil
 }
 
+func (u NoopAmbientIndexes) ServicesWithWaypoint(string) []ServiceWaypointInfo {
+	return nil
+}
+
 var _ AmbientIndexes = NoopAmbientIndexes{}
 
 type AddressInfo struct {
 	*workloadapi.Address
+	Marshaled *anypb.Any
+}
+
+func (i AddressInfo) Equals(other AddressInfo) bool {
+	return protoconv.Equals(i.Address, other.Address)
 }
 
 func (i AddressInfo) Aliases() []string {
@@ -949,32 +1082,142 @@ func (i AddressInfo) ResourceName() string {
 	return name
 }
 
+type ServiceWaypointInfo struct {
+	Service            *workloadapi.Service
+	IngressUseWaypoint bool
+	WaypointHostname   string
+}
+
+type TypedObject struct {
+	types.NamespacedName
+	Kind kind.Kind
+}
+
 type ServicePortName struct {
 	PortName       string
 	TargetPortName string
 }
 
 type ServiceInfo struct {
-	*workloadapi.Service
+	Service *workloadapi.Service
 	// LabelSelectors for the Service. Note these are only used internally, not sent over XDS
-	LabelSelector
+	LabelSelector LabelSelector
 	// PortNames provides a mapping of ServicePort -> port names. Note these are only used internally, not sent over XDS
 	PortNames map[int32]ServicePortName
 	// Source is the type that introduced this service.
-	Source kind.Kind
-	// Waypoint that clients should use when addressing traffic to this Service.
-	Waypoint string
+	Source   TypedObject
+	Waypoint WaypointBindingStatus
+	// MarshaledAddress contains the pre-marshaled representation.
+	// Note: this is an Address -- not a Service.
+	MarshaledAddress *anypb.Any
+	// AsAddress contains a pre-created AddressInfo representation. This ensures we do not need repeated conversions on
+	// the hotpath
+	AsAddress AddressInfo
+}
+
+func (i ServiceInfo) GetLabelSelector() map[string]string {
+	return i.LabelSelector.Labels
+}
+
+func (i ServiceInfo) GetStatusTarget() TypedObject {
+	return i.Source
+}
+
+type ConditionType string
+
+const (
+	WaypointBound    ConditionType = "istio.io/WaypointBound"
+	ZtunnelAccepted  ConditionType = "ZtunnelAccepted"
+	WaypointAccepted ConditionType = "WaypointAccepted"
+)
+
+type ConditionSet = map[ConditionType]*Condition
+
+type Condition struct {
+	ObservedGeneration int64
+	Reason             string
+	Message            string
+	Status             bool
+}
+
+func (c *Condition) Equals(v *Condition) bool {
+	return c.ObservedGeneration == v.ObservedGeneration &&
+		c.Reason == v.Reason &&
+		c.Message == v.Message &&
+		c.Status == v.Status
+}
+
+func (i ServiceInfo) GetConditions() ConditionSet {
+	set := ConditionSet{
+		// Write all conditions here, then override if we want them set.
+		// This ensures we can properly prune the condition if its no longer needed (such as if there is no waypoint attached at all).
+		WaypointBound: nil,
+	}
+
+	if i.Waypoint.ResourceName != "" {
+		buildMsg := strings.Builder{}
+		buildMsg.WriteString("Successfully attached to waypoint ")
+		buildMsg.WriteString(i.Waypoint.ResourceName)
+
+		if i.Waypoint.IngressUseWaypoint {
+			buildMsg.WriteString(". Ingress traffic will traverse the waypoint")
+		} else if i.Waypoint.IngressLabelPresent {
+			buildMsg.WriteString(". Ingress traffic is not using the waypoint, set the istio.io/ingress-use-waypoint label to true if desired.")
+		}
+
+		set[WaypointBound] = &Condition{
+			Status:  true,
+			Reason:  string(WaypointAccepted),
+			Message: buildMsg.String(),
+		}
+	} else if i.Waypoint.Error != nil {
+		set[WaypointBound] = &Condition{
+			Status:  false,
+			Reason:  i.Waypoint.Error.Reason,
+			Message: i.Waypoint.Error.Message,
+		}
+	}
+
+	return set
+}
+
+type WaypointBindingStatus struct {
+	// ResourceName that clients should use when addressing traffic to this Service.
+	ResourceName string
+	// IngressUseWaypoint specifies whether ingress gateways should use the waypoint for this service.
+	IngressUseWaypoint bool
+	// IngressLabelPresent specifies whether the istio.io/ingress-use-waypoint label is set on the service.
+	IngressLabelPresent bool
+	// Error represents some error
+	Error *StatusMessage
+}
+
+type StatusMessage struct {
+	Reason  string
+	Message string
+}
+
+func (i WaypointBindingStatus) Equals(other WaypointBindingStatus) bool {
+	return i.ResourceName == other.ResourceName &&
+		i.IngressUseWaypoint == other.IngressUseWaypoint &&
+		i.IngressLabelPresent == other.IngressLabelPresent &&
+		ptr.Equal(i.Error, other.Error)
 }
 
 func (i ServiceInfo) NamespacedName() types.NamespacedName {
-	return types.NamespacedName{Name: i.Name, Namespace: i.Namespace}
+	return types.NamespacedName{Name: i.Service.Name, Namespace: i.Service.Namespace}
+}
+
+func (i ServiceInfo) GetNamespace() string {
+	return i.Service.Namespace
 }
 
 func (i ServiceInfo) Equals(other ServiceInfo) bool {
-	return proto.Equal(i.Service, other.Service) &&
+	return equalUsingPremarshaled(i.Service, i.MarshaledAddress, other.Service, other.MarshaledAddress) &&
 		maps.Equal(i.LabelSelector.Labels, other.LabelSelector.Labels) &&
 		maps.Equal(i.PortNames, other.PortNames) &&
-		i.Source == other.Source
+		i.Source == other.Source &&
+		i.Waypoint.Equals(other.Waypoint)
 }
 
 func (i ServiceInfo) ResourceName() string {
@@ -985,20 +1228,24 @@ func serviceResourceName(s *workloadapi.Service) string {
 	return s.Namespace + "/" + s.Hostname
 }
 
-type WorkloadSource string
-
 type WorkloadInfo struct {
-	*workloadapi.Workload
+	Workload *workloadapi.Workload
 	// Labels for the workload. Note these are only used internally, not sent over XDS
 	Labels map[string]string
 	// Source is the type that introduced this workload.
 	Source kind.Kind
 	// CreationTime is the time when the workload was created. Note this is used internally only.
 	CreationTime time.Time
+	// MarshaledAddress contains the pre-marshaled representation.
+	// Note: this is an Address -- not a Workload.
+	MarshaledAddress *anypb.Any
+	// AsAddress contains a pre-created AddressInfo representation. This ensures we do not need repeated conversions on
+	// the hotpath
+	AsAddress AddressInfo
 }
 
 func (i WorkloadInfo) Equals(other WorkloadInfo) bool {
-	return proto.Equal(i.Workload, other.Workload) &&
+	return equalUsingPremarshaled(i.Workload, i.MarshaledAddress, other.Workload, other.MarshaledAddress) &&
 		maps.Equal(i.Labels, other.Labels) &&
 		i.Source == other.Source &&
 		i.CreationTime == other.CreationTime
@@ -1010,7 +1257,7 @@ func workloadResourceName(w *workloadapi.Workload) string {
 
 func (i *WorkloadInfo) Clone() *WorkloadInfo {
 	return &WorkloadInfo{
-		Workload:     proto.Clone(i).(*workloadapi.Workload),
+		Workload:     protomarshal.Clone(i.Workload),
 		Labels:       maps.Clone(i.Labels),
 		Source:       i.Source,
 		CreationTime: i.CreationTime,
@@ -1021,15 +1268,155 @@ func (i WorkloadInfo) ResourceName() string {
 	return workloadResourceName(i.Workload)
 }
 
+type WaypointPolicyStatus struct {
+	Source     TypedObject
+	Conditions []PolicyBindingStatus
+}
+
+const (
+	WaypointPolicyReasonAccepted         = "Accepted"
+	WaypointPolicyReasonInvalid          = "Invalid"
+	WaypointPolicyReasonPartiallyInvalid = "PartiallyInvalid"
+	WaypointPolicyReasonAncestorNotBound = "AncestorNotBound"
+	WaypointPolicyReasonTargetNotFound   = "TargetNotFound"
+)
+
+// impl pilot/pkg/serviceregistry/kube/controller/ambient/statusqueue/StatusWriter
+func (i WaypointPolicyStatus) GetStatusTarget() TypedObject {
+	return i.Source
+}
+
+func (i WaypointPolicyStatus) GetConditions() ConditionSet {
+	set := make(ConditionSet, 1)
+
+	set[WaypointAccepted] = flattenConditions(i.Conditions)
+
+	return set
+}
+
+// end impl StatusWriter
+
+// flattenConditions is a work around for the uncertain future of Ancestor in gtwapi which exists at the moment.
+// It is intended to take many conditions which have ancestors and condense them into a single condition so we can
+// retain detail in the codebase to be prepared when a canonical representation is accepted upstream.
+func flattenConditions(conditions []PolicyBindingStatus) *Condition {
+	status := false
+	reason := WaypointPolicyReasonInvalid
+	unboundAncestors := []string{}
+	var message string
+
+	// flatten causes a loss of some information and there is only 1 condition so no need to flatten
+	if len(conditions) == 1 {
+		c := conditions[0]
+		return &Condition{
+			ObservedGeneration: c.ObservedGeneration,
+			Reason:             c.Status.Reason,
+			Message:            c.Status.Message,
+			Status:             c.Bound,
+		}
+	}
+
+	var highestObservedGeneration int64
+	for _, c := range conditions {
+		if c.Bound {
+			// if anything was true we consider the overall bind to be true
+			status = true
+		} else {
+			unboundAncestors = append(unboundAncestors, c.Ancestor)
+		}
+
+		if c.ObservedGeneration > highestObservedGeneration {
+			highestObservedGeneration = c.ObservedGeneration
+		}
+	}
+
+	someUnbound := len(unboundAncestors) > 0
+
+	if status {
+		reason = WaypointPolicyReasonAccepted
+	}
+
+	if status && someUnbound {
+		reason = WaypointPolicyReasonPartiallyInvalid
+	}
+
+	if someUnbound {
+		message = fmt.Sprintf("Invalid targetRefs: %s", strings.Join(unboundAncestors, ", "))
+	}
+
+	return &Condition{
+		highestObservedGeneration,
+		reason,
+		message,
+		status,
+	}
+}
+
+// impl pkg/kube/krt/ResourceNamer
+func (i WaypointPolicyStatus) ResourceName() string {
+	return i.Source.Namespace + "/" + i.Source.Name
+}
+
+// end impl ResourceNamer
+
+type PolicyBindingStatus struct {
+	ObservedGeneration int64
+	Ancestor           string
+	Status             *StatusMessage
+	Bound              bool
+}
+
+func (i PolicyBindingStatus) Equals(other PolicyBindingStatus) bool {
+	return ptr.Equal(i.Status, other.Status) &&
+		i.Bound == other.Bound &&
+		i.Ancestor == other.Ancestor &&
+		i.ObservedGeneration == other.ObservedGeneration
+}
+
 type WorkloadAuthorization struct {
 	// LabelSelectors for the workload. Note these are only used internally, not sent over XDS
 	LabelSelector
 	Authorization *security.Authorization
+
+	Source  TypedObject
+	Binding PolicyBindingStatus
 }
 
+// impl pilot/pkg/serviceregistry/kube/controller/ambient/statusqueue/StatusWriter
+func (i WorkloadAuthorization) GetStatusTarget() TypedObject {
+	return i.Source
+}
+
+func (i WorkloadAuthorization) GetConditions() ConditionSet {
+	set := make(ConditionSet, 1)
+
+	if i.Binding.Status != nil {
+		set[ZtunnelAccepted] = &Condition{
+			ObservedGeneration: i.Binding.ObservedGeneration,
+			Reason:             i.Binding.Status.Reason,
+			Message:            i.Binding.Status.Message,
+			Status:             i.Binding.Bound,
+		}
+	} else {
+		message := "attached to ztunnel"
+		set[ZtunnelAccepted] = &Condition{
+			ObservedGeneration: i.Binding.ObservedGeneration,
+			Reason:             "Accepted",
+			Message:            message,
+			Status:             i.Binding.Bound,
+		}
+	}
+
+	return set
+}
+
+// end impl StatusWriter
+
 func (i WorkloadAuthorization) Equals(other WorkloadAuthorization) bool {
-	return maps.Equal(i.LabelSelector.Labels, other.LabelSelector.Labels) &&
-		proto.Equal(i.Authorization, other.Authorization)
+	return protoconv.Equals(i.Authorization, other.Authorization) &&
+		maps.Equal(i.Labels, other.Labels) &&
+		i.Source == other.Source &&
+		i.Binding.Equals(other.Binding)
 }
 
 func (i WorkloadAuthorization) ResourceName() string {
@@ -1062,11 +1449,24 @@ func ExtractWorkloadsFromAddresses(addrs []AddressInfo) []WorkloadInfo {
 func SortWorkloadsByCreationTime(workloads []WorkloadInfo) []WorkloadInfo {
 	sort.SliceStable(workloads, func(i, j int) bool {
 		if workloads[i].CreationTime.Equal(workloads[j].CreationTime) {
-			return workloads[i].Uid < workloads[j].Uid
+			return workloads[i].Workload.Uid < workloads[j].Workload.Uid
 		}
 		return workloads[i].CreationTime.Before(workloads[j].CreationTime)
 	})
 	return workloads
+}
+
+type NamespaceInfo struct {
+	Name               string
+	IngressUseWaypoint bool
+}
+
+func (i NamespaceInfo) ResourceName() string {
+	return i.Name
+}
+
+func (i NamespaceInfo) Equals(other NamespaceInfo) bool {
+	return i == other
 }
 
 // MCSServiceInfo combines the name of a service with a particular Kubernetes cluster. This
@@ -1224,28 +1624,18 @@ func ParseSubsetKey(s string) (direction TrafficDirection, subsetName string, ho
 	return
 }
 
-// GetAddresses returns a Service's addresses.
-// This method returns all the VIPs of a service if the ClusterID is explicitly set to "", otherwise only return the VIP
-// specific to the cluster where the node resides
-func (s *Service) GetAddresses(node *Proxy) []string {
-	if node.Metadata != nil && node.Metadata.ClusterID == "" {
-		return s.getAllAddresses()
-	}
-
-	return []string{s.GetAddressForProxy(node)}
-}
-
 // GetAddressForProxy returns a Service's address specific to the cluster where the node resides
 func (s *Service) GetAddressForProxy(node *Proxy) string {
 	if node.Metadata != nil {
 		if node.Metadata.ClusterID != "" {
 			addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
+			addresses = filterAddresses(addresses, node.SupportsIPv4(), node.SupportsIPv6())
 			if len(addresses) > 0 {
 				return addresses[0]
 			}
 		}
 
-		if node.Metadata.DNSCapture && node.Metadata.DNSAutoAllocate && s.DefaultAddress == constants.UnspecifiedIP {
+		if nodeUsesAutoallocatedIPs(node) && s.DefaultAddress == constants.UnspecifiedIP {
 			if node.SupportsIPv4() && s.AutoAllocatedIPv4Address != "" {
 				return s.AutoAllocatedIPv4Address
 			}
@@ -1255,47 +1645,156 @@ func (s *Service) GetAddressForProxy(node *Proxy) string {
 		}
 	}
 
+	// fallback to the default address
+	// TODO: this maybe not right, as the default address may not be the right ip family. We need to come up with a good solution.
 	return s.DefaultAddress
 }
 
 // GetExtraAddressesForProxy returns a k8s service's extra addresses to the cluster where the node resides.
 // Especially for dual stack k8s service to get other IP family addresses.
 func (s *Service) GetExtraAddressesForProxy(node *Proxy) []string {
-	if features.EnableDualStack && node.Metadata != nil {
-		if node.Metadata.ClusterID != "" {
-			addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
-			if len(addresses) > 1 {
-				return addresses[1:]
-			}
-		}
+	addresses := s.getAllAddressesForProxy(node)
+	if len(addresses) > 1 {
+		return addresses[1:]
 	}
 	return nil
 }
 
-// GetAllAddressesForProxy returns a k8s service's extra addresses to the cluster where the node resides.
-// Especially for dual stack k8s service to get other IP family addresses.
-func (s *Service) GetAllAddressesForProxy(node *Proxy) []string {
-	if (features.EnableDualStack || features.EnableAmbient) && node.Metadata != nil && node.Metadata.ClusterID != "" {
-		addresses := s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
-		if len(addresses) > 0 {
-			return addresses
+// HasAddressOrAssigned returns whether the service has an IP address.
+// This includes auto-allocated IP addresses. Note that not all proxies support auto-allocated IP addresses;
+// typically GetAllAddressesForProxy should be used which automatically filters addresses to account for that.
+func (s *Service) HasAddressOrAssigned(id cluster.ID) bool {
+	if id != "" {
+		if len(s.ClusterVIPs.GetAddressesFor(id)) > 0 {
+			return true
 		}
 	}
-	if a := s.GetAddressForProxy(node); a != "" {
+	if s.DefaultAddress != constants.UnspecifiedIP {
+		return true
+	}
+	if s.AutoAllocatedIPv4Address != "" {
+		return true
+	}
+	if s.AutoAllocatedIPv6Address != "" {
+		return true
+	}
+	return false
+}
+
+// GetAllAddressesForProxy returns a k8s service's all addresses to the cluster where the node resides.
+// Especially for dual stack k8s service to get other IP family addresses.
+func (s *Service) GetAllAddressesForProxy(node *Proxy) []string {
+	return s.getAllAddressesForProxy(node)
+}
+
+// nodeUsesAutoallocatedIPs checks to see if this node is eligible to consume automatically allocated IPs
+func nodeUsesAutoallocatedIPs(node *Proxy) bool {
+	if node == nil {
+		return false
+	}
+	var DNSAutoAllocate, DNSCapture bool
+	if node.Metadata != nil {
+		DNSAutoAllocate = bool(node.Metadata.DNSAutoAllocate)
+		DNSCapture = bool(node.Metadata.DNSCapture)
+	}
+	// check whether either version of auto-allocation is enabled
+	autoallocationEnabled := DNSAutoAllocate || features.EnableIPAutoallocate
+
+	// check if this proxy is a type that always consumes or has consumption explicitly enabled
+	nodeConsumesAutoIP := DNSCapture || node.Type == Waypoint
+
+	return autoallocationEnabled && nodeConsumesAutoIP
+}
+
+func (s *Service) getAllAddressesForProxy(node *Proxy) []string {
+	addresses := []string{}
+	if node.Metadata != nil && node.Metadata.ClusterID != "" {
+		addresses = s.ClusterVIPs.GetAddressesFor(node.Metadata.ClusterID)
+	}
+	if len(addresses) == 0 && nodeUsesAutoallocatedIPs(node) {
+		// The criteria to use AutoAllocated addresses is met so we should go ahead and use them if they are populated
+		if s.AutoAllocatedIPv4Address != "" {
+			addresses = append(addresses, s.AutoAllocatedIPv4Address)
+		}
+		if s.AutoAllocatedIPv6Address != "" {
+			addresses = append(addresses, s.AutoAllocatedIPv6Address)
+		}
+	}
+	if (!features.EnableDualStack && !features.EnableAmbient) || node.GetIPMode() != Dual {
+		addresses = filterAddresses(addresses, node.SupportsIPv4(), node.SupportsIPv6())
+	}
+	if len(addresses) > 0 {
+		return addresses
+	}
+
+	// fallback to the default address
+	if a := s.DefaultAddress; len(a) > 0 {
 		return []string{a}
 	}
 	return nil
 }
 
-// getAllAddresses returns a Service's all addresses.
-func (s *Service) getAllAddresses() []string {
-	var addresses []string
-	addressMap := s.ClusterVIPs.GetAddresses()
-	for _, clusterAddresses := range addressMap {
-		addresses = append(addresses, clusterAddresses...)
+func filterAddresses(addresses []string, supportsV4, supportsV6 bool) []string {
+	if len(addresses) == 0 {
+		return nil
 	}
 
-	return addresses
+	var ipv4Addresses []string
+	var ipv6Addresses []string
+	for _, addr := range addresses {
+		// check if an address is a CIDR range
+		if strings.Contains(addr, "/") {
+			if prefix, err := netip.ParsePrefix(addr); err != nil {
+				log.Warnf("failed to parse prefix address '%s': %s", addr, err)
+				continue
+			} else if supportsV4 && prefix.Addr().Is4() {
+				ipv4Addresses = append(ipv4Addresses, addr)
+			} else if supportsV6 && prefix.Addr().Is6() {
+				ipv6Addresses = append(ipv6Addresses, addr)
+			}
+		} else {
+			if ipAddr, err := netip.ParseAddr(addr); err != nil {
+				log.Warnf("failed to parse address '%s': %s", addr, err)
+				continue
+			} else if supportsV4 && ipAddr.Is4() {
+				ipv4Addresses = append(ipv4Addresses, addr)
+			} else if supportsV6 && ipAddr.Is6() {
+				ipv6Addresses = append(ipv6Addresses, addr)
+			}
+		}
+	}
+
+	if supportsV4 && supportsV6 {
+		firstAddrFamily := ""
+		if strings.Contains(addresses[0], "/") {
+			if prefix, err := netip.ParsePrefix(addresses[0]); err == nil {
+				if prefix.Addr().Is4() {
+					firstAddrFamily = "v4"
+				} else if prefix.Addr().Is6() {
+					firstAddrFamily = "v6"
+				}
+			}
+		} else {
+			if ipAddr, err := netip.ParseAddr(addresses[0]); err == nil {
+				if ipAddr.Is4() {
+					firstAddrFamily = "v4"
+				} else if ipAddr.Is6() {
+					firstAddrFamily = "v6"
+				}
+			}
+		}
+
+		if firstAddrFamily == "v4" {
+			return ipv4Addresses
+		} else if firstAddrFamily == "v6" {
+			return ipv6Addresses
+		}
+	}
+
+	if len(ipv4Addresses) > 0 {
+		return ipv4Addresses
+	}
+	return ipv6Addresses
 }
 
 // GetTLSModeFromEndpointLabels returns the value of the label
@@ -1331,10 +1830,7 @@ func (s *Service) DeepCopy() *Service {
 		}
 	}
 
-	if s.ServiceAccounts != nil {
-		out.ServiceAccounts = make([]string, len(s.ServiceAccounts))
-		copy(out.ServiceAccounts, s.ServiceAccounts)
-	}
+	out.ServiceAccounts = slices.Clone(s.ServiceAccounts)
 	out.ClusterVIPs = *s.ClusterVIPs.DeepCopy()
 	return &out
 }
@@ -1375,7 +1871,15 @@ func (s *Service) Equals(other *Service) bool {
 
 // DeepCopy creates a clone of IstioEndpoint.
 func (ep *IstioEndpoint) DeepCopy() *IstioEndpoint {
-	return copyInternal(ep).(*IstioEndpoint)
+	if ep == nil {
+		return nil
+	}
+
+	out := *ep
+	out.Labels = maps.Clone(ep.Labels)
+	out.Addresses = slices.Clone(ep.Addresses)
+
+	return &out
 }
 
 // ShallowCopy creates a shallow clone of IstioEndpoint.
@@ -1395,8 +1899,7 @@ func (ep *IstioEndpoint) Equals(other *IstioEndpoint) bool {
 	}
 
 	// Check things we can directly compare...
-	eq := ep.Address == other.Address &&
-		ep.ServicePortName == other.ServicePortName &&
+	eq := ep.ServicePortName == other.ServicePortName &&
 		ep.LegacyClusterPortKey == other.LegacyClusterPortKey &&
 		ep.ServiceAccount == other.ServiceAccount &&
 		ep.Network == other.Network &&
@@ -1409,12 +1912,16 @@ func (ep *IstioEndpoint) Equals(other *IstioEndpoint) bool {
 		ep.HostName == other.HostName &&
 		ep.SubDomain == other.SubDomain &&
 		ep.HealthStatus == other.HealthStatus &&
+		ep.SendUnhealthyEndpoints == other.SendUnhealthyEndpoints &&
 		ep.NodeName == other.NodeName
 	if !eq {
 		return false
 	}
 
 	// check everything else
+	if !slices.EqualUnordered(ep.Addresses, other.Addresses) {
+		return false
+	}
 	if !maps.Equal(ep.Labels, other.Labels) {
 		return false
 	}
@@ -1435,14 +1942,12 @@ func (ep *IstioEndpoint) Equals(other *IstioEndpoint) bool {
 	return true
 }
 
-func copyInternal(v any) any {
-	copied, err := copystructure.Copy(v)
-	if err != nil {
-		// There are 2 locations where errors are generated in copystructure.Copy:
-		//  * The reflection walk over the structure fails, which should never happen
-		//  * A configurable copy function returns an error. This is only used for copying times, which never returns an error.
-		// Therefore, this should never happen
-		panic(err)
+func equalUsingPremarshaled[T proto.Message](a T, am *anypb.Any, b T, bm *anypb.Any) bool {
+	// If they are both pre-marshaled, use the marshaled representation. This is orders of magnitude faster
+	if am != nil && bm != nil {
+		return bytes.Equal(am.Value, bm.Value)
 	}
-	return copied
+
+	// Fallback to equals
+	return protoconv.Equals(a, b)
 }

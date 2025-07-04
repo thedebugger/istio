@@ -16,6 +16,8 @@ package revisions
 
 import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"istio.io/api/label"
@@ -33,6 +35,7 @@ type TagWatcher interface {
 	HasSynced() bool
 	AddHandler(handler TagHandler)
 	GetMyTags() sets.String
+	IsMine(metav1.ObjectMeta) bool
 }
 
 // TagHandler is a callback for when the tags revision change.
@@ -42,9 +45,10 @@ type tagWatcher struct {
 	revision string
 	handlers []TagHandler
 
-	queue    controllers.Queue
-	webhooks kclient.Client[*admissionregistrationv1.MutatingWebhookConfiguration]
-	index    kclient.Index[string, *admissionregistrationv1.MutatingWebhookConfiguration]
+	namespaces kclient.Client[*corev1.Namespace]
+	queue      controllers.Queue
+	webhooks   kclient.Client[*admissionregistrationv1.MutatingWebhookConfiguration]
+	index      kclient.Index[string, *admissionregistrationv1.MutatingWebhookConfiguration]
 }
 
 func NewTagWatcher(client kube.Client, revision string) TagWatcher {
@@ -59,19 +63,21 @@ func NewTagWatcher(client kube.Client, revision string) TagWatcher {
 		ObjectFilter: kubetypes.NewStaticObjectFilter(isTagWebhook),
 	})
 	p.webhooks.AddEventHandler(controllers.ObjectHandler(p.queue.AddObject))
-	p.index = kclient.CreateStringIndex(p.webhooks,
+	p.index = kclient.CreateStringIndex(p.webhooks, "istioRev",
 		func(o *admissionregistrationv1.MutatingWebhookConfiguration) []string {
 			rev := o.GetLabels()[label.IoIstioRev.Name]
-			if rev == "" {
+			if rev == "" || !isTagWebhook(o) {
 				return nil
 			}
 			return []string{rev}
 		})
+	p.namespaces = kclient.New[*corev1.Namespace](client)
 	return p
 }
 
 func (p *tagWatcher) Run(stopCh <-chan struct{}) {
 	if !kube.WaitForCacheSync("tag watcher", stopCh, p.webhooks.HasSynced) {
+		p.queue.ShutDownEarly()
 		return
 	}
 	// Notify handlers of initial state
@@ -88,10 +94,23 @@ func (p *tagWatcher) HasSynced() bool {
 	return p.queue.HasSynced()
 }
 
+func (p *tagWatcher) IsMine(obj metav1.ObjectMeta) bool {
+	selectedTag, ok := obj.Labels[label.IoIstioRev.Name]
+	if !ok {
+		ns := p.namespaces.Get(obj.Namespace, "")
+		if ns == nil {
+			return true
+		}
+		selectedTag = ns.Labels[label.IoIstioRev.Name]
+	}
+	myTags := p.GetMyTags()
+	return myTags.Contains(selectedTag) || (selectedTag == "" && myTags.Contains("default"))
+}
+
 func (p *tagWatcher) GetMyTags() sets.String {
 	res := sets.New(p.revision)
 	for _, wh := range p.index.Lookup(p.revision) {
-		res.Insert(wh.GetLabels()[IstioTagLabel])
+		res.Insert(wh.GetLabels()[label.IoIstioTag.Name])
 	}
 	return res
 }
@@ -109,8 +128,6 @@ func isTagWebhook(uobj any) bool {
 	if obj == nil {
 		return false
 	}
-	_, ok := obj.GetLabels()[IstioTagLabel]
+	_, ok := obj.GetLabels()[label.IoIstioTag.Name]
 	return ok
 }
-
-const IstioTagLabel = "istio.io/tag"

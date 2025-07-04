@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"google.golang.org/grpc/metadata"
 	"k8s.io/client-go/kubernetes"
@@ -36,7 +35,10 @@ const (
 	clusterIDMeta = "clusterid"
 )
 
-type RemoteKubeClientGetter func(clusterID cluster.ID) kubernetes.Interface
+type RemoteKubeClientGetter interface {
+	GetRemoteKubeClient(clusterID cluster.ID) kubernetes.Interface
+	ListClusters() []cluster.ID
+}
 
 // KubeJWTAuthenticator authenticates K8s JWTs.
 type KubeJWTAuthenticator struct {
@@ -47,6 +49,8 @@ type KubeJWTAuthenticator struct {
 	kubeClient kubernetes.Interface
 	// Primary cluster ID
 	clusterID cluster.ID
+	// Primary cluster alisases
+	clusterAliases map[cluster.ID]cluster.ID
 
 	// remote cluster kubeClient getter
 	remoteKubeClientGetter RemoteKubeClientGetter
@@ -59,25 +63,26 @@ func NewKubeJWTAuthenticator(
 	meshHolder mesh.Holder,
 	client kubernetes.Interface,
 	clusterID cluster.ID,
+	clusterAliases map[string]string,
 	remoteKubeClientGetter RemoteKubeClientGetter,
 ) *KubeJWTAuthenticator {
-	return &KubeJWTAuthenticator{
+	out := &KubeJWTAuthenticator{
 		meshHolder:             meshHolder,
 		kubeClient:             client,
 		clusterID:              clusterID,
 		remoteKubeClientGetter: remoteKubeClientGetter,
 	}
+
+	out.clusterAliases = make(map[cluster.ID]cluster.ID)
+	for alias := range clusterAliases {
+		out.clusterAliases[cluster.ID(alias)] = cluster.ID(clusterAliases[alias])
+	}
+
+	return out
 }
 
 func (a *KubeJWTAuthenticator) AuthenticatorType() string {
 	return KubeJWTAuthenticatorType
-}
-
-func isAllowedKubernetesAudience(a string) bool {
-	// We do not use url.Parse() as it *requires* the protocol.
-	a = strings.TrimPrefix(a, "https://")
-	a = strings.TrimPrefix(a, "http://")
-	return strings.HasPrefix(a, "kubernetes.default.svc")
 }
 
 // Authenticate authenticates the call using the K8s JWT from the context.
@@ -114,7 +119,8 @@ func (a *KubeJWTAuthenticator) authenticateGrpc(ctx context.Context) (*security.
 func (a *KubeJWTAuthenticator) authenticate(targetJWT string, clusterID cluster.ID) (*security.Caller, error) {
 	kubeClient := a.getKubeClient(clusterID)
 	if kubeClient == nil {
-		return nil, fmt.Errorf("could not get cluster %s's kube client", clusterID)
+		return nil, fmt.Errorf("client claims to be in cluster %q, but we only know about local cluster %q and remote clusters %v",
+			clusterID, a.clusterID, a.remoteKubeClientGetter.ListClusters())
 	}
 
 	id, err := tokenreview.ValidateK8sJwt(kubeClient, targetJWT, security.TokenAudiences)
@@ -135,15 +141,18 @@ func (a *KubeJWTAuthenticator) authenticate(targetJWT string, clusterID cluster.
 }
 
 func (a *KubeJWTAuthenticator) getKubeClient(clusterID cluster.ID) kubernetes.Interface {
-	// first match local/primary cluster
+	// first match local/primary cluster or it's aliases
 	// or if clusterID is not sent (we assume that its a single cluster)
-	if a.clusterID == clusterID || clusterID == "" {
+	if a.clusterID == clusterID || a.clusterID == a.clusterAliases[clusterID] || clusterID == "" {
 		return a.kubeClient
 	}
 
 	// secondly try other remote clusters
 	if a.remoteKubeClientGetter != nil {
-		if res := a.remoteKubeClientGetter(clusterID); res != nil {
+		if res := a.remoteKubeClientGetter.GetRemoteKubeClient(clusterID); res != nil {
+			return res
+		}
+		if res := a.remoteKubeClientGetter.GetRemoteKubeClient(a.clusterAliases[clusterID]); res != nil {
 			return res
 		}
 	}

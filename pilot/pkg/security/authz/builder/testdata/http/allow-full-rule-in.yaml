@@ -1,4 +1,4 @@
-apiVersion: security.istio.io/v1beta1
+apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
   name: httpbin-1
@@ -9,6 +9,10 @@ spec:
       app: httpbin
       version: v1
   rules:
+    - from:
+        - source:
+            serviceAccounts: [ "my-ns/my-sa", "sa-only" ]
+            notServiceAccounts: [ "my-ns/my-sa-not", "sa-not-only" ]
     - from:
         - source:
             principals: ["principal", "principal-prefix-*", "*-suffix-principal", "*"]

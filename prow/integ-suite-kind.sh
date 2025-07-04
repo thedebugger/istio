@@ -37,12 +37,19 @@ setup_and_export_git_sha
 source "${ROOT}/common/scripts/kind_provisioner.sh"
 
 TOPOLOGY=SINGLE_CLUSTER
-NODE_IMAGE="gcr.io/istio-testing/kind-node:v1.30.0"
+NODE_IMAGE="gcr.io/istio-testing/kind-node:v1.32.0"
 KIND_CONFIG=""
 CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/prow/config/topology/multicluster.json"
+CLUSTER_NAME="${CLUSTER_NAME:-istio-testing}"
 
 export FAST_VM_BUILDS=true
 export ISTIO_DOCKER_BUILDER="${ISTIO_DOCKER_BUILDER:-crane}"
+# DEVCONTAINER controls a set of features that allow this script to be run from
+# within a dev container using ghcr.io/devcontainers/features/docker-outside-of-docker
+export DEVCONTAINER="${DEVCONTAINER:-}"
+if [[ "${DEVCONTAINER}" ]]; then
+  export ISTIO_DOCKER_BUILDER=docker
+fi
 
 PARAMS=()
 
@@ -78,7 +85,7 @@ while (( "$#" )); do
     --topology)
       case $2 in
         # TODO(landow) get rid of MULTICLUSTER_SINGLE_NETWORK after updating Prow job
-        SINGLE_CLUSTER | MULTICLUSTER_SINGLE_NETWORK | MULTICLUSTER )
+        SINGLE_CLUSTER | MULTICLUSTER_SINGLE_NETWORK | MULTICLUSTER | AMBIENT_MULTICLUSTER )
           TOPOLOGY=$2
           echo "Running with topology ${TOPOLOGY}"
           ;;
@@ -110,7 +117,14 @@ if [ -f /proc/cpuinfo ]; then
 fi
 
 # Default IP family of the cluster is IPv4
-export IP_FAMILY="${IP_FAMILY:-ipv4}"
+KIND_IP_FAMILY="ipv4"
+export IP_FAMILIES="${IP_FAMILIES:-IPv4}"
+if [[ "$IP_FAMILIES" == "IPv6" ]]; then
+   KIND_IP_FAMILY="ipv6"
+elif [[ "$IP_FAMILIES" =~ "IPv6" ]] && [[ "$IP_FAMILIES" =~ "IPv4" ]]; then
+   KIND_IP_FAMILY="dual"
+fi
+export KIND_IP_FAMILY
 
 # LoadBalancer in Kind is supported using metallb
 export TEST_ENV=kind-metallb
@@ -123,6 +137,7 @@ export PULL_POLICY=IfNotPresent
 export KIND_REGISTRY_NAME="kind-registry"
 export KIND_REGISTRY_PORT="5000"
 export KIND_REGISTRY="localhost:${KIND_REGISTRY_PORT}"
+export KIND_REGISTRY_DIR="/etc/containerd/certs.d/localhost:${KIND_REGISTRY_PORT}"
 
 export HUB=${HUB:-"istio-testing"}
 export TAG="${TAG:-"istio-testing"}"
@@ -146,10 +161,10 @@ if [[ -z "${SKIP_SETUP:-}" ]]; then
   export METRICS_SERVER_CONFIG_DIR='./prow/config/metrics'
 
   if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
-    trace "setup kind cluster" setup_kind_cluster_retry "istio-testing" "${NODE_IMAGE}" "${KIND_CONFIG}"
+    trace "setup kind cluster" setup_kind_cluster_retry "${CLUSTER_NAME}" "${NODE_IMAGE}" "${KIND_CONFIG}"
   else
     trace "load cluster topology" load_cluster_topology "${CLUSTER_TOPOLOGY_CONFIG_FILE}"
-    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${IP_FAMILY}"
+    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${KIND_IP_FAMILY}"
 
     TOPOLOGY_JSON=$(cat "${CLUSTER_TOPOLOGY_CONFIG_FILE}")
     for i in $(seq 0 $((${#CLUSTER_NAMES[@]} - 1))); do
@@ -173,12 +188,13 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
   trace "build images" build_images "${PARAMS[*]}"
 
   # upload WASM plugins to kind-registry
-  crane copy gcr.io/istio-testing/wasm/attributegen:359dcd3a19f109c50e97517fe6b1e2676e870c4d localhost:5000/istio-testing/wasm/attributegen:0.0.1
-  crane copy gcr.io/istio-testing/wasm/header-injector:0.0.1 localhost:5000/istio-testing/wasm/header-injector:0.0.1
-  crane copy gcr.io/istio-testing/wasm/header-injector:0.0.2 localhost:5000/istio-testing/wasm/header-injector:0.0.2
+  registry_url=$(if [ -z "$DEVCONTAINER" ]; then echo "localhost"; else echo $KIND_REGISTRY_NAME; fi):$KIND_REGISTRY_PORT
+  crane copy gcr.io/istio-testing/wasm/attributegen:359dcd3a19f109c50e97517fe6b1e2676e870c4d "$registry_url/istio-testing/wasm/attributegen:0.0.1" --insecure
+  crane copy gcr.io/istio-testing/wasm/header-injector:0.0.1 "$registry_url/istio-testing/wasm/header-injector:0.0.1" --insecure
+  crane copy gcr.io/istio-testing/wasm/header-injector:0.0.2 "$registry_url/istio-testing/wasm/header-injector:0.0.2" --insecure
 
   # Make "kind-registry" resolvable in IPv6 cluster
-  if [[ "$IP_FAMILY" == "ipv6" ]]; then
+  if [[ "$KIND_IP_FAMILY" == "ipv6" ]]; then
     kind_registry_ip=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "kind"}}{{.GlobalIPv6Address}}{{end}}{{end}}' kind-registry)
     coredns_config=$(kubectl get -oyaml -n=kube-system configmap/coredns)
     echo "Current CoreDNS config:"

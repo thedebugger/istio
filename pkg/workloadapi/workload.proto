@@ -15,6 +15,10 @@
 syntax = "proto3";
 
 package istio.workload;
+
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/any.proto";
+
 option go_package="pkg/workloadapi";
 
 // Address represents a unique address.
@@ -82,6 +86,9 @@ message Service {
 
   // IP families provides configuration about the IP families this service supports.
   IPFamilies ip_families = 9;
+
+  // Extension provides a mechanism to attach arbitrary additional configuration to an object.
+  repeated Extension extensions = 10;
 }
 
 enum IPFamilies {
@@ -93,6 +100,15 @@ enum IPFamilies {
   IPV6_ONLY = 2;
   // Both IPv4 and IPv6 is supported
   DUAL = 3;
+}
+
+// NetworkMode indicates how the addresses of the workload should be treated.
+enum NetworkMode {
+  // STANDARD means that the workload is uniquely identified by its address (within its network).
+  STANDARD = 0;
+  // HOST_NETWORK means the workload has an IP address that is shared by many workloads. The data plane should avoid
+  // attempting to lookup these workloads by IP address (which could return the wrong result).
+  HOST_NETWORK = 1;
 }
 
 message LoadBalancing {
@@ -128,12 +144,20 @@ message LoadBalancing {
     // 4. Any endpoints
     FAILOVER = 2;
   }
+  enum HealthPolicy {
+    // Only select healthy endpoints
+    ONLY_HEALTHY = 0;
+    // Include all endpoints, even if they are unhealthy.
+    ALLOW_ALL = 1;
+  }
 
   // routing_preference defines what scopes we want to keep traffic within.
   // The `mode` determines how these routing preferences are handled
   repeated Scope routing_preference = 1;
   // mode defines how we should handle the routing preferences.
   Mode mode = 2;
+  // health_policy defines how we should filter endpoints
+  HealthPolicy health_policy = 3;
 }
 
 // Workload represents a workload - an endpoint (or collection behind a hostname).
@@ -239,6 +263,16 @@ message Workload {
   // The Locality defines information about where a workload is geographically deployed
   Locality locality = 24;
 
+  NetworkMode network_mode = 25;
+
+  // Extension provides a mechanism to attach arbitrary additional configuration to an object.
+  repeated Extension extensions = 26;
+
+  // Capacity for this workload.
+  // This represents the amount of traffic the workload can handle, relative to other workloads
+  // If unset, the capacity is default to 1.
+  google.protobuf.UInt32Value capacity = 27;
+
   // Reservations for deleted fields.
   reserved 15;
 }
@@ -300,7 +334,7 @@ message ApplicationTunnel {
     PROXY = 1;
   }
 
-  // A target natively handles this type of traffic.  
+  // A target natively handles this type of traffic.
   Protocol protocol = 1;
 
   // optional: if set, traffic should be sent to this port after the last zTunnel hop
@@ -335,4 +369,14 @@ message NamespacedHostname {
   string namespace = 1;
   // hostname (ex: gateway.example.com)
   string hostname = 2;
+}
+
+// Extension provides a mechanism to attach arbitrary additional configuration to an object.
+message Extension {
+  // name provides an opaque name for the extension.
+  // This may have semantic meaning or used for debugging.
+  // This should be unique amongst all extensions attached to an item.
+  string name = 1;
+  // config provides some opaque configuration.
+  google.protobuf.Any config = 2;
 }

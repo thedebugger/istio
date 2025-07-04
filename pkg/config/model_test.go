@@ -28,6 +28,7 @@ import (
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pkg/test/config"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestDeepCopy(t *testing.T) {
@@ -52,7 +53,7 @@ func TestDeepCopy(t *testing.T) {
 	copied.Annotations["policy.istio.io/checkRetries"] = "0"
 	if cfg.Labels["app"] == copied.Labels["app"] ||
 		cfg.Annotations["policy.istio.io/checkRetries"] == copied.Annotations["policy.istio.io/checkRetries"] {
-		t.Fatalf("Did not deep copy labels and annotations")
+		t.Fatal("Did not deep copy labels and annotations")
 	}
 
 	// change the copied gateway to see if the original config is not effected
@@ -178,7 +179,7 @@ func TestDeepCopyTypes(t *testing.T) {
 			}
 			changed := tt.modify(tt.input)
 			if cmp.Equal(cpy, changed, tt.option) {
-				t.Fatalf("deep copy allowed modification")
+				t.Fatal("deep copy allowed modification")
 			}
 		})
 	}
@@ -238,7 +239,7 @@ func TestApplyJSON(t *testing.T) {
 				t.Fatalf("Diff: %v", diff)
 			}
 			if err := ApplyJSONStrict(tt.input, tt.json); err == nil {
-				t.Fatalf("expected error from non existent field in strict mode")
+				t.Fatal("expected error from non existent field in strict mode")
 			}
 		})
 	}
@@ -350,6 +351,122 @@ func TestToMap(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.mp) {
 				t.Fatalf("got %+v want %+v", got, tt.mp)
 			}
+		})
+	}
+}
+
+func TestEqualsTypes(t *testing.T) {
+	mk := func(a Spec) Config {
+		return Config{
+			Spec: a,
+		}
+	}
+	cases := []struct {
+		input  Config
+		modify func(c Spec) Spec
+		option cmp.Option
+	}{
+		// Istio type
+		{
+			mk(&networking.VirtualService{Gateways: []string{"foo"}}),
+			func(c Spec) Spec {
+				c.(*networking.VirtualService).Gateways = []string{"bar"}
+				return c
+			},
+			protocmp.Transform(),
+		},
+		// Kubernetes type
+		{
+			mk(&corev1.PodSpec{ServiceAccountName: "foobar"}),
+			func(c Spec) Spec {
+				c.(*corev1.PodSpec).ServiceAccountName = "bar"
+				return c
+			},
+			nil,
+		},
+		// gateway-api type
+		{
+			mk(&k8s.GatewayClassSpec{ControllerName: "foo"}),
+			func(c Spec) Spec {
+				c.(*k8s.GatewayClassSpec).ControllerName = "bar"
+				return c
+			},
+			nil,
+		},
+		// mock type
+		{
+			mk(&config.MockConfig{Key: "foobar"}),
+			func(c Spec) Spec {
+				c.(*config.MockConfig).Key = "bar"
+				return c
+			},
+			protocmp.Transform(),
+		},
+		// XDS type, to test golang/proto
+		{
+			mk(&cluster.Cluster{Name: "foobar"}),
+			func(c Spec) Spec {
+				c.(*cluster.Cluster).Name = "bar"
+				return c
+			},
+			protocmp.Transform(),
+		},
+		// Random struct pointer
+		{
+			mk(&TestStruct{Name: "foobar"}),
+			func(c Spec) Spec {
+				c.(*TestStruct).Name = "bar"
+				return c
+			},
+			nil,
+		},
+		// Random struct
+		{
+			mk(TestStruct{Name: "foobar"}),
+			func(c Spec) Spec {
+				x := c.(TestStruct)
+				x.Name = "bar"
+				return x
+			},
+			nil,
+		},
+		// Slice
+		{
+			mk([]string{"foo"}),
+			func(c Spec) Spec {
+				x := c.([]string)
+				x[0] = "a"
+				return x
+			},
+			nil,
+		},
+		// Array
+		{
+			mk([1]string{"foo"}),
+			func(c Spec) Spec {
+				x := c.([1]string)
+				x[0] = "a"
+				return x
+			},
+			nil,
+		},
+		// Map
+		{
+			mk(map[string]string{"a": "b"}),
+			func(c Spec) Spec {
+				x := c.(map[string]string)
+				x["a"] = "x"
+				return x
+			},
+			nil,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(fmt.Sprintf("%T", tt.input.Spec), func(t *testing.T) {
+			cpy := tt.input.DeepCopy()
+			assert.Equal(t, tt.input.Equals(&cpy), true)
+			tt.input.Spec = tt.modify(tt.input.Spec)
+			assert.Equal(t, tt.input.Equals(&cpy), false)
 		})
 	}
 }

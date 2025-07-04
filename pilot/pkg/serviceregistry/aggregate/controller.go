@@ -40,7 +40,8 @@ var (
 
 // Controller aggregates data across different registries and monitors for changes
 type Controller struct {
-	meshHolder mesh.Holder
+	meshHolder      mesh.Holder
+	configClusterID cluster.ID
 
 	// The lock is used to protect the registries and controller's running status.
 	storeLock  sync.RWMutex
@@ -60,7 +61,28 @@ func (c *Controller) ServicesForWaypoint(key model.WaypointKey) []model.ServiceI
 	}
 	var res []model.ServiceInfo
 	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			// Only return workloads for the same cluster as the config cluster.
+			continue
+		}
 		res = append(res, p.ServicesForWaypoint(key)...)
+	}
+	return res
+}
+
+func (c *Controller) ServicesWithWaypoint(key string) []model.ServiceWaypointInfo {
+	if !features.EnableAmbient {
+		return nil
+	}
+	var res []model.ServiceWaypointInfo
+	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			// Only return workloads for the same cluster as the config cluster.
+			continue
+		}
+		res = append(res, p.ServicesWithWaypoint(key)...)
 	}
 	return res
 }
@@ -71,6 +93,11 @@ func (c *Controller) WorkloadsForWaypoint(key model.WaypointKey) []model.Workloa
 	}
 	var res []model.WorkloadInfo
 	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			// Only return workloads for the same cluster as the config cluster.
+			continue
+		}
 		res = append(res, p.WorkloadsForWaypoint(key)...)
 	}
 	return res
@@ -82,6 +109,11 @@ func (c *Controller) AdditionalPodSubscriptions(proxy *model.Proxy, addr, cur se
 	}
 	res := sets.New[string]()
 	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			// Only return workloads for the same cluster as the config cluster.
+			continue
+		}
 		res = res.Merge(p.AdditionalPodSubscriptions(proxy, addr, cur))
 	}
 	return res
@@ -93,27 +125,50 @@ func (c *Controller) Policies(requested sets.Set[model.ConfigKey]) []model.Workl
 		return res
 	}
 	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			// Only return workloads for the same cluster as the config cluster.
+			continue
+		}
 		res = append(res, p.Policies(requested)...)
 	}
 	return res
 }
 
 func (c *Controller) AddressInformation(addresses sets.String) ([]model.AddressInfo, sets.String) {
-	i := []model.AddressInfo{}
 	if !features.EnableAmbient {
-		return i, nil
+		return nil, nil
 	}
-	removed := sets.String{}
+	var i []model.AddressInfo
+	var removed sets.String
+	foundRegistryCount := 0
 	for _, p := range c.GetRegistries() {
+		// If this is a kubernetes registry that isn't the local cluster, skip it.
+		if p.Cluster() != c.configClusterID && p.Provider() == provider.Kubernetes {
+			continue
+		}
 		wis, r := p.AddressInformation(addresses)
-		i = append(i, wis...)
-		removed.Merge(r)
+		if len(wis) == 0 && len(r) == 0 {
+			continue
+		}
+		foundRegistryCount++
+		if foundRegistryCount == 1 {
+			// first registry: use the data structures they provided, to avoid a copy
+			removed = r
+			i = wis
+		} else {
+			i = append(i, wis...)
+			removed.Merge(r)
+		}
 	}
-	// We may have 'removed' it in one registry but found it in another
-	for _, wl := range i {
-		// TODO(@hzxuzhonghu) This is not right for workload, we may search workload by ip, but the resource name is uid.
-		if removed.Contains(wl.ResourceName()) {
-			removed.Delete(wl.ResourceName())
+	if foundRegistryCount > 1 {
+		// We may have 'removed' it in one registry but found it in another
+		// As an optimization, we skip this in the common case of only one registry
+		for _, wl := range i {
+			// TODO(@hzxuzhonghu) This is not right for workload, we may search workload by ip, but the resource name is uid.
+			if removed.Contains(wl.ResourceName()) {
+				removed.Delete(wl.ResourceName())
+			}
 		}
 	}
 	return i, removed
@@ -126,13 +181,15 @@ type registryEntry struct {
 }
 
 type Options struct {
-	MeshHolder mesh.Holder
+	MeshHolder      mesh.Holder
+	ConfigClusterID cluster.ID
 }
 
 // NewController creates a new Aggregate controller
 func NewController(opt Options) *Controller {
 	return &Controller{
 		registries:        make([]*registryEntry, 0),
+		configClusterID:   opt.ConfigClusterID,
 		meshHolder:        opt.MeshHolder,
 		running:           false,
 		handlersByCluster: map[cluster.ID]*model.ControllerHandlers{},

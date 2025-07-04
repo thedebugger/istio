@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
+	"istio.io/api/label"
 	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
@@ -38,6 +39,7 @@ import (
 	"istio.io/istio/pkg/config/schema/kind"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/hash"
 	netutil "istio.io/istio/pkg/util/net"
@@ -52,8 +54,12 @@ var (
 )
 
 // ConnectOriginate is the name for the resources associated with the origination of HTTP CONNECT.
-// Duplicated from v1alpha3/waypoint.go to avoid import cycle
+// Duplicated from networking/core/waypoint.go to avoid import cycle
 const connectOriginate = "connect_originate"
+
+// ForwardInnerConnect is the name for resources associated with the forwarding of an inner CONNECT tunnel.
+// Duplicated from networking/core/waypoint.go to avoid import cycle
+const forwardInnerConnect = "forward_inner_connect"
 
 type EndpointBuilder struct {
 	// These fields define the primary key for an endpoint, and can be used as a cache key
@@ -161,7 +167,7 @@ func (b *EndpointBuilder) populateSubsetInfo() {
 func (b *EndpointBuilder) populateFailoverPriorityLabels() {
 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
 	if enableFailover {
-		lbSetting := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting())
+		lbSetting, _ := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
 		if lbSetting != nil && lbSetting.Distribute == nil &&
 			len(lbSetting.FailoverPriority) > 0 && (lbSetting.Enabled == nil || lbSetting.Enabled.Value) {
 			b.failoverPriorityLabels = util.GetFailoverPriorityLabels(b.proxy.Labels, lbSetting.FailoverPriority)
@@ -322,7 +328,8 @@ func (b *EndpointBuilder) FromServiceEndpoints() []*endpoint.LocalityLbEndpoints
 	}
 	svcEps := b.push.ServiceEndpointsByPort(b.service, b.port, b.subsetLabels)
 	// don't use the pre-computed endpoints for CDS to preserve previous behavior
-	return ExtractEnvoyEndpoints(b.generate(svcEps))
+	// CDS is always toServiceWaypoint=false. We do not yet support calling waypoints for CDS (DNS type)
+	return ExtractEnvoyEndpoints(b.generate(svcEps, false))
 }
 
 // BuildClusterLoadAssignment converts the shards for this EndpointBuilder's Service
@@ -332,6 +339,27 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 	if svcPort == nil {
 		return buildEmptyClusterLoadAssignment(b.clusterName)
 	}
+
+	if features.EnableIngressWaypointRouting {
+		if waypointEps, f := b.findServiceWaypoint(endpointIndex); f {
+			// endpoints are from waypoint service but the envoy endpoint is different envoy cluster
+			locLbEps := b.generate(waypointEps, true)
+			return b.createClusterLoadAssignment(locLbEps)
+		}
+	}
+
+	// If we're an east west gateway, then we also want to send to waypoints
+	// TODO: depending on the final design, there will be times we DON'T want
+	// the e/w gateway to send to waypoints. That conditional logic will either live
+	// here or in the listener logic.
+	if features.EnableAmbientMultiNetwork && isEastWestGateway(b.proxy) {
+		if waypointEps, f := b.findServiceWaypoint(endpointIndex); f {
+			// endpoints are from waypoint service but the envoy endpoint is different envoy cluster
+			locLbEps := b.generate(waypointEps, true)
+			return b.createClusterLoadAssignment(locLbEps)
+		}
+	}
+
 	svcEps := b.snapshotShards(endpointIndex)
 	svcEps = slices.FilterInPlace(svcEps, func(ep *model.IstioEndpoint) bool {
 		// filter out endpoints that don't match the service port
@@ -340,9 +368,9 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 		}
 		// filter out endpoint that has invalid ip address, mostly domain name. Because this is generated from ServiceEntry.
 		// There are other two cases that should not be filtered out:
-		// 1. ep.Address can be empty since https://github.com/istio/istio/pull/45150, in this case we will replace it with gateway ip.
-		// 2. ep.Address can be uds when EndpointPort = 0
-		if ep.Address != "" && ep.EndpointPort != 0 && !netutil.IsValidIPAddress(ep.Address) {
+		// 1. ep.Addresses[0] can be empty since https://github.com/istio/istio/pull/45150, in this case we will replace it with gateway ip.
+		// 2. ep.Addresses[0] can be uds when EndpointPort = 0
+		if ep.Addresses[0] != "" && ep.EndpointPort != 0 && !netutil.IsValidIPAddress(ep.Addresses[0]) {
 			return false
 		}
 		// filter out endpoints that don't match the subset
@@ -352,7 +380,7 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 		return true
 	})
 
-	localityLbEndpoints := b.generate(svcEps)
+	localityLbEndpoints := b.generate(svcEps, false)
 	if len(localityLbEndpoints) == 0 {
 		return buildEmptyClusterLoadAssignment(b.clusterName)
 	}
@@ -363,7 +391,8 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 	// Failover should only be enabled when there is an outlier detection, otherwise Envoy
 	// will never detect the hosts are unhealthy and redirect traffic.
 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
-	lbSetting := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting())
+	lbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
+	enableFailover = enableFailover || forceFailover
 	if lbSetting != nil {
 		// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
 		l = util.CloneClusterLoadAssignment(l)
@@ -380,7 +409,7 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
 }
 
 // generate endpoints with applies weights, multi-network mapping and other filtering
-func (b *EndpointBuilder) generate(eps []*model.IstioEndpoint) []*LocalityEndpoints {
+func (b *EndpointBuilder) generate(eps []*model.IstioEndpoint, toServiceWaypoint bool) []*LocalityEndpoints {
 	// shouldn't happen here
 	if !b.ServiceFound() {
 		return nil
@@ -393,7 +422,7 @@ func (b *EndpointBuilder) generate(eps []*model.IstioEndpoint) []*LocalityEndpoi
 	localityEpMap := make(map[string]*LocalityEndpoints)
 	for _, ep := range eps {
 		mtlsEnabled := b.mtlsChecker.checkMtlsEnabled(ep, b.proxy.IsWaypointProxy())
-		eep := buildEnvoyLbEndpoint(b, ep, mtlsEnabled)
+		eep := buildEnvoyLbEndpoint(b, ep, mtlsEnabled, toServiceWaypoint)
 		if eep == nil {
 			continue
 		}
@@ -483,11 +512,20 @@ func (b *EndpointBuilder) filterIstioEndpoint(ep *model.IstioEndpoint) bool {
 		return false
 	}
 	// If we don't know the address we must eventually use a gateway address
-	if ep.Address == "" && (!b.gateways().IsMultiNetworkEnabled() || b.proxy.InNetwork(ep.Network)) {
+	if len(ep.Addresses) == 0 && (!b.gateways().IsMultiNetworkEnabled() || b.proxy.InNetwork(ep.Network)) {
 		return false
 	}
-	// Filter out unhealthy endpoints
-	if !features.SendUnhealthyEndpoints.Load() && ep.HealthStatus == model.UnHealthy {
+	// Filter out unhealthy endpoints, unless the service needs them.
+	// This is used to let envoy know about the amount of health endpoints in a cluster.
+	// This is used to let envoy know about the amount of health endpoints in a cluster.
+	if !b.service.SupportsUnhealthyEndpoints() && ep.HealthStatus == model.UnHealthy {
+		return false
+	}
+	// Filter out terminating endpoints -- we never need these. Even in "send unhealthy mode", there is no need
+	// to consider terminating endpoints in the calculation.
+	// For example, if I change a service with 1 pod, I will temporarily have 1 new pod and 1 terminating pod.
+	// We want this to be 100% healthy, not 50% healthy.
+	if ep.HealthStatus == model.Terminating {
 		return false
 	}
 	// Draining endpoints are only sent to 'persistent session' clusters.
@@ -594,8 +632,7 @@ func ExtractEnvoyEndpoints(locEps []*LocalityEndpoints) []*endpoint.LocalityLbEn
 }
 
 // buildEnvoyLbEndpoint packs the endpoint based on istio info.
-func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnabled bool) *endpoint.LbEndpoint {
-	addr := util.BuildAddress(e.Address, e.EndpointPort)
+func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnabled bool, toServiceWaypoint bool) *endpoint.LbEndpoint {
 	healthStatus := e.HealthStatus
 	if features.DrainingLabel != "" && e.Labels[features.DrainingLabel] != "" {
 		healthStatus = model.Draining
@@ -605,11 +642,6 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 		HealthStatus: corev3.HealthStatus(healthStatus),
 		LoadBalancingWeight: &wrapperspb.UInt32Value{
 			Value: e.GetLoadBalancingWeight(),
-		},
-		HostIdentifier: &endpoint.LbEndpoint_Endpoint{
-			Endpoint: &endpoint.Endpoint{
-				Address: addr,
-			},
 		},
 		Metadata: &corev3.Metadata{},
 	}
@@ -643,14 +675,39 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 	util.AppendLbEndpointMetadata(meta, ep.Metadata)
 
 	tunnel := supportTunnel(b, e)
-	if mtlsEnabled && !features.PreferHBONESend {
+	// Only send HBONE if its necessary. If they support legacy mTLS and do not explicitly PreferHBONE, we will use legacy mTLS.
+	// However, waypoints (TrafficDirectionInboundVIP) do not support legacy mTLS, so do not allow opting out of that case.
+	supportsMtls := e.TLSMode == model.IstioMutualTLSModeLabel
+	if supportsMtls && !features.PreferHBONESend && b.dir != model.TrafficDirectionInboundVIP {
 		tunnel = false
 	}
 	if b.proxy.Metadata.DisableHBONESend {
 		tunnel = false
 	}
+	// Waypoints always use HBONE
+	if toServiceWaypoint {
+		tunnel = true
+	}
+
 	if tunnel {
-		address, port := e.Address, int(e.EndpointPort)
+		// Currently, Envoy cannot support tunneling to multiple IP families.
+		// TODO(https://github.com/envoyproxy/envoy/issues/36318)
+		address, port := e.Addresses[0], int(e.EndpointPort)
+
+		waypoint := ""
+		if toServiceWaypoint {
+			// Address of this specific waypoint endpoint
+			// Currently our setup cannot support dual stack, so we need to pick the first address.
+			waypoint = net.JoinHostPort(e.Addresses[0], strconv.Itoa(port))
+			// Get the VIP of the service we are targeting (not the waypoint service)
+			serviceVIPs := b.service.ClusterVIPs.GetAddressesFor(e.Locality.ClusterID)
+			if len(serviceVIPs) == 0 {
+				serviceVIPs = []string{b.service.DefaultAddress}
+			}
+			// // If there are multiple VIPs, we just use one. Hostname would be ideal here but isn't supported.
+			address = serviceVIPs[0]
+			port = b.port
+		}
 		// We intentionally do not take into account waypoints here.
 		// 1. Workload waypoints: sidecar/ingress do not support sending traffic directly to workloads, only to services,
 		//    so these are not applicable.
@@ -664,10 +721,15 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 		//    However, it's not safe to do that by default; perhaps a future API could opt into this.
 		// Support connecting to server side waypoint proxy, if the destination has one. This is for sidecars and ingress.
 		// Setup tunnel metadata so requests will go through the tunnel
+		target := ptr.NonEmptyOrDefault(waypoint, net.JoinHostPort(address, strconv.Itoa(port)))
+		innerAddressName := connectOriginate
+		if isEastWestGateway(b.proxy) {
+			innerAddressName = forwardInnerConnect
+		}
 		ep.HostIdentifier = &endpoint.LbEndpoint_Endpoint{Endpoint: &endpoint.Endpoint{
-			Address: util.BuildInternalAddressWithIdentifier(connectOriginate, net.JoinHostPort(address, strconv.Itoa(port))),
+			Address: util.BuildInternalAddressWithIdentifier(innerAddressName, target),
 		}}
-		ep.Metadata.FilterMetadata[util.OriginalDstMetadataKey] = util.BuildTunnelMetadataStruct(address, port)
+		ep.Metadata.FilterMetadata[util.OriginalDstMetadataKey] = util.BuildTunnelMetadataStruct(address, port, waypoint)
 		if b.dir != model.TrafficDirectionInboundVIP {
 			// Add TLS metadata matcher to indicate we can use HBONE for this endpoint.
 			// We skip this for service waypoint, which doesn't need to dynamically match mTLS vs HBONE.
@@ -676,6 +738,36 @@ func buildEnvoyLbEndpoint(b *EndpointBuilder, e *model.IstioEndpoint, mtlsEnable
 					model.TunnelLabelShortName: {Kind: &structpb.Value_StringValue{StringValue: model.TunnelHTTP}},
 				},
 			}
+		}
+	} else {
+		addr := util.BuildAddress(e.Addresses[0], e.EndpointPort)
+
+		// This change can support multiple addresses for an endpoint, then there are some use cases for it, such as
+		// 1. An endpoint can have both ipv4 or ipv6
+		// 2. An endpoint can be represented a serviceentry/workload instance with multiple IP addresses
+		// When the additional_addresses field is populated for EDS in Envoy configuration, there would be a Happy Eyeballs
+		// algorithm to instantiate for the Endpoint, first attempt connecting to the IP address in the address field.
+		// Thereafter it will interleave IP addresses in the `additional_addresses` field based on IP version, as described in rfc8305,
+		// and attempt connections with them with a delay of 300ms each. The first connection to succeed will be used.
+		// Note: it uses Hash Based Load Balancing Policies for multiple addresses support Endpoint, and only the first address of the
+		// endpoint will be used as the hash key for the ring or maglev list, however, the upstream address that load balancer ends up
+		// connecting to will depend on the one that ends up "winning" using the Happy Eyeballs algorithm.
+		// Please refer to https://docs.google.com/document/d/1AjmTcMWwb7nia4rAgqE-iqIbSbfiXCI4h1vk-FONFdM/ for more details.
+		var additionalAddrs []*endpoint.Endpoint_AdditionalAddress
+		if features.EnableDualStack {
+			for _, itemAddr := range e.Addresses[1:] {
+				coreAddr := util.BuildAddress(itemAddr, e.EndpointPort)
+				additionalAddr := &endpoint.Endpoint_AdditionalAddress{
+					Address: coreAddr,
+				}
+				additionalAddrs = append(additionalAddrs, additionalAddr)
+			}
+		}
+		ep.HostIdentifier = &endpoint.LbEndpoint_Endpoint{
+			Endpoint: &endpoint.Endpoint{
+				Address:             addr,
+				AdditionalAddresses: additionalAddrs,
+			},
 		}
 	}
 
@@ -689,19 +781,23 @@ func supportTunnel(b *EndpointBuilder, e *model.IstioEndpoint) bool {
 	}
 
 	// Other side is a waypoint proxy.
-	if al := e.Labels[constants.ManagedGatewayLabel]; al == constants.ManagedGatewayMeshControllerLabel {
+	if al := e.Labels[label.GatewayManaged.Name]; al == constants.ManagedGatewayMeshControllerLabel {
 		return true
 	}
 
-	// Otherwise has ambient enabled. Note: this is a synthetic label, not existing in the real Pod.
-	if b.push.SupportsTunnel(e.Network, e.Address) {
-		return true
-	}
 	// Otherwise supports tunnel
 	// Currently we only support HTTP tunnel, so just check for that. If we support more, we will
 	// need to pick the right one based on our support overlap.
 	if e.SupportsTunnel(model.TunnelHTTP) {
 		return true
+	}
+
+	// Otherwise has ambient enabled. Note: this is a synthetic label, not existing in the real Pod.
+	// Check all addresses and return true if there is any IP address that supports tunneling when current endpoint has multiple addresses
+	for _, addr := range e.Addresses {
+		if b.push.SupportsTunnel(e.Network, addr) {
+			return true
+		}
 	}
 
 	return false
@@ -762,4 +858,71 @@ func getSubSetLabels(dr *v1alpha3.DestinationRule, subsetName string) labels.Ins
 	}
 
 	return nil
+}
+
+// For services that have a waypoint, we want to send to the waypoints rather than the service endpoints.
+// Lookup the service, find its waypoint, then find the waypoint's endpoints.
+func (b *EndpointBuilder) findServiceWaypoint(endpointIndex *model.EndpointIndex) ([]*model.IstioEndpoint, bool) {
+	// Currently we only support routers (gateways)
+	if b.nodeType != model.Router && !isEastWestGateway(b.proxy) {
+		// Currently only ingress and e/w gateway will call waypoints
+		return nil, false
+	}
+	if !b.service.HasAddressOrAssigned(b.proxy.Metadata.ClusterID) {
+		// No VIP, so skip this. Currently, waypoints can only accept VIP traffic
+		return nil, false
+	}
+
+	svcs := b.push.ServicesWithWaypoint(b.service.Attributes.Namespace + "/" + string(b.hostname))
+	if len(svcs) == 0 {
+		// Service isn't captured by a waypoint
+		return nil, false
+	}
+	if len(svcs) > 1 {
+		log.Warnf("unexpected multiple waypoint services for %v", b.clusterName)
+	}
+	svc := svcs[0]
+	// They need to explicitly opt-in on the service to send from ingress -> waypoint
+	if !svc.IngressUseWaypoint && !isEastWestGateway(b.proxy) {
+		return nil, false
+	}
+	waypointClusterName := model.BuildSubsetKey(
+		model.TrafficDirectionOutbound,
+		"",
+		host.Name(svc.WaypointHostname),
+		int(svc.Service.GetWaypoint().GetHboneMtlsPort()),
+	)
+	endpointBuilder := NewEndpointBuilder(waypointClusterName, b.proxy, b.push)
+	waypointEndpoints, _ := endpointBuilder.snapshotEndpointsForPort(endpointIndex)
+	return waypointEndpoints, true
+}
+
+func (b *EndpointBuilder) snapshotEndpointsForPort(endpointIndex *model.EndpointIndex) ([]*model.IstioEndpoint, bool) {
+	svcPort := b.servicePort(b.port)
+	if svcPort == nil {
+		return nil, false
+	}
+	svcEps := b.snapshotShards(endpointIndex)
+	svcEps = slices.FilterInPlace(svcEps, func(ep *model.IstioEndpoint) bool {
+		// filter out endpoints that don't match the service port
+		if svcPort.Name != ep.ServicePortName {
+			return false
+		}
+		// filter out endpoints that don't match the subset
+		if !b.subsetLabels.SubsetOf(ep.Labels) {
+			return false
+		}
+		return true
+	})
+	return svcEps, true
+}
+
+// Duplicated from networking/core/waypoint to avoid circular dependency
+func isEastWestGateway(node *model.Proxy) bool {
+	if node == nil || node.Type != model.Waypoint {
+		return false
+	}
+	controller, isManagedGateway := node.Labels[label.GatewayManaged.Name]
+
+	return isManagedGateway && controller == constants.ManagedGatewayEastWestControllerLabel
 }

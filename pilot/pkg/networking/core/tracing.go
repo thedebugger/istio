@@ -38,6 +38,7 @@ import (
 	"istio.io/istio/pilot/pkg/util/protoconv"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/pkg/xds/requestidextension"
+	"istio.io/istio/pkg/env"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/wellknown"
 )
@@ -83,7 +84,7 @@ func configureTracingFromTelemetry(
 		// use the prior configuration bits of sampling and custom tags
 		h.Tracing = &hcm.HttpConnectionManager_Tracing{}
 		configureSampling(h.Tracing, proxyConfigSamplingValue(proxyCfg))
-		configureCustomTags(h.Tracing, map[string]*telemetrypb.Tracing_CustomTag{}, proxyCfg, proxy)
+		configureCustomTags(nil, h.Tracing, map[string]*telemetrypb.Tracing_CustomTag{}, proxyCfg, proxy)
 		if proxyCfg.GetTracing().GetMaxPathTagLength() != 0 {
 			h.Tracing.MaxPathTagLength = wrapperspb.UInt32(proxyCfg.GetTracing().MaxPathTagLength)
 		}
@@ -130,7 +131,7 @@ func configureTracingFromTelemetry(
 	}
 
 	configureSampling(h.Tracing, sampling)
-	configureCustomTags(h.Tracing, spec.CustomTags, proxyCfg, proxy)
+	configureCustomTags(&spec, h.Tracing, spec.CustomTags, proxyCfg, proxy)
 
 	// if there is configured max tag length somewhere, fallback to it.
 	if h.GetTracing().GetMaxPathTagLength() == nil && proxyCfg.GetTracing().GetMaxPathTagLength() != 0 {
@@ -145,12 +146,15 @@ func configureTracingFromTelemetry(
 // configureFromProviderConfigHandled contains the number of providers we handle below.
 // This is to ensure this stays in sync as new handlers are added
 // STOP. DO NOT UPDATE THIS WITHOUT UPDATING configureFromProviderConfig.
-const configureFromProviderConfigHandled = 14
+const configureFromProviderConfigHandled = 15
 
 func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 	providerCfg *meshconfig.MeshConfig_ExtensionProvider,
 ) (*hcm.HttpConnectionManager_Tracing, bool, error) {
 	startChildSpan := false
+	if proxy.Type == model.Router {
+		startChildSpan = features.SpawnUpstreamSpanForGateway
+	}
 	useCustomSampler := false
 	var serviceCluster string
 	var maxTagLength uint32
@@ -169,7 +173,7 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 				model.IncLookupClusterFailures("zipkin")
 				return nil, fmt.Errorf("could not find cluster for tracing provider %q: %v", provider, err)
 			}
-			return zipkinConfig(hostname, cluster, !provider.Zipkin.GetEnable_64BitTraceId())
+			return zipkinConfig(hostname, cluster, provider.Zipkin.GetPath(), !provider.Zipkin.GetEnable_64BitTraceId())
 		}
 	case *meshconfig.MeshConfig_ExtensionProvider_Datadog:
 		maxTagLength = provider.Datadog.GetMaxTagLength()
@@ -183,18 +187,7 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 			return datadogConfig(serviceCluster, hostname, cluster)
 		}
 	case *meshconfig.MeshConfig_ExtensionProvider_Lightstep:
-		//nolint: staticcheck  // Lightstep deprecated
-		maxTagLength = provider.Lightstep.GetMaxTagLength()
-		providerName = envoyOpenTelemetry
-		//nolint: staticcheck  // Lightstep deprecated
-		providerConfig = func() (*anypb.Any, error) {
-			hostname, clusterName, err := clusterLookupFn(pushCtx, provider.Lightstep.GetService(), int(provider.Lightstep.GetPort()))
-			if err != nil {
-				model.IncLookupClusterFailures("lightstep")
-				return nil, fmt.Errorf("could not find cluster for tracing provider %q: %v", provider, err)
-			}
-			return otelLightStepConfig(clusterName, hostname, provider.Lightstep.GetAccessToken())
-		}
+		log.Warnf("Lightstep provider is deprecated, please use OpenTelemetry instead")
 	case *meshconfig.MeshConfig_ExtensionProvider_Skywalking:
 		maxTagLength = 0
 		providerName = envoySkywalking
@@ -224,6 +217,7 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 		*meshconfig.MeshConfig_ExtensionProvider_EnvoyTcpAls,
 		*meshconfig.MeshConfig_ExtensionProvider_EnvoyOtelAls,
 		*meshconfig.MeshConfig_ExtensionProvider_EnvoyFileAccessLog,
+		*meshconfig.MeshConfig_ExtensionProvider_Sds,
 		*meshconfig.MeshConfig_ExtensionProvider_Prometheus:
 		return nil, false, fmt.Errorf("provider %T does not support tracing", provider)
 		// Should never happen, but just in case we forget to add one
@@ -234,10 +228,13 @@ func configureFromProviderConfig(pushCtx *model.PushContext, proxy *model.Proxy,
 	return hcmTracing, useCustomSampler, err
 }
 
-func zipkinConfig(hostname, cluster string, enable128BitTraceID bool) (*anypb.Any, error) {
+func zipkinConfig(hostname, cluster, endpoint string, enable128BitTraceID bool) (*anypb.Any, error) {
+	if endpoint == "" {
+		endpoint = "/api/v2/spans" // envoy deprecated v1 support
+	}
 	zc := &tracingcfg.ZipkinConfig{
 		CollectorCluster:         cluster,
-		CollectorEndpoint:        "/api/v2/spans",                   // envoy deprecated v1 support
+		CollectorEndpoint:        endpoint,
 		CollectorEndpointVersion: tracingcfg.ZipkinConfig_HTTP_JSON, // use v2 JSON for now
 		CollectorHostname:        hostname,                          // http host header
 		TraceId_128Bit:           enable128BitTraceID,               // istio default enable 128 bit trace id
@@ -269,17 +266,7 @@ func otelConfig(serviceName string, otelProvider *meshconfig.MeshConfig_Extensio
 		ServiceName: serviceName,
 	}
 
-	if otelProvider.GetHttp() == nil {
-		// export via gRPC
-		oc.GrpcService = &core.GrpcService{
-			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
-					ClusterName: cluster,
-					Authority:   hostname,
-				},
-			},
-		}
-	} else {
+	if otelProvider.GetHttp() != nil {
 		// export via HTTP
 		httpService := otelProvider.GetHttp()
 		te, err := url.JoinPath(hostname, httpService.GetPath())
@@ -295,6 +282,19 @@ func otelConfig(serviceName string, otelProvider *meshconfig.MeshConfig_Extensio
 				Timeout: httpService.GetTimeout(),
 			},
 			RequestHeadersToAdd: buildHTTPHeaders(httpService.GetHeaders()),
+		}
+
+	} else {
+		// export via gRPC
+		oc.GrpcService = &core.GrpcService{
+			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+					ClusterName: cluster,
+					Authority:   hostname,
+				},
+			},
+			Timeout:         otelProvider.GetGrpc().GetTimeout(),
+			InitialMetadata: buildInitialMetadata(otelProvider.GetGrpc().GetInitialMetadata()),
 		}
 	}
 
@@ -344,26 +344,6 @@ func skywalkingConfig(clusterName, hostname string) (*anypb.Any, error) {
 	}
 
 	return protoconv.MessageToAnyWithError(s)
-}
-
-func otelLightStepConfig(clusterName, hostname, accessToken string) (*anypb.Any, error) {
-	dc := &tracingcfg.OpenTelemetryConfig{
-		GrpcService: &core.GrpcService{
-			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
-					ClusterName: clusterName,
-					Authority:   hostname,
-				},
-			},
-			InitialMetadata: []*core.HeaderValue{
-				{
-					Key:   "lightstep-access-token",
-					Value: accessToken,
-				},
-			},
-		},
-	}
-	return anypb.New(dc)
 }
 
 func configureDynatraceSampler(hostname, cluster string,
@@ -591,10 +571,22 @@ func proxyConfigSamplingValue(config *meshconfig.ProxyConfig) float64 {
 	return sampling
 }
 
-func configureCustomTags(hcmTracing *hcm.HttpConnectionManager_Tracing,
+func configureCustomTags(spec *model.TracingSpec, hcmTracing *hcm.HttpConnectionManager_Tracing,
 	providerTags map[string]*telemetrypb.Tracing_CustomTag, proxyCfg *meshconfig.ProxyConfig, node *model.Proxy,
 ) {
-	tags := append(buildServiceTags(node.Metadata, node.Labels), optionalPolicyTags...)
+	var tags []*tracing.CustomTag
+	if spec == nil {
+		// Fallback to legacy mesh config.
+		enableIstioTags := true
+		if proxyCfg.GetTracing().GetEnableIstioTags() != nil {
+			enableIstioTags = proxyCfg.GetTracing().GetEnableIstioTags().GetValue()
+		}
+		if enableIstioTags {
+			tags = append(buildServiceTags(node.Metadata, node.Labels), optionalPolicyTags...)
+		}
+	} else if spec.EnableIstioTags {
+		tags = append(buildServiceTags(node.Metadata, node.Labels), optionalPolicyTags...)
+	}
 
 	if len(providerTags) == 0 {
 		tags = append(tags, buildCustomTagsFromProxyConfig(proxyCfg.GetTracing().GetCustomTags())...)
@@ -710,10 +702,35 @@ func buildHTTPHeaders(headers []*meshconfig.MeshConfig_ExtensionProvider_HttpHea
 			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 			Header: &core.HeaderValue{
 				Key:   h.GetName(),
-				Value: h.GetValue(),
+				Value: getHeaderValue(h),
 			},
 		}
 		target = append(target, hvo)
 	}
 	return target
+}
+
+func buildInitialMetadata(metadata []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader) []*core.HeaderValue {
+	if metadata == nil {
+		return nil
+	}
+	target := make([]*core.HeaderValue, 0, len(metadata))
+	for _, h := range metadata {
+		hv := &core.HeaderValue{
+			Key:   h.GetName(),
+			Value: getHeaderValue(h),
+		}
+		target = append(target, hv)
+	}
+	return target
+}
+
+func getHeaderValue(header *meshconfig.MeshConfig_ExtensionProvider_HttpHeader) string {
+	switch hv := header.HeaderValue.(type) {
+	case *meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value:
+		return hv.Value
+	case *meshconfig.MeshConfig_ExtensionProvider_HttpHeader_EnvName:
+		return env.Register[string](hv.EnvName, "", "").Get()
+	}
+	return ""
 }

@@ -96,7 +96,8 @@ func (ml *MutableGatewayListener) build(builder *ListenerBuilder, opts gatewayLi
 
 			// If statPrefix has been set before calling this method, respect that.
 			if len(opt.httpOpts.statPrefix) == 0 {
-				opt.httpOpts.statPrefix = strings.ToLower(ml.Listener.TrafficDirection.String()) + "_" + ml.Listener.Name
+				statPrefix := strings.ToLower(ml.Listener.TrafficDirection.String()) + "_" + ml.Listener.Name
+				opt.httpOpts.statPrefix = util.DelimitedStatsPrefix(statPrefix)
 			}
 			opt.httpOpts.port = opts.port
 			httpConnectionManagers[i] = builder.buildHTTPConnectionManager(opt.httpOpts)
@@ -445,14 +446,20 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 			vskey := virtualService.Name + "/" + virtualService.Namespace
 
 			if routes, exists = gatewayRoutes[gatewayName][vskey]; !exists {
+				hashByDestination := istio_route.GetConsistentHashForVirtualService(push, node, virtualService)
 				opts := istio_route.RouteOptions{
 					IsTLS:                     server.Tls != nil,
 					IsHTTP3AltSvcHeaderNeeded: isH3DiscoveryNeeded,
 					Mesh:                      push.Mesh,
+					LookupService: func(name host.Name) *model.Service {
+						return nameToServiceMap[name]
+					},
+					LookupDestinationCluster: istio_route.GetDestinationCluster,
+					LookupHash: func(destination *networking.HTTPRouteDestination) *networking.LoadBalancerSettings_ConsistentHashLB {
+						return hashByDestination[destination]
+					},
 				}
-				hashByDestination := istio_route.GetConsistentHashForVirtualService(push, node, virtualService)
-				routes, err = istio_route.BuildHTTPRoutesForVirtualService(node, virtualService, nameToServiceMap,
-					hashByDestination, port, sets.New(gatewayName), opts)
+				routes, err = istio_route.BuildHTTPRoutesForVirtualService(node, virtualService, port, sets.New(gatewayName), opts)
 				if err != nil {
 					log.Debugf("%s omitting routes for virtual service %v/%v due to error: %v", node.ID, virtualService.Namespace, virtualService.Name, err)
 					continue
@@ -502,6 +509,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 			if !server.GetTls().GetHttpsRedirect() {
 				continue
 			}
+			hostname = strings.ToLower(hostname)
 			if vHost, exists := vHostDedupMap[host.Name(hostname)]; exists {
 				vHost.RequireTls = route.VirtualHost_ALL
 				continue
@@ -651,6 +659,7 @@ func (configgen *ConfigGeneratorImpl) createGatewayHTTPFilterChainOpts(node *mod
 				useRemoteAddress:          true,
 				connectionManager:         buildGatewayConnectionManager(proxyConfig, node, false /* http3SupportEnabled */, push),
 				suppressEnvoyDebugHeaders: ph.SuppressDebugHeaders,
+				skipIstioMXHeaders:        ph.SkipIstioMXHeaders,
 				protocol:                  serverProto,
 				class:                     istionetworking.ListenerClassGateway,
 			},
@@ -672,6 +681,7 @@ func (configgen *ConfigGeneratorImpl) createGatewayHTTPFilterChainOpts(node *mod
 			useRemoteAddress:          true,
 			connectionManager:         buildGatewayConnectionManager(proxyConfig, node, http3Enabled, push),
 			suppressEnvoyDebugHeaders: ph.SuppressDebugHeaders,
+			skipIstioMXHeaders:        ph.SkipIstioMXHeaders,
 			protocol:                  serverProto,
 			statPrefix:                server.Name,
 			http3Only:                 http3Enabled,
@@ -726,16 +736,12 @@ func buildGatewayConnectionManager(proxyConfig *meshconfig.ProxyConfig, node *mo
 		httpConnManager.Http3ProtocolOptions = &core.Http3ProtocolOptions{}
 		httpConnManager.CodecType = hcm.HttpConnectionManager_HTTP3
 	}
+	// As of Envoy 1.33, the default internalAddressConfig is set to an empty set. In previous versions
+	// the default was all private IPs. To preserve internal headers, we must set ENABLE_HCM_INTERNAL_NETWORKS
+	// to true and explicitly set MeshNetworks to configure Envoy's internal_address_config.
+	// MeshNetwork configuration docs can be found here: https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshNetworks
 	if features.EnableHCMInternalNetworks && push.Networks != nil {
-		for _, internalnetwork := range push.Networks.GetNetworks() {
-			iac := &hcm.HttpConnectionManager_InternalAddressConfig{}
-			for _, ne := range internalnetwork.Endpoints {
-				if cidr := util.ConvertAddressToCidr(ne.GetFromCidr()); cidr != nil {
-					iac.CidrRanges = append(iac.CidrRanges, cidr)
-				}
-			}
-			httpConnManager.InternalAddressConfig = iac
-		}
+		httpConnManager.InternalAddressConfig = util.MeshNetworksToEnvoyInternalAddressConfig(push.Networks)
 	}
 
 	return httpConnManager

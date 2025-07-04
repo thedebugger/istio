@@ -12,7 +12,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-FROM python:3.12.1-slim
+FROM python:3.13.3-slim
 
 WORKDIR /
 
@@ -29,7 +29,7 @@ COPY static /opt/microservices/static
 COPY requirements.txt /opt/microservices/
 
 ARG flood_factor
-ENV FLOOD_FACTOR ${flood_factor:-0}
+ENV FLOOD_FACTOR=${flood_factor:-0}
 
 EXPOSE 9080
 WORKDIR /opt/microservices

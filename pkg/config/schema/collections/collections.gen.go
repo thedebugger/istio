@@ -10,15 +10,20 @@ import (
 
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
+	k8sioapiautoscalingv2 "k8s.io/api/autoscaling/v2"
 	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
+	k8sioapicertificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	k8sioapicoordinationv1 "k8s.io/api/coordination/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
+	k8sioapipolicyv1 "k8s.io/api/policy/v1"
 	k8sioapiextensionsapiserverpkgapisapiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	sigsk8siogatewayapiapisv1 "sigs.k8s.io/gateway-api/apis/v1"
 	sigsk8siogatewayapiapisv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	sigsk8siogatewayapiapisv1alpha3 "sigs.k8s.io/gateway-api/apis/v1alpha3"
 	sigsk8siogatewayapiapisv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	sigsk8siogatewayapiapisxv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	istioioapiextensionsv1alpha1 "istio.io/api/extensions/v1alpha1"
 	istioioapimeshv1alpha1 "istio.io/api/mesh/v1alpha1"
@@ -39,9 +44,9 @@ var (
 		Group:      "security.istio.io",
 		Kind:       "AuthorizationPolicy",
 		Plural:     "authorizationpolicies",
-		Version:    "v1beta1",
+		Version:    "v1",
 		VersionAliases: []string{
-			"v1",
+			"v1beta1",
 		},
 		Proto: "istio.security.v1beta1.AuthorizationPolicy", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapisecurityv1beta1.AuthorizationPolicy{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -50,6 +55,21 @@ var (
 		Synthetic:     false,
 		Builtin:       false,
 		ValidateProto: validation.ValidateAuthorizationPolicy,
+	}.MustBuild()
+
+	BackendTLSPolicy = resource.Builder{
+		Identifier: "BackendTLSPolicy",
+		Group:      "gateway.networking.k8s.io",
+		Kind:       "BackendTLSPolicy",
+		Plural:     "backendtlspolicies",
+		Version:    "v1alpha3",
+		Proto:      "k8s.io.gateway_api.api.v1alpha3.BackendTLSPolicySpec", StatusProto: "k8s.io.gateway_api.api.v1alpha2.PolicyStatus",
+		ReflectType: reflect.TypeOf(&sigsk8siogatewayapiapisv1alpha3.BackendTLSPolicySpec{}).Elem(), StatusType: reflect.TypeOf(&sigsk8siogatewayapiapisv1alpha2.PolicyStatus{}).Elem(),
+		ProtoPackage: "sigs.k8s.io/gateway-api/apis/v1alpha3", StatusPackage: "sigs.k8s.io/gateway-api/apis/v1alpha2",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       false,
+		ValidateProto: validation.EmptyValidate,
 	}.MustBuild()
 
 	CertificateSigningRequest = resource.Builder{
@@ -61,6 +81,21 @@ var (
 		Proto:      "k8s.io.api.certificates.v1.CertificateSigningRequestSpec", StatusProto: "k8s.io.api.certificates.v1.CertificateSigningRequestStatus",
 		ReflectType: reflect.TypeOf(&k8sioapicertificatesv1.CertificateSigningRequestSpec{}).Elem(), StatusType: reflect.TypeOf(&k8sioapicertificatesv1.CertificateSigningRequestStatus{}).Elem(),
 		ProtoPackage: "k8s.io/api/certificates/v1", StatusPackage: "k8s.io/api/certificates/v1",
+		ClusterScoped: true,
+		Synthetic:     false,
+		Builtin:       true,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
+	ClusterTrustBundle = resource.Builder{
+		Identifier:    "ClusterTrustBundle",
+		Group:         "certificates.k8s.io",
+		Kind:          "ClusterTrustBundle",
+		Plural:        "clustertrustbundles",
+		Version:       "v1beta1",
+		Proto:         "k8s.io.api.certificates.v1beta1.ClusterTrustBundleSpec",
+		ReflectType:   reflect.TypeOf(&k8sioapicertificatesv1beta1.ClusterTrustBundleSpec{}).Elem(),
+		ProtoPackage:  "k8s.io/api/certificates/v1beta1",
 		ClusterScoped: true,
 		Synthetic:     false,
 		Builtin:       true,
@@ -132,10 +167,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "DestinationRule",
 		Plural:     "destinationrules",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.DestinationRule", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.DestinationRule{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -214,10 +249,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "Gateway",
 		Plural:     "gateways",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.Gateway", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.Gateway{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -263,6 +298,21 @@ var (
 		ClusterScoped: false,
 		Synthetic:     false,
 		Builtin:       false,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
+	HorizontalPodAutoscaler = resource.Builder{
+		Identifier: "HorizontalPodAutoscaler",
+		Group:      "autoscaling",
+		Kind:       "HorizontalPodAutoscaler",
+		Plural:     "horizontalpodautoscalers",
+		Version:    "v2",
+		Proto:      "k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerSpec", StatusProto: "k8s.io.api.autoscaling.v2.HorizontalPodAutoscalerStatus",
+		ReflectType: reflect.TypeOf(&k8sioapiautoscalingv2.HorizontalPodAutoscalerSpec{}).Elem(), StatusType: reflect.TypeOf(&k8sioapiautoscalingv2.HorizontalPodAutoscalerStatus{}).Elem(),
+		ProtoPackage: "k8s.io/api/autoscaling/v2", StatusPackage: "k8s.io/api/autoscaling/v2",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       true,
 		ValidateProto: validation.EmptyValidate,
 	}.MustBuild()
 
@@ -410,9 +460,9 @@ var (
 		Group:      "security.istio.io",
 		Kind:       "PeerAuthentication",
 		Plural:     "peerauthentications",
-		Version:    "v1beta1",
+		Version:    "v1",
 		VersionAliases: []string{
-			"v1",
+			"v1beta1",
 		},
 		Proto: "istio.security.v1beta1.PeerAuthentication", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapisecurityv1beta1.PeerAuthentication{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -432,6 +482,21 @@ var (
 		Proto:         "k8s.io.api.core.v1.PodSpec",
 		ReflectType:   reflect.TypeOf(&k8sioapicorev1.PodSpec{}).Elem(),
 		ProtoPackage:  "k8s.io/api/core/v1",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       true,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
+	PodDisruptionBudget = resource.Builder{
+		Identifier: "PodDisruptionBudget",
+		Group:      "policy",
+		Kind:       "PodDisruptionBudget",
+		Plural:     "poddisruptionbudgets",
+		Version:    "v1",
+		Proto:      "k8s.io.api.policy.v1.PodDisruptionBudgetSpec", StatusProto: "k8s.io.api.policy.v1.PodDisruptionBudgetStatus",
+		ReflectType: reflect.TypeOf(&k8sioapipolicyv1.PodDisruptionBudgetSpec{}).Elem(), StatusType: reflect.TypeOf(&k8sioapipolicyv1.PodDisruptionBudgetStatus{}).Elem(),
+		ProtoPackage: "k8s.io/api/policy/v1", StatusPackage: "k8s.io/api/policy/v1",
 		ClusterScoped: false,
 		Synthetic:     false,
 		Builtin:       true,
@@ -476,9 +541,9 @@ var (
 		Group:      "security.istio.io",
 		Kind:       "RequestAuthentication",
 		Plural:     "requestauthentications",
-		Version:    "v1beta1",
+		Version:    "v1",
 		VersionAliases: []string{
-			"v1",
+			"v1beta1",
 		},
 		Proto: "istio.security.v1beta1.RequestAuthentication", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapisecurityv1beta1.RequestAuthentication{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -505,14 +570,14 @@ var (
 	}.MustBuild()
 
 	Service = resource.Builder{
-		Identifier:    "Service",
-		Group:         "",
-		Kind:          "Service",
-		Plural:        "services",
-		Version:       "v1",
-		Proto:         "k8s.io.api.core.v1.ServiceSpec",
-		ReflectType:   reflect.TypeOf(&k8sioapicorev1.ServiceSpec{}).Elem(),
-		ProtoPackage:  "k8s.io/api/core/v1",
+		Identifier: "Service",
+		Group:      "",
+		Kind:       "Service",
+		Plural:     "services",
+		Version:    "v1",
+		Proto:      "k8s.io.api.core.v1.ServiceSpec", StatusProto: "k8s.io.api.core.v1.ServiceStatus",
+		ReflectType: reflect.TypeOf(&k8sioapicorev1.ServiceSpec{}).Elem(), StatusType: reflect.TypeOf(&k8sioapicorev1.ServiceStatus{}).Elem(),
+		ProtoPackage: "k8s.io/api/core/v1", StatusPackage: "k8s.io/api/core/v1",
 		ClusterScoped: false,
 		Synthetic:     false,
 		Builtin:       true,
@@ -539,10 +604,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "ServiceEntry",
 		Plural:     "serviceentries",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.ServiceEntry", StatusProto: "istio.networking.v1alpha3.ServiceEntryStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.ServiceEntry{}).Elem(), StatusType: reflect.TypeOf(&istioioapinetworkingv1alpha3.ServiceEntryStatus{}).Elem(),
@@ -558,10 +623,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "Sidecar",
 		Plural:     "sidecars",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.Sidecar", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.Sidecar{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -622,9 +687,9 @@ var (
 		Group:      "telemetry.istio.io",
 		Kind:       "Telemetry",
 		Plural:     "telemetries",
-		Version:    "v1alpha1",
+		Version:    "v1",
 		VersionAliases: []string{
-			"v1",
+			"v1alpha1",
 		},
 		Proto: "istio.telemetry.v1alpha1.Telemetry", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapitelemetryv1alpha1.Telemetry{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -670,10 +735,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "VirtualService",
 		Plural:     "virtualservices",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.VirtualService", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.VirtualService{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -704,10 +769,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "WorkloadEntry",
 		Plural:     "workloadentries",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.WorkloadEntry", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.WorkloadEntry{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -723,10 +788,10 @@ var (
 		Group:      "networking.istio.io",
 		Kind:       "WorkloadGroup",
 		Plural:     "workloadgroups",
-		Version:    "v1alpha3",
+		Version:    "v1",
 		VersionAliases: []string{
+			"v1alpha3",
 			"v1beta1",
-			"v1",
 		},
 		Proto: "istio.networking.v1alpha3.WorkloadGroup", StatusProto: "istio.meta.v1alpha1.IstioStatus",
 		ReflectType: reflect.TypeOf(&istioioapinetworkingv1alpha3.WorkloadGroup{}).Elem(), StatusType: reflect.TypeOf(&istioioapimetav1alpha1.IstioStatus{}).Elem(),
@@ -737,10 +802,42 @@ var (
 		ValidateProto: validation.ValidateWorkloadGroup,
 	}.MustBuild()
 
+	XBackendTrafficPolicy = resource.Builder{
+		Identifier: "XBackendTrafficPolicy",
+		Group:      "gateway.networking.x-k8s.io",
+		Kind:       "XBackendTrafficPolicy",
+		Plural:     "xbackendtrafficpolicies",
+		Version:    "v1alpha1",
+		Proto:      "k8s.io.gateway_api.apix.v1alpha1.BackendTrafficPolicySpec", StatusProto: "PolicyStatus",
+		ReflectType: reflect.TypeOf(&sigsk8siogatewayapiapisxv1alpha1.BackendTrafficPolicySpec{}).Elem(), StatusType: reflect.TypeOf(&sigsk8siogatewayapiapisxv1alpha1.PolicyStatus{}).Elem(),
+		ProtoPackage: "sigs.k8s.io/gateway-api/apisx/v1alpha1", StatusPackage: "sigs.k8s.io/gateway-api/apisx/v1alpha1",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       false,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
+	XListenerSet = resource.Builder{
+		Identifier: "XListenerSet",
+		Group:      "gateway.networking.x-k8s.io",
+		Kind:       "XListenerSet",
+		Plural:     "xlistenersets",
+		Version:    "v1alpha1",
+		Proto:      "ListenerSetSpec", StatusProto: "ListenerSetStatus",
+		ReflectType: reflect.TypeOf(&sigsk8siogatewayapiapisxv1alpha1.ListenerSetSpec{}).Elem(), StatusType: reflect.TypeOf(&sigsk8siogatewayapiapisxv1alpha1.ListenerSetStatus{}).Elem(),
+		ProtoPackage: "sigs.k8s.io/gateway-api/apisx/v1alpha1", StatusPackage: "sigs.k8s.io/gateway-api/apisx/v1alpha1",
+		ClusterScoped: false,
+		Synthetic:     false,
+		Builtin:       false,
+		ValidateProto: validation.EmptyValidate,
+	}.MustBuild()
+
 	// All contains all collections in the system.
 	All = collection.NewSchemasBuilder().
 		MustAdd(AuthorizationPolicy).
+		MustAdd(BackendTLSPolicy).
 		MustAdd(CertificateSigningRequest).
+		MustAdd(ClusterTrustBundle).
 		MustAdd(ConfigMap).
 		MustAdd(CustomResourceDefinition).
 		MustAdd(DaemonSet).
@@ -753,6 +850,7 @@ var (
 		MustAdd(Gateway).
 		MustAdd(GatewayClass).
 		MustAdd(HTTPRoute).
+		MustAdd(HorizontalPodAutoscaler).
 		MustAdd(Ingress).
 		MustAdd(IngressClass).
 		MustAdd(KubernetesGateway).
@@ -764,6 +862,7 @@ var (
 		MustAdd(Node).
 		MustAdd(PeerAuthentication).
 		MustAdd(Pod).
+		MustAdd(PodDisruptionBudget).
 		MustAdd(ProxyConfig).
 		MustAdd(ReferenceGrant).
 		MustAdd(RequestAuthentication).
@@ -782,11 +881,15 @@ var (
 		MustAdd(WasmPlugin).
 		MustAdd(WorkloadEntry).
 		MustAdd(WorkloadGroup).
+		MustAdd(XBackendTrafficPolicy).
+		MustAdd(XListenerSet).
 		Build()
 
 	// Kube contains only kubernetes collections.
 	Kube = collection.NewSchemasBuilder().
+		MustAdd(BackendTLSPolicy).
 		MustAdd(CertificateSigningRequest).
+		MustAdd(ClusterTrustBundle).
 		MustAdd(ConfigMap).
 		MustAdd(CustomResourceDefinition).
 		MustAdd(DaemonSet).
@@ -796,6 +899,7 @@ var (
 		MustAdd(GRPCRoute).
 		MustAdd(GatewayClass).
 		MustAdd(HTTPRoute).
+		MustAdd(HorizontalPodAutoscaler).
 		MustAdd(Ingress).
 		MustAdd(IngressClass).
 		MustAdd(KubernetesGateway).
@@ -804,6 +908,7 @@ var (
 		MustAdd(Namespace).
 		MustAdd(Node).
 		MustAdd(Pod).
+		MustAdd(PodDisruptionBudget).
 		MustAdd(ReferenceGrant).
 		MustAdd(Secret).
 		MustAdd(Service).
@@ -813,6 +918,8 @@ var (
 		MustAdd(TLSRoute).
 		MustAdd(UDPRoute).
 		MustAdd(ValidatingWebhookConfiguration).
+		MustAdd(XBackendTrafficPolicy).
+		MustAdd(XListenerSet).
 		Build()
 
 	// Pilot contains only collections used by Pilot.
@@ -836,6 +943,7 @@ var (
 	// pilotGatewayAPI contains only collections used by Pilot, including the full Gateway API.
 	pilotGatewayAPI = collection.NewSchemasBuilder().
 			MustAdd(AuthorizationPolicy).
+			MustAdd(BackendTLSPolicy).
 			MustAdd(DestinationRule).
 			MustAdd(EnvoyFilter).
 			MustAdd(GRPCRoute).
@@ -857,6 +965,8 @@ var (
 			MustAdd(WasmPlugin).
 			MustAdd(WorkloadEntry).
 			MustAdd(WorkloadGroup).
+			MustAdd(XBackendTrafficPolicy).
+			MustAdd(XListenerSet).
 			Build()
 
 	// PilotStableGatewayAPI contains only collections used by Pilot, including beta+ Gateway API.

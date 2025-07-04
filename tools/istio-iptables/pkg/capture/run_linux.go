@@ -23,14 +23,13 @@ import (
 
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/tools/istio-iptables/pkg/config"
-	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
 // configureTProxyRoutes configures ip firewall rules to enable TPROXY support.
 // See https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/original_src_filter
 func configureTProxyRoutes(cfg *config.Config) error {
 	if cfg.InboundPortsInclude != "" {
-		if cfg.InboundInterceptionMode == constants.TPROXY {
+		if cfg.InboundInterceptionMode == "TPROXY" {
 			link, err := netlink.LinkByName("lo")
 			if err != nil {
 				return fmt.Errorf("failed to find 'lo' link: %v", err)
@@ -53,7 +52,7 @@ func configureTProxyRoutes(cfg *config.Config) error {
 				r := netlink.NewRule()
 				r.Family = family
 				r.Table = tproxyTable
-				r.Mark = tproxyMark
+				r.Mark = uint32(tproxyMark)
 				if err := netlink.RuleAdd(r); err != nil {
 					return fmt.Errorf("failed to configure netlink rule: %v", err)
 				}
@@ -97,5 +96,32 @@ func ConfigureRoutes(cfg *config.Config) error {
 	if err := configureTProxyRoutes(cfg); err != nil {
 		return err
 	}
+	return nil
+}
+
+// configureIPv6Addresses sets up a new IP address on local interface. This is used as the source IP
+// for inbound traffic to distinguish traffic we want to capture vs traffic we do not. This is needed
+// for IPv6 but not IPv4, as IPv4 defaults to `netmask 255.0.0.0`, which allows binding to addresses
+// in the 127.x.y.z range, while IPv6 defaults to `prefixlen 128` which allows binding only to ::1.
+// Equivalent to `ip -6 addr add "::6/128" dev lo`
+func configureIPv6Addresses(cfg *config.Config) error {
+	if !cfg.EnableIPv6 {
+		return nil
+	}
+	link, err := netlink.LinkByName("lo")
+	if err != nil {
+		return fmt.Errorf("failed to find 'lo' link: %v", err)
+	}
+	// Setup a new IP address on local interface. This is used as the source IP for inbound traffic
+	// to distinguish traffic we want to capture vs traffic we do not.
+	// Equivalent to `ip -6 addr add "::6/128" dev lo`
+	address := &net.IPNet{IP: net.ParseIP("::6"), Mask: net.CIDRMask(128, 128)}
+	addr := &netlink.Addr{IPNet: address}
+
+	err = netlink.AddrAdd(link, addr)
+	if ignoreExists(err) != nil {
+		return fmt.Errorf("failed to add IPv6 inbound address: %v", err)
+	}
+	log.Infof("Added ::6 address on the loopback iface")
 	return nil
 }

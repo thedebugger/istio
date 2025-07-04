@@ -19,6 +19,7 @@ package untaint
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,15 +52,15 @@ func TestMain(m *testing.M) {
 			// can't deploy VMs without eastwest gateway
 			ctx.Settings().SkipVMs()
 			cfg.DeployEastWestGW = false
-			cfg.ControlPlaneValues = `
-components:
-  cni:
-    namespace: "kube-system"
+			if ctx.Settings().AmbientMultiNetwork {
+				cfg.SkipDeployCrossClusterSecrets = true
+			}
+			cfg.ControlPlaneValues = fmt.Sprintf(`
 values:
   pilot:
     taint:
       enabled: true
-      namespace: "kube-system"
+      namespace: "%s"
     env:
       PILOT_ENABLE_NODE_UNTAINT_CONTROLLERS: "true"
   ztunnel:
@@ -73,7 +74,7 @@ values:
     istio-egressgateway:
       enabled: false
 
-`
+`, cfg.SystemNamespace)
 		}, cert.CreateCASecretAlt)).
 		Teardown(untaintNodes).
 		Run()

@@ -26,18 +26,16 @@ ADDONS="${WD}/../../samples/addons"
 DASHBOARDS="${WD}/dashboards"
 mkdir -p "${ADDONS}"
 TMP=$(mktemp -d)
-LOKI_VERSION=${LOKI_VERSION:-"6.6.3"}
-GRAFANA_VERSION=${GRAFANA_VERSION:-"8.0.1"}
+LOKI_VERSION=${LOKI_VERSION:-"6.30.1"}
+GRAFANA_VERSION=${GRAFANA_VERSION:-"9.2.2"}
 
 # Set up kiali
 {
 helm3 template kiali-server \
   --namespace istio-system \
-  --version 1.87.0 \
-  --set deployment.image_version=v1.87 \
+  --version 2.11.0 \
+  --set deployment.image_version=v2.11 \
   --include-crds \
-  --set nameOverride=kiali \
-  --set fullnameOverride=kiali \
   kiali-server \
   --repo https://kiali.org/helm-charts \
   -f "${WD}/values-kiali.yaml"
@@ -46,7 +44,7 @@ helm3 template kiali-server \
 # Set up prometheus
 helm3 template prometheus prometheus \
   --namespace istio-system \
-  --version 25.21.0 \
+  --version 27.20.0 \
   --repo https://prometheus-community.github.io/helm-charts \
   -f "${WD}/values-prometheus.yaml" \
   > "${ADDONS}/prometheus.yaml"
@@ -77,7 +75,7 @@ function compressDashboard() {
   compressDashboard "istio-performance-dashboard.json"
   compressDashboard "istio-workload-dashboard.json"
   compressDashboard "istio-service-dashboard.json"
-  compressDashboard "istio-mesh-dashboard.json"
+  compressDashboard "istio-mesh-dashboard.gen.json"
   compressDashboard "istio-extension-dashboard.json"
   compressDashboard "ztunnel-dashboard.gen.json"
   echo -e "\n---\n"
@@ -92,7 +90,7 @@ function compressDashboard() {
     --dry-run=client -oyaml \
     --from-file=istio-workload-dashboard.json="${TMP}/istio-workload-dashboard.json" \
     --from-file=istio-service-dashboard.json="${TMP}/istio-service-dashboard.json" \
-    --from-file=istio-mesh-dashboard.json="${TMP}/istio-mesh-dashboard.json" \
+    --from-file=istio-mesh-dashboard.json="${TMP}/istio-mesh-dashboard.gen.json" \
     --from-file=istio-extension-dashboard.json="${TMP}/istio-extension-dashboard.json"
 } > "${ADDONS}/grafana.yaml"
 
@@ -104,3 +102,10 @@ function compressDashboard() {
     --repo https://grafana.github.io/helm-charts \
     -f "${WD}/values-loki.yaml"
 } > "${ADDONS}/loki.yaml"
+
+# Test that the dashboard links are using UIDs instead of paths
+if [[ -f "${DASHBOARDS}/test_dashboard_links.sh" ]]; then
+  echo "Testing dashboard links..."
+  chmod +x "${DASHBOARDS}/test_dashboard_links.sh"
+  "${DASHBOARDS}/test_dashboard_links.sh"
+fi

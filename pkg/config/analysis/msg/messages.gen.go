@@ -105,7 +105,7 @@ var (
 	SchemaWarning = diag.NewMessageType(diag.Warning, "IST0133", "Schema validation warning: %v")
 
 	// ServiceEntryAddressesRequired defines a diag.MessageType for message "ServiceEntryAddressesRequired".
-	// Description: Virtual IP addresses are required for ports serving TCP (or unset) protocol when ISTIO_META_DNS_AUTO_ALLOCATE is not set on a proxy
+	// Description: Virtual IP addresses are required for ports serving TCP (or unset) protocol when PILOT_ENABLE_IP_AUTOALLOCATE is not set on a proxy
 	ServiceEntryAddressesRequired = diag.NewMessageType(diag.Warning, "IST0134", "ServiceEntry addresses are required for this protocol.")
 
 	// DeprecatedAnnotation defines a diag.MessageType for message "DeprecatedAnnotation".
@@ -196,6 +196,10 @@ var (
 	// Description: The Gateway API CRD version is not supported
 	UnsupportedGatewayAPIVersion = diag.NewMessageType(diag.Error, "IST0156", "The Gateway API CRD version %v is lower than the minimum version: %v")
 
+	// FutureUnsupportedGatewayAPIVersion defines a diag.MessageType for message "FutureUnsupportedGatewayAPIVersion".
+	// Description: The Gateway API CRD version will not be supported in the future
+	FutureUnsupportedGatewayAPIVersion = diag.NewMessageType(diag.Warning, "IST0172", "The Gateway API CRD version %v is lower than the minimum version: %v")
+
 	// InvalidTelemetryProvider defines a diag.MessageType for message "InvalidTelemetryProvider".
 	// Description: The Telemetry with empty providers will be ignored
 	InvalidTelemetryProvider = diag.NewMessageType(diag.Warning, "IST0157", "The Telemetry %v in namespace %q with empty providers will be ignored.")
@@ -251,6 +255,18 @@ var (
 	// MultiClusterInconsistentService defines a diag.MessageType for message "MultiClusterInconsistentService".
 	// Description: The services live in different clusters under multi-cluster deployment model are inconsistent
 	MultiClusterInconsistentService = diag.NewMessageType(diag.Warning, "IST0170", "The service %v in namespace %q is inconsistent across clusters %q, which can lead to undefined behaviors. The inconsistent behaviors are: %v.")
+
+	// NegativeConditionStatus defines a diag.MessageType for message "NegativeConditionStatus".
+	// Description: A condition with a negative status is present
+	NegativeConditionStatus = diag.NewMessageType(diag.Warning, "IST0171", "A condition with a negative status is present: type=%s, reason=%s, message=%s.")
+
+	// DestinationRuleSubsetNotSelectPods defines a diag.MessageType for message "DestinationRuleSubsetNotSelectPods".
+	// Description: Subsets defined in destination does not select any pods.
+	DestinationRuleSubsetNotSelectPods = diag.NewMessageType(diag.Error, "IST0173", "The Subset %s defined in the DestinationRule does not select any pods. Which may lead to 503 UH (NoHealthyUpstream).")
+
+	// UnknownDestinationRuleHost defines a diag.MessageType for message "UnknownDestinationRuleHost".
+	// Description: Host defined in destination rule does not match any services in the mesh.
+	UnknownDestinationRuleHost = diag.NewMessageType(diag.Warning, "IST0174", "The host %s defined in the DestinationRule does not match any services in the mesh.")
 )
 
 // All returns a list of all known message types.
@@ -303,6 +319,7 @@ func All() []*diag.MessageType {
 		EnvoyFilterUsesRemoveOperationIncorrectly,
 		EnvoyFilterUsesRelativeOperationWithProxyVersion,
 		UnsupportedGatewayAPIVersion,
+		FutureUnsupportedGatewayAPIVersion,
 		InvalidTelemetryProvider,
 		PodsIstioProxyImageMismatchInNamespace,
 		ConflictingTelemetryWorkloadSelectors,
@@ -317,6 +334,9 @@ func All() []*diag.MessageType {
 		UnknownUpgradeCompatibility,
 		UpdateIncompatibility,
 		MultiClusterInconsistentService,
+		NegativeConditionStatus,
+		DestinationRuleSubsetNotSelectPods,
+		UnknownDestinationRuleHost,
 	}
 }
 
@@ -775,6 +795,16 @@ func NewUnsupportedGatewayAPIVersion(r *resource.Instance, version string, minim
 	)
 }
 
+// NewFutureUnsupportedGatewayAPIVersion returns a new diag.Message based on FutureUnsupportedGatewayAPIVersion.
+func NewFutureUnsupportedGatewayAPIVersion(r *resource.Instance, version string, minimumVersion string) diag.Message {
+	return diag.NewMessage(
+		FutureUnsupportedGatewayAPIVersion,
+		r,
+		version,
+		minimumVersion,
+	)
+}
+
 // NewInvalidTelemetryProvider returns a new diag.Message based on InvalidTelemetryProvider.
 func NewInvalidTelemetryProvider(r *resource.Instance, name string, namespace string) diag.Message {
 	return diag.NewMessage(
@@ -917,5 +947,34 @@ func NewMultiClusterInconsistentService(r *resource.Instance, serviceName string
 		namespace,
 		clusters,
 		error,
+	)
+}
+
+// NewNegativeConditionStatus returns a new diag.Message based on NegativeConditionStatus.
+func NewNegativeConditionStatus(r *resource.Instance, conditionType string, reason string, message string) diag.Message {
+	return diag.NewMessage(
+		NegativeConditionStatus,
+		r,
+		conditionType,
+		reason,
+		message,
+	)
+}
+
+// NewDestinationRuleSubsetNotSelectPods returns a new diag.Message based on DestinationRuleSubsetNotSelectPods.
+func NewDestinationRuleSubsetNotSelectPods(r *resource.Instance, subset string) diag.Message {
+	return diag.NewMessage(
+		DestinationRuleSubsetNotSelectPods,
+		r,
+		subset,
+	)
+}
+
+// NewUnknownDestinationRuleHost returns a new diag.Message based on UnknownDestinationRuleHost.
+func NewUnknownDestinationRuleHost(r *resource.Instance, host string) diag.Message {
+	return diag.NewMessage(
+		UnknownDestinationRuleHost,
+		r,
+		host,
 	)
 }

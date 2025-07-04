@@ -40,6 +40,7 @@ type ZtunnelWorkload struct {
 	Network               string            `json:"network,omitempty"`
 	Status                string            `json:"status"`
 	Hostname              string            `json:"hostname"`
+	Capacity              uint32            `json:"capacity"`
 	ApplicationTunnel     ApplicationTunnel `json:"applicationTunnel,omitempty"`
 	AuthorizationPolicies []string          `json:"authorizationPolicies,omitempty"`
 }
@@ -56,6 +57,7 @@ type GatewayAddress struct {
 type LoadBalancer struct {
 	Mode               string   `json:"mode"`
 	RoutingPreferences []string `json:"routingPreferences"`
+	HealthPolicy       string   `json:"healthPolicy"`
 }
 
 type ZtunnelEndpoint struct {
@@ -66,27 +68,31 @@ type ZtunnelEndpoint struct {
 }
 
 type ZtunnelService struct {
-	Name         string                      `json:"name"`
-	Namespace    string                      `json:"namespace"`
-	Hostname     string                      `json:"hostname"`
-	Addresses    []string                    `json:"vips"`
-	Ports        map[string]int              `json:"ports"`
-	LoadBalancer *LoadBalancer               `json:"loadBalancer"`
-	Waypoint     *GatewayAddress             `json:"waypoint"`
-	Endpoints    map[string]*ZtunnelEndpoint `json:"endpoints"`
+	Name            string                      `json:"name"`
+	Namespace       string                      `json:"namespace"`
+	Hostname        string                      `json:"hostname"`
+	Addresses       []string                    `json:"vips"`
+	Ports           map[string]int              `json:"ports"`
+	LoadBalancer    *LoadBalancer               `json:"loadBalancer,omitempty"`
+	Waypoint        *GatewayAddress             `json:"waypoint,omitempty"`
+	Endpoints       map[string]*ZtunnelEndpoint `json:"endpoints"`
+	SubjectAltNames []string                    `json:"subjectAltNames,omitempty"`
+	IPFamilies      string                      `json:"ipFamilies"`
 }
 
 type PolicyMatch struct {
-	Namespaces          []StringMatch `json:"namespaces,omitempty"`
-	NotNamespaces       []StringMatch `json:"notNamespaces,omitempty"`
-	Principals          []StringMatch `json:"principals,omitempty"`
-	NotPrincipals       []StringMatch `json:"notPrincipals,omitempty"`
-	SourceIps           []string      `json:"sourceIps,omitempty"`
-	NotSourceIps        []string      `json:"notSourceIps,omitempty"`
-	DestinationIps      []string      `json:"destinationIps,omitempty"`
-	NotDestinationIps   []string      `json:"notDestinationIps,omitempty"`
-	DestinationPorts    []uint16      `json:"destinationPorts,omitempty"`
-	NotDestinationPorts []uint16      `json:"notDestinationPorts,omitempty"`
+	Namespaces          []StringMatch         `json:"namespaces,omitempty"`
+	NotNamespaces       []StringMatch         `json:"notNamespaces,omitempty"`
+	Principals          []StringMatch         `json:"principals,omitempty"`
+	NotPrincipals       []StringMatch         `json:"notPrincipals,omitempty"`
+	SourceIps           []string              `json:"sourceIps,omitempty"`
+	NotSourceIps        []string              `json:"notSourceIps,omitempty"`
+	DestinationIps      []string              `json:"destinationIps,omitempty"`
+	NotDestinationIps   []string              `json:"notDestinationIps,omitempty"`
+	DestinationPorts    []uint16              `json:"destinationPorts,omitempty"`
+	NotDestinationPorts []uint16              `json:"notDestinationPorts,omitempty"`
+	ServiceAccounts     []ServiceAccountMatch `json:"serviceAccounts,omitempty"`
+	NotServiceAccounts  []ServiceAccountMatch `json:"notServiceAccounts,omitempty"`
 }
 
 type StringMatch struct {
@@ -94,6 +100,11 @@ type StringMatch struct {
 	Suffix   string `json:"Suffix,omitempty"`
 	Prefix   string `json:"Prefix,omitempty"`
 	Presence any    `json:"Presence,omitempty"`
+}
+
+type ServiceAccountMatch struct {
+	Namespace      string `json:"namespace"`
+	ServiceAccount string `json:"serviceAccount"`
 }
 
 type ZtunnelPolicy struct {
@@ -116,6 +127,7 @@ type CertsDump struct {
 	Identity  string  `json:"identity"`
 	State     string  `json:"state"`
 	CertChain []*Cert `json:"certChain"`
+	RootCert  []*Cert `json:"rootCerts"`
 }
 
 type Cert struct {
@@ -147,12 +159,14 @@ type InboundConnection struct {
 	Src         string `json:"src"`
 	OriginalDst string `json:"originalDst"`
 	ActualDst   string `json:"actualDst"`
+	Protocol    string `json:"protocol"`
 }
 
 type OutboundConnection struct {
 	Src         string `json:"src"`
 	OriginalDst string `json:"originalDst"`
 	ActualDst   string `json:"actualDst"`
+	Protocol    string `json:"protocol"`
 }
 
 type WorkloadConnection struct {

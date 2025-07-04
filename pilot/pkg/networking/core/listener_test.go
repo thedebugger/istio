@@ -26,9 +26,9 @@ import (
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
+	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	tracing "github.com/envoyproxy/go-control-plane/envoy/type/tracing/v3"
 	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/conversion"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -43,12 +43,14 @@ import (
 	telemetry "istio.io/api/telemetry/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/listenertest"
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
@@ -57,6 +59,7 @@ import (
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -234,13 +237,48 @@ func TestInboundListenerConfig(t *testing.T) {
 			MeshConfig: mc,
 			Configs:    filterTestConfigs,
 		}
+
+		httpFilters := []string{
+			xdsfilters.MxFilterName,
+			// Ext auth makes 2 filters
+			wellknown.HTTPRoleBasedAccessControl,
+			wellknown.HTTPExternalAuthorization,
+			"extensions.istio.io/wasmplugin/istio-system.wasm-authn",
+			"extensions.istio.io/wasmplugin/istio-system.wasm-authz",
+			wellknown.HTTPRoleBasedAccessControl,
+			"extensions.istio.io/wasmplugin/istio-system.wasm-stats",
+			wellknown.HTTPGRPCStats,
+			xdsfilters.Fault.Name,
+			xdsfilters.Cors.Name,
+			xds.StatsFilterName,
+			wellknown.Router,
+		}
+		httpNetworkFilters := []string{
+			xdsfilters.MxFilterName,
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+			wellknown.HTTPConnectionManager,
+		}
+		tcpNetworkFilters := []string{
+			xdsfilters.MxFilterName,
+			// Ext auth makes 2 filters
+			wellknown.RoleBasedAccessControl,
+			wellknown.ExternalAuthorization,
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+			wellknown.RoleBasedAccessControl,
+			"extensions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+			xds.StatsFilterName,
+			wellknown.TCPProxy,
+		}
 		cg := NewConfigGenTest(t, o)
 		p := getProxy()
 		for _, s := range o.Services {
 			i := &model.ServiceInstance{
 				Service: s,
 				Endpoint: &model.IstioEndpoint{
-					Address:      "1.1.1.1",
+					Addresses:    []string{"1.1.1.1"},
 					EndpointPort: uint32(s.Ports[0].Port),
 				},
 				ServicePort: s.Ports[0],
@@ -250,40 +288,58 @@ func TestInboundListenerConfig(t *testing.T) {
 		listeners := cg.Listeners(cg.SetupProxy(p))
 		xdstest.ValidateListeners(t, listeners)
 		l := xdstest.ExtractListener(model.VirtualInboundListenerName, listeners)
-		httpFilters := []string{
-			xdsfilters.MxFilterName,
-			// Ext auth makes 2 filters
-			wellknown.HTTPRoleBasedAccessControl,
-			wellknown.HTTPExternalAuthorization,
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
-			wellknown.HTTPRoleBasedAccessControl,
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
-			wellknown.HTTPGRPCStats,
-			xdsfilters.Fault.Name,
-			xdsfilters.Cors.Name,
-			xds.StatsFilterName,
-			wellknown.Router,
+		verifyInboundFilterChains(t, l, httpFilters, httpNetworkFilters, tcpNetworkFilters)
+		// verifyInboundFilterChains only checks the passthrough. Ensure the main filters get created as expected, too.
+		listenertest.VerifyListener(t, l, listenertest.ListenerTest{
+			FilterChains: []listenertest.FilterChainTest{
+				{
+					Name:           "0.0.0.0_8080",
+					Type:           listenertest.MTLSHTTP,
+					HTTPFilters:    httpFilters,
+					NetworkFilters: httpNetworkFilters,
+					TotalMatch:     true,
+				},
+				{
+					Name:           "0.0.0.0_8080",
+					Type:           listenertest.PlainTCP,
+					HTTPFilters:    httpFilters,
+					NetworkFilters: httpNetworkFilters,
+					TotalMatch:     true,
+				},
+				{
+					Name:           "0.0.0.0_1234",
+					Type:           listenertest.StandardTLS,
+					HTTPFilters:    []string{},
+					NetworkFilters: tcpNetworkFilters,
+					TotalMatch:     true,
+				},
+				{
+					Name:           "0.0.0.0_1234",
+					Type:           listenertest.PlainTCP,
+					HTTPFilters:    []string{},
+					NetworkFilters: tcpNetworkFilters,
+					TotalMatch:     true,
+				},
+			},
+		})
+
+		// test instance with multiple addresses
+		cg = NewConfigGenTest(t, o)
+		p = getProxy()
+		for _, s := range o.Services {
+			i := &model.ServiceInstance{
+				Service: s,
+				Endpoint: &model.IstioEndpoint{
+					Addresses:    []string{"1.1.1.1", "2001:1::1"},
+					EndpointPort: uint32(s.Ports[0].Port),
+				},
+				ServicePort: s.Ports[0],
+			}
+			cg.MemRegistry.AddInstance(i)
 		}
-		httpNetworkFilters := []string{
-			xdsfilters.MxFilterName,
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
-			wellknown.HTTPConnectionManager,
-		}
-		tcpNetworkFilters := []string{
-			xdsfilters.MxFilterName,
-			// Ext auth makes 2 filters
-			wellknown.RoleBasedAccessControl,
-			wellknown.ExternalAuthorization,
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-			wellknown.RoleBasedAccessControl,
-			"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
-			xds.StatsFilterName,
-			wellknown.TCPProxy,
-		}
+		listeners = cg.Listeners(cg.SetupProxy(p))
+		xdstest.ValidateListeners(t, listeners)
+		l = xdstest.ExtractListener(model.VirtualInboundListenerName, listeners)
 		verifyInboundFilterChains(t, l, httpFilters, httpNetworkFilters, tcpNetworkFilters)
 		// verifyInboundFilterChains only checks the passthrough. Ensure the main filters get created as expected, too.
 		listenertest.VerifyListener(t, l, listenertest.ListenerTest{
@@ -974,11 +1030,12 @@ func TestInboundHTTPListenerConfig(t *testing.T) {
 							},
 							ValidateHCM: func(t test.Failer, hcm *hcm.HttpConnectionManager) {
 								assert.Equal(t, "istio-envoy", hcm.GetServerName(), "server name")
+								statPrefixDelimeter := constants.StatPrefixDelimiter
 								if len(tt.cfg) == 0 {
-									assert.Equal(t, "inbound_0.0.0.0_8080", hcm.GetStatPrefix(), "stat prefix")
+									assert.Equal(t, "inbound_0.0.0.0_8080"+statPrefixDelimeter, hcm.GetStatPrefix(), "stat prefix")
 								} else {
 									// Sidecar impacts stat prefix
-									assert.Equal(t, "inbound_1.1.1.1_8080", hcm.GetStatPrefix(), "stat prefix")
+									assert.Equal(t, "inbound_1.1.1.1_8080"+statPrefixDelimeter, hcm.GetStatPrefix(), "stat prefix")
 								}
 								assert.Equal(t, "APPEND_FORWARD", hcm.GetForwardClientCertDetails().String(), "forward client cert details")
 								assert.Equal(t, true, hcm.GetSetCurrentClientCertDetails().GetSubject().GetValue(), "subject")
@@ -1123,9 +1180,9 @@ func TestOutboundFilters(t *testing.T) {
 					TotalMatch: true,
 					HTTPFilters: []string{
 						xdsfilters.MxFilterName,
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-authn",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-authz",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-stats",
 						wellknown.HTTPGRPCStats,
 						xdsfilters.AlpnFilterName,
 						xdsfilters.Fault.Name,
@@ -1134,9 +1191,9 @@ func TestOutboundFilters(t *testing.T) {
 						wellknown.Router,
 					},
 					NetworkFilters: []string{
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-stats",
 						wellknown.HTTPConnectionManager,
 					},
 				},
@@ -1159,9 +1216,9 @@ func TestOutboundFilters(t *testing.T) {
 				{
 					TotalMatch: true,
 					NetworkFilters: []string{
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-						"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+						"extensions.istio.io/wasmplugin/istio-system.wasm-network-stats",
 						xds.StatsFilterName,
 						wellknown.TCPProxy,
 					},
@@ -1673,7 +1730,7 @@ func testOutboundListenerRoute(t *testing.T, services ...*model.Service) {
 		}
 
 		f := l.FilterChains[0].Filters[0]
-		cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+		cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 		rds := cfg.Fields["rds"].GetStructValue().Fields["route_config_name"].GetStringValue()
 		if rds != "8080" {
 			t.Fatalf("expect routes %s, found %s", "8080", rds)
@@ -1684,7 +1741,7 @@ func testOutboundListenerRoute(t *testing.T, services ...*model.Service) {
 			t.Fatalf("expect listener %s", "1.2.3.4_8080")
 		}
 		f = l.FilterChains[0].Filters[0]
-		cfg, _ = conversion.MessageToStruct(f.GetTypedConfig())
+		cfg, _ = protomarshal.MessageToStructSlow(f.GetTypedConfig())
 		rds = cfg.Fields["rds"].GetStructValue().Fields["route_config_name"].GetStringValue()
 		if rds != "test1.com:8080" {
 			t.Fatalf("expect routes %s, found %s", "test1.com:8080", rds)
@@ -1695,7 +1752,7 @@ func testOutboundListenerRoute(t *testing.T, services ...*model.Service) {
 			t.Fatalf("expect listener %s", "3.4.5.6_8080")
 		}
 		f = l.FilterChains[0].Filters[0]
-		cfg, _ = conversion.MessageToStruct(f.GetTypedConfig())
+		cfg, _ = protomarshal.MessageToStructSlow(f.GetTypedConfig())
 		rds = cfg.Fields["rds"].GetStructValue().Fields["route_config_name"].GetStringValue()
 		if rds != "test3.com:8080" {
 			t.Fatalf("expect routes %s, found %s", "test3.com:8080", rds)
@@ -1755,7 +1812,7 @@ func testOutboundListenerConflict(t *testing.T, services ...*model.Service) {
 			}
 
 			verifyHTTPFilterChainMatch(t, listeners[0].FilterChains[0])
-			verifyListenerFilters(t, listeners[0].ListenerFilters)
+			verifyHTTPListenerFilters(t, listeners[0].ListenerFilters)
 
 			if listeners[0].ListenerFiltersTimeout.GetSeconds() != 5 {
 				t.Fatalf("expected timeout 5s, found  ListenerFiltersTimeout %v",
@@ -1763,7 +1820,7 @@ func testOutboundListenerConflict(t *testing.T, services ...*model.Service) {
 			}
 
 			f := listeners[0].FilterChains[0].Filters[0]
-			cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+			cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 			rds := cfg.Fields["rds"].GetStructValue().Fields["route_config_name"].GetStringValue()
 			expect := fmt.Sprintf("%d", oldestService.Ports[0].Port)
 			if rds != expect {
@@ -1774,14 +1831,14 @@ func testOutboundListenerConflict(t *testing.T, services ...*model.Service) {
 				t.Fatalf("expected %d filter chains, found %d", 1, len(listeners[0].FilterChains))
 			}
 			if listeners[0].DefaultFilterChain == nil {
-				t.Fatalf("expected default filter chains, found none")
+				t.Fatal("expected default filter chains, found none")
 			}
 
 			_ = getTCPFilterChain(t, listeners[0])
 			http := getHTTPFilterChain(t, listeners[0])
 
 			verifyHTTPFilterChainMatch(t, http)
-			verifyListenerFilters(t, listeners[0].ListenerFilters)
+			verifyHTTPListenerFilters(t, listeners[0].ListenerFilters)
 
 			if listeners[0].ListenerFiltersTimeout == nil {
 				t.Fatalf("expected timeout, found ContinueOnListenerFiltersTimeout %v, ListenerFiltersTimeout %v",
@@ -1809,7 +1866,7 @@ func getTCPFilterChain(t *testing.T, l *listener.Listener) *listener.FilterChain
 			}
 		}
 	}
-	t.Fatalf("tcp filter chain not found")
+	t.Fatal("tcp filter chain not found")
 	return nil
 }
 
@@ -1840,7 +1897,7 @@ func getHTTPFilterChain(t *testing.T, l *listener.Listener) *listener.FilterChai
 			}
 		}
 	}
-	t.Fatalf("tcp filter chain not found")
+	t.Fatal("tcp filter chain not found")
 	return nil
 }
 
@@ -1856,7 +1913,7 @@ func testInboundListenerConfigWithConflictPort(t *testing.T, proxy *model.Proxy,
 	virtualListener := xdstest.ExtractListener(model.VirtualInboundListenerName, listeners)
 	for _, fc := range virtualListener.FilterChains {
 		if fc.FilterChainMatch.DestinationPort.GetValue() == 15021 {
-			t.Fatalf("port 15021 should not be included in inbound listener")
+			t.Fatal("port 15021 should not be included in inbound listener")
 		}
 	}
 }
@@ -2038,13 +2095,12 @@ func testInboundListenerConfigWithoutService(t *testing.T, proxy *model.Proxy) {
 	verifyFilterChainMatch(t, l)
 }
 
-func verifyListenerFilters(t *testing.T, lfilters []*listener.ListenerFilter) {
+func verifyHTTPListenerFilters(t *testing.T, lfilters []*listener.ListenerFilter) {
 	t.Helper()
-	if len(lfilters) != 2 {
-		t.Fatalf("expected %d listener filter, found %d", 2, len(lfilters))
+	if len(lfilters) != 1 {
+		t.Fatalf("expected %d listener filter, found %d", 1, len(lfilters))
 	}
-	if lfilters[0].Name != wellknown.TLSInspector ||
-		lfilters[1].Name != wellknown.HTTPInspector {
+	if lfilters[0].Name != wellknown.HTTPInspector {
 		t.Fatalf("expected listener filters not found, got %v", lfilters)
 	}
 }
@@ -2153,7 +2209,7 @@ func testOutboundListenerConfigWithSidecar(t *testing.T, services ...*model.Serv
 		}
 
 		verifyHTTPFilterChainMatch(t, l.FilterChains[0])
-		verifyListenerFilters(t, l.ListenerFilters)
+		verifyHTTPListenerFilters(t, l.ListenerFilters)
 
 		if l := findListenerByPort(listeners, 3306); !isMysqlListener(l) {
 			t.Fatalf("expected MySQL listener on port 3306, found %v", l)
@@ -2176,7 +2232,7 @@ func testOutboundListenerConfigWithSidecar(t *testing.T, services ...*model.Serv
 		}
 
 		verifyHTTPFilterChainMatch(t, l.FilterChains[0])
-		verifyListenerFilters(t, l.ListenerFilters)
+		verifyHTTPListenerFilters(t, l.ListenerFilters)
 	}
 }
 
@@ -2207,11 +2263,11 @@ func TestVirtualListeners_TrafficRedirectionEnabled(t *testing.T) {
 			listeners := buildListeners(t, TestOptions{}, &model.Proxy{Metadata: &model.NodeMetadata{InterceptionMode: tc.mode}})
 
 			if l := xdstest.ExtractListener(model.VirtualInboundListenerName, listeners); l == nil {
-				t.Fatalf("did not generate virtual inbound listener")
+				t.Fatal("did not generate virtual inbound listener")
 			}
 
 			if l := xdstest.ExtractListener(model.VirtualOutboundListenerName, listeners); l == nil {
-				t.Fatalf("did not generate virtual outbound listener")
+				t.Fatal("did not generate virtual outbound listener")
 			}
 		})
 	}
@@ -2220,11 +2276,11 @@ func TestVirtualListeners_TrafficRedirectionEnabled(t *testing.T) {
 func TestVirtualListeners_TrafficRedirectionDisabled(t *testing.T) {
 	listeners := buildListeners(t, TestOptions{}, &model.Proxy{Metadata: &model.NodeMetadata{InterceptionMode: model.InterceptionNone}})
 	if l := xdstest.ExtractListener(model.VirtualInboundListenerName, listeners); l != nil {
-		t.Fatalf("unexpectedly generated virtual inbound listener")
+		t.Fatal("unexpectedly generated virtual inbound listener")
 	}
 
 	if l := xdstest.ExtractListener(model.VirtualOutboundListenerName, listeners); l != nil {
-		t.Fatalf("unexpectedly generated virtual outbound listener")
+		t.Fatal("unexpectedly generated virtual outbound listener")
 	}
 }
 
@@ -2262,7 +2318,7 @@ func TestListenerAccessLogs(t *testing.T) {
 func validateAccessLog(t *testing.T, l *listener.Listener, format string) {
 	t.Helper()
 	if l == nil {
-		t.Fatalf("nil listener")
+		t.Fatal("nil listener")
 	}
 
 	fc := &tcp.TcpProxy{}
@@ -2272,7 +2328,7 @@ func validateAccessLog(t *testing.T, l *listener.Listener, format string) {
 	if fc.AccessLog == nil {
 		t.Fatal("expected access log configuration")
 	}
-	cfg, _ := conversion.MessageToStruct(fc.AccessLog[0].GetTypedConfig())
+	cfg, _ := protomarshal.MessageToStructSlow(fc.AccessLog[0].GetTypedConfig())
 	textFormat := cfg.GetFields()["log_format"].GetStructValue().GetFields()["text_format_source"].GetStructValue().
 		GetFields()["inline_string"].GetStringValue()
 	if format != "" && textFormat != format {
@@ -2285,15 +2341,16 @@ func TestHttpProxyListener(t *testing.T) {
 	m.ProxyHttpPort = 15007
 	listeners := buildListeners(t, TestOptions{MeshConfig: m}, nil)
 	httpProxy := xdstest.ExtractListener("127.0.0.1_15007", listeners)
-	t.Logf(xdstest.Dump(t, httpProxy))
 	f := httpProxy.FilterChains[0].Filters[0]
-	cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+	cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 
 	if httpProxy.Address.GetSocketAddress().GetPortValue() != 15007 {
+		t.Log(xdstest.Dump(t, httpProxy))
 		t.Fatalf("expected http proxy is not listening on %d, but on port %d", 15007,
 			httpProxy.Address.GetSocketAddress().GetPortValue())
 	}
 	if !strings.HasPrefix(cfg.Fields["stat_prefix"].GetStringValue(), "outbound_") {
+		t.Log(xdstest.Dump(t, httpProxy))
 		t.Fatalf("expected http proxy stat prefix to have outbound, %s", cfg.Fields["stat_prefix"].GetStringValue())
 	}
 }
@@ -2302,7 +2359,7 @@ func TestHttpProxyListenerPerWorkload(t *testing.T) {
 	listeners := buildListeners(t, TestOptions{}, &model.Proxy{Metadata: &model.NodeMetadata{HTTPProxyPort: "15007"}})
 	httpProxy := xdstest.ExtractListener("127.0.0.1_15007", listeners)
 	f := httpProxy.FilterChains[0].Filters[0]
-	cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+	cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 
 	if httpProxy.Address.GetSocketAddress().GetPortValue() != 15007 {
 		t.Fatalf("expected http proxy is not listening on %d, but on port %d", 15007,
@@ -2698,7 +2755,7 @@ func TestOutboundListenerConfig_TCPFailThrough(t *testing.T) {
 	listeners := buildListeners(t, TestOptions{Services: services}, nil)
 	l := xdstest.ExtractListener("0.0.0.0_8080", listeners)
 	if l == nil {
-		t.Fatalf("failed to find listener")
+		t.Fatal("failed to find listener")
 	}
 	if len(l.FilterChains) != 1 {
 		t.Fatalf("expected %d filter chains, found %d", 1, len(l.FilterChains))
@@ -2706,14 +2763,14 @@ func TestOutboundListenerConfig_TCPFailThrough(t *testing.T) {
 
 	verifyHTTPFilterChainMatch(t, l.FilterChains[0])
 	verifyPassThroughTCPFilterChain(t, l.DefaultFilterChain)
-	verifyListenerFilters(t, l.ListenerFilters)
+	verifyHTTPListenerFilters(t, l.ListenerFilters)
 }
 
 func verifyPassThroughTCPFilterChain(t *testing.T, fc *listener.FilterChain) {
 	t.Helper()
 	f := fc.Filters[0]
 	expectedStatPrefix := util.PassthroughCluster
-	cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+	cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 	statPrefix := cfg.Fields["stat_prefix"].GetStringValue()
 	if statPrefix != expectedStatPrefix {
 		t.Fatalf("expected listener to contain stat_prefix %s, found %s", expectedStatPrefix, statPrefix)
@@ -2728,10 +2785,10 @@ func verifyOutboundTCPListenerHostname(t *testing.T, l *listener.Listener, hostn
 	fc := l.FilterChains[0]
 	f := getTCPFilter(fc)
 	if f == nil {
-		t.Fatalf("expected TCP filters, found none")
+		t.Fatal("expected TCP filters, found none")
 	}
 	expectedStatPrefix := fmt.Sprintf("outbound|8080||%s", hostname)
-	cfg, _ := conversion.MessageToStruct(f.GetTypedConfig())
+	cfg, _ := protomarshal.MessageToStructSlow(f.GetTypedConfig())
 	statPrefix := cfg.Fields["stat_prefix"].GetStringValue()
 	if statPrefix != expectedStatPrefix {
 		t.Fatalf("expected listener to contain stat_prefix %s, found %s", expectedStatPrefix, statPrefix)
@@ -2928,7 +2985,7 @@ func buildServiceWithPort(hostname string, port int, protocol protocol.Instance,
 func buildServiceInstance(service *model.Service, instanceIP string) *model.ServiceInstance {
 	return &model.ServiceInstance{
 		Endpoint: &model.IstioEndpoint{
-			Address:         instanceIP,
+			Addresses:       []string{instanceIP},
 			ServicePortName: service.Ports[0].Name,
 		},
 		ServicePort: service.Ports[0],
@@ -3041,6 +3098,212 @@ func TestOutboundListenerConfig_WithAutoAllocatedAddress(t *testing.T) {
 						t.Errorf("Expected %d listeners on service port 79, got %d (%v)", tt.numListenersOnServicePort, len(listenersToCheck), listenersToCheck)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestListenerTransportSocketConnectTimeoutForSidecar(t *testing.T) {
+	cases := []struct {
+		name            string
+		expectedTimeout int64
+		services        []*model.Service
+	}{
+		{
+			name:            "should set timeout",
+			expectedTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout).GetSeconds(),
+			services: []*model.Service{
+				buildService("test.com", "1.2.3.4", protocol.TCP, tnow.Add(1*time.Second)),
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			p := getProxy()
+			listeners := buildOutboundListeners(t, p, nil, nil, tt.services...)
+			for _, l := range listeners {
+				for _, fc := range l.FilterChains {
+					if fc.TransportSocketConnectTimeout == nil || fc.TransportSocketConnectTimeout.Seconds != tt.expectedTimeout {
+						t.Errorf("expected transport socket connect timeout to be %v for listener %s filter chain %s, got %v",
+							tt.expectedTimeout, l.Name, fc.Name, fc.TransportSocketConnectTimeout)
+					}
+				}
+				if l.DefaultFilterChain != nil {
+					fc := l.DefaultFilterChain
+					if fc.TransportSocketConnectTimeout == nil || fc.TransportSocketConnectTimeout.Seconds != tt.expectedTimeout {
+						t.Errorf("expected transport socket connect timeout to be %v for listener %s default filter chain, got %v",
+							tt.expectedTimeout, l.Name, fc.TransportSocketConnectTimeout)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestBuildListenerTLSContext(t *testing.T) {
+	tests := []struct {
+		name                    string
+		serverTLSSettings       *networking.ServerTLSSettings
+		proxy                   *model.Proxy
+		mesh                    *meshconfig.MeshConfig
+		transportProtocol       istionetworking.TransportProtocol
+		gatewayTCPServerWithTLS bool
+		expectedCertCount       int
+		expectedValidation      bool
+	}{
+		{
+			name: "single certificate with credential name",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_SIMPLE,
+				CredentialName: "test-cert",
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       1,
+			expectedValidation:      false,
+		},
+		{
+			name: "multiple certificates with credential names",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_SIMPLE,
+				CredentialNames: []string{"rsa-cert", "ecdsa-cert"},
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       2,
+			expectedValidation:      false,
+		},
+		{
+			name: "multiple certificates with mutual TLS",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_MUTUAL,
+				CredentialNames: []string{"rsa-cert", "ecdsa-cert"},
+				SubjectAltNames: []string{"test.com"},
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       2,
+			expectedValidation:      true,
+		},
+		{
+			name: "SIMPLE and Server certificate",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_SIMPLE,
+				ServerCertificate: "/path/to/cert.pem",
+				PrivateKey:        "/path/to/key.pem",
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       1,
+			expectedValidation:      false,
+		},
+		{
+			name: "SIMPLE and TLS certificates",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode: networking.ServerTLSSettings_SIMPLE,
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "/path/to/cert.pem",
+						PrivateKey:        "/path/to/key.pem",
+					},
+					{
+						ServerCertificate: "/path/to/cert2.pem",
+						PrivateKey:        "/path/to/key2.pem",
+					},
+				},
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       2,
+			expectedValidation:      false,
+		},
+		{
+			name: "MUTUAL and server certificate",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:              networking.ServerTLSSettings_MUTUAL,
+				CaCertificates:    "/path/to/ca.pem",
+				ServerCertificate: "/path/to/cert.pem",
+				PrivateKey:        "/path/to/key.pem",
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       1,
+			expectedValidation:      true,
+		},
+		{
+			name: "MUTUAL and TLS certificates",
+			serverTLSSettings: &networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CaCertificates: "/path/to/ca.pem",
+				TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+					{
+						ServerCertificate: "/path/to/cert.pem",
+						PrivateKey:        "/path/to/key.pem",
+					},
+					{
+						ServerCertificate: "/path/to/cert2.pem",
+						PrivateKey:        "/path/to/key2.pem",
+					},
+				},
+			},
+			proxy: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			mesh:                    &meshconfig.MeshConfig{},
+			transportProtocol:       istionetworking.TransportProtocolTCP,
+			gatewayTCPServerWithTLS: false,
+			expectedCertCount:       2,
+			expectedValidation:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := BuildListenerTLSContext(tt.serverTLSSettings, tt.proxy, tt.mesh, tt.transportProtocol, tt.gatewayTCPServerWithTLS)
+
+			// Check certificate count
+			if len(ctx.CommonTlsContext.TlsCertificateSdsSecretConfigs) != tt.expectedCertCount {
+				t.Errorf("expected %d certificates, got %d", tt.expectedCertCount, len(ctx.CommonTlsContext.TlsCertificateSdsSecretConfigs))
+			}
+
+			// Check validation context
+			if tt.expectedValidation {
+				if ctx.CommonTlsContext.ValidationContextType == nil {
+					t.Error("expected validation context to be set")
+				}
+				combinedCtx, ok := ctx.CommonTlsContext.ValidationContextType.(*tls.CommonTlsContext_CombinedValidationContext)
+				if !ok {
+					t.Error("expected CombinedValidationContext")
+				}
+				if combinedCtx.CombinedValidationContext == nil {
+					t.Error("expected CombinedValidationContext to be set")
+				}
+			} else if ctx.CommonTlsContext.ValidationContextType != nil {
+				t.Error("unexpected validation context")
 			}
 		})
 	}

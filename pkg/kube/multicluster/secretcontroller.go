@@ -35,6 +35,8 @@ import (
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/monitoring"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
 )
 
 const (
@@ -181,6 +183,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 			c.secrets.Start(stopCh)
 		}
 		if !kube.WaitForCacheSync("multicluster remote secrets", stopCh, c.secrets.HasSynced) {
+			c.queue.ShutDownEarly()
 			return
 		}
 		log.Infof("multicluster remote secrets controller cache synced in %v", time.Since(t0))
@@ -233,7 +236,9 @@ func DefaultBuildClientsFromConfig(kubeConfig []byte, clusterID cluster.ID, conf
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kube clients: %v", err)
 	}
-	if features.WorkloadEntryCrossCluster {
+
+	// We need to read remote gateways in ambient multicluster mode
+	if features.WorkloadEntryCrossCluster || features.EnableAmbientMultiNetwork {
 		clients = kube.EnableCrdWatcher(clients)
 	}
 
@@ -382,4 +387,10 @@ func (c *Controller) GetRemoteKubeClient(clusterID cluster.ID) kubernetes.Interf
 		return remoteCluster.Client.Kube()
 	}
 	return nil
+}
+
+func (c *Controller) ListClusters() []cluster.ID {
+	return slices.Map(sets.SortedList(c.cs.clusters), func(e string) cluster.ID {
+		return cluster.ID(e)
+	})
 }

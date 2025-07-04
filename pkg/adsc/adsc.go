@@ -34,7 +34,6 @@ import (
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"github.com/envoyproxy/go-control-plane/pkg/conversion"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -69,6 +68,9 @@ const (
 )
 
 type Config struct {
+	// Is the name of the client for user-facing logs. If not set, Address will be used
+	ClientName string
+
 	// Address of the xDS server
 	Address string
 
@@ -292,7 +294,7 @@ func setDefaultConfig(config *Config) Config {
 
 // Dial connects to a ADS server, with optional MTLS authentication if a cert dir is specified.
 func (a *ADSC) Dial() error {
-	conn, err := dialWithConfig(&a.cfg.Config)
+	conn, err := dialWithConfig(context.Background(), &a.cfg.Config)
 	if err != nil {
 		return err
 	}
@@ -300,7 +302,7 @@ func (a *ADSC) Dial() error {
 	return nil
 }
 
-func dialWithConfig(config *Config) (*grpc.ClientConn, error) {
+func dialWithConfig(ctx context.Context, config *Config) (*grpc.ClientConn, error) {
 	defaultGrpcDialOptions := defaultGrpcDialOptions()
 	var grpcDialOptions []grpc.DialOption
 	grpcDialOptions = append(grpcDialOptions, defaultGrpcDialOptions...)
@@ -322,7 +324,7 @@ func dialWithConfig(config *Config) (*grpc.ClientConn, error) {
 		grpcDialOptions = append(grpcDialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.Dial(config.Address, grpcDialOptions...)
+	conn, err := grpc.DialContext(ctx, config.Address, grpcDialOptions...)
 	if err != nil {
 		return nil, err
 	}
@@ -627,7 +629,7 @@ func (a *ADSC) handleLDS(ll []*listener.Listener) {
 		switch filter.Name {
 		case wellknown.TCPProxy:
 			lt[l.Name] = l
-			config, _ := conversion.MessageToStruct(filter.GetTypedConfig())
+			config, _ := protomarshal.MessageToStructSlow(filter.GetTypedConfig())
 			c := config.Fields["cluster"].GetStringValue()
 			adscLog.Debugf("TCP: %s -> %s", l.Name, c)
 		case wellknown.HTTPConnectionManager:

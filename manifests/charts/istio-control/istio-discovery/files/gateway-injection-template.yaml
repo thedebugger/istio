@@ -4,13 +4,16 @@ metadata:
   labels:
     service.istio.io/canonical-name: {{ index .ObjectMeta.Labels `service.istio.io/canonical-name` | default (index .ObjectMeta.Labels `app.kubernetes.io/name`) | default (index .ObjectMeta.Labels `app`) | default .DeploymentMeta.Name  | quote }}
     service.istio.io/canonical-revision: {{ index .ObjectMeta.Labels `service.istio.io/canonical-revision` | default (index .ObjectMeta.Labels `app.kubernetes.io/version`) | default (index .ObjectMeta.Labels `version`) | default "latest"  | quote }}
-  annotations: {
-    istio.io/rev: {{ .Revision | default "default" | quote }},
-    {{- if eq (len $containers) 1 }}
-    kubectl.kubernetes.io/default-logs-container: "{{ index $containers 0 }}",
-    kubectl.kubernetes.io/default-container: "{{ index $containers 0 }}",
-    {{ end }}
-  }
+  annotations:
+    istio.io/rev: {{ .Revision | default "default" | quote }}
+    {{- if ge (len $containers) 1 }}
+    {{- if not (isset .ObjectMeta.Annotations `kubectl.kubernetes.io/default-logs-container`) }}
+    kubectl.kubernetes.io/default-logs-container: "{{ index $containers 0 }}"
+    {{- end }}
+    {{- if not (isset .ObjectMeta.Annotations `kubectl.kubernetes.io/default-container`) }}
+    kubectl.kubernetes.io/default-container: "{{ index $containers 0 }}"
+    {{- end }}
+    {{- end }}
 spec:
   securityContext:
   {{- if .Values.gateways.securityContext }}
@@ -135,6 +138,10 @@ spec:
     - name: ISTIO_META_OWNER
       value: kubernetes://apis/{{ .TypeMeta.APIVersion }}/namespaces/{{ valueOrDefault .DeploymentMeta.Namespace `default` }}/{{ toLower .TypeMeta.Kind}}s/{{ .DeploymentMeta.Name }}
     {{- end}}
+    {{- if (isset .ObjectMeta.Annotations `sidecar.istio.io/bootstrapOverride`) }}
+    - name: ISTIO_BOOTSTRAP_OVERRIDE
+      value: "/etc/istio/custom-bootstrap/custom_bootstrap.json"
+    {{- end }}
     {{- if .Values.global.meshID }}
     - name: ISTIO_META_MESH_ID
       value: "{{ .Values.global.meshID }}"
@@ -178,6 +185,10 @@ spec:
     {{- end }}
     - mountPath: /var/lib/istio/data
       name: istio-data
+    {{ if (isset .ObjectMeta.Annotations `sidecar.istio.io/bootstrapOverride`) }}
+    - mountPath: /etc/istio/custom-bootstrap
+      name: custom-bootstrap-volume
+    {{- end }}
     # SDS channel between istioagent and Envoy
     - mountPath: /etc/istio/proxy
       name: istio-envoy
@@ -192,7 +203,7 @@ spec:
     - name: istio-podinfo
       mountPath: /etc/istio/pod
   volumes:
-  - emptyDir: {}
+  - emptyDir:
     name: workload-socket
   - emptyDir: {}
     name: credential-socket
@@ -203,6 +214,11 @@ spec:
   {{- else}}
   - emptyDir: {}
     name: workload-certs
+  {{- end }}
+  {{- if (isset .ObjectMeta.Annotations `sidecar.istio.io/bootstrapOverride`) }}
+  - name: custom-bootstrap-volume
+    configMap:
+      name: {{ annotation .ObjectMeta `sidecar.istio.io/bootstrapOverride` "" }}
   {{- end }}
   # SDS channel between istioagent and Envoy
   - emptyDir:
@@ -228,8 +244,16 @@ spec:
           audience: {{ .Values.global.sds.token.aud }}
   {{- if eq .Values.global.pilotCertProvider "istiod" }}
   - name: istiod-ca-cert
+  {{- if eq (.Values.pilot.env).ENABLE_CLUSTER_TRUST_BUNDLE_API true }}
+    projected:
+      sources:
+      - clusterTrustBundle:
+          name: istio.io:istiod-ca:{{ .Values.global.trustBundleName | default "root-cert" }}
+          path: root-cert.pem
+  {{- else }}
     configMap:
-      name: istio-ca-root-cert
+      name: {{ .Values.global.trustBundleName | default "istio-ca-root-cert" }}
+  {{- end }}
   {{- end }}
   {{- if .Values.global.mountMtlsCerts }}
   # Use the key and cert mounted to /etc/certs/ for the in-cluster mTLS communications.

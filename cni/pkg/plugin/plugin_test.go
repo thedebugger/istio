@@ -77,15 +77,38 @@ var mockConfTmpl = `{
 
     },
     "plugin_log_level": "debug",
-    "cni_event_address": "%s",
+    "cni_agent_run_dir": "%s",
     "ambient_enabled": %t,
+	"enablement_selectors": [
+		{
+			"podSelector": {
+				"matchLabels": {
+					"istio.io/dataplane-mode": "ambient"
+				}
+			}
+        },
+		{
+			"podSelector": {
+				"matchExpressions": [
+					{
+						"key": "istio.io/dataplane-mode",
+						"operator": "NotIn",
+						"values": ["none"]
+					}
+				]
+			},
+			"namespaceSelector": {
+				"matchLabels": {
+					"istio.io/dataplane-mode": "ambient"
+				}
+			}
+		}
+	],
+	"exclude_namespaces": ["testExcludeNS"],
     "kubernetes": {
         "k8s_api_root": "APIRoot",
         "kubeconfig": "testK8sConfig",
-		"intercept_type": "%s",
-        "node_name": "testNodeName",
-        "exclude_namespaces": ["testExcludeNS"],
-        "cni_bin_dir": "/testDirectory"
+		"intercept_type": "%s"
     }
 }`
 
@@ -93,14 +116,14 @@ type mockInterceptRuleMgr struct {
 	lastRedirect []*Redirect
 }
 
-func buildMockConf(ambientEnabled bool, eventURL string) string {
+func buildMockConf(ambientEnabled bool) string {
 	return fmt.Sprintf(
 		mockConfTmpl,
 		"1.0.0",
 		"1.0.0",
 		"eth0",
 		testSandboxDirectory,
-		eventURL,
+		"", // unused here
 		ambientEnabled,
 		"mock",
 	)
@@ -145,18 +168,8 @@ func (mrdir *mockInterceptRuleMgr) Program(podName, netns string, redirect *Redi
 }
 
 // returns the test server URL and a dispose func for the test server
-func setupCNIEventClientWithMockServer(serverErr bool) (string, func() bool) {
+func setupCNIEventClientWithMockServer(serverErr bool) func() bool {
 	cniAddServerCalled := false
-	// replace the global CNI client with mock
-	newCNIClient = func(address, path string) CNIEventClient {
-		c := http.DefaultClient
-
-		eventC := CNIEventClient{
-			client: c,
-			url:    address + path,
-		}
-		return eventC
-	}
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		cniAddServerCalled = true
@@ -169,7 +182,18 @@ func setupCNIEventClientWithMockServer(serverErr bool) (string, func() bool) {
 		res.Write([]byte("server happy"))
 	}))
 
-	return testServer.URL, func() bool {
+	// replace the global CNI client with mock
+	newCNIClient = func(address, path string) CNIEventClient {
+		c := http.DefaultClient
+
+		eventC := CNIEventClient{
+			client: c,
+			url:    testServer.URL + path,
+		}
+		return eventC
+	}
+
+	return func() bool {
 		testServer.Close()
 		return cniAddServerCalled
 	}
@@ -227,12 +251,12 @@ func testDoAddRun(t *testing.T, stdinData, nsName string, objects ...runtime.Obj
 }
 
 func TestCmdAddAmbientEnabledOnNS(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
 
 	testDoAddRun(t, cniConf, testNSName, pod, ns)
 
@@ -242,12 +266,12 @@ func TestCmdAddAmbientEnabledOnNS(t *testing.T) {
 }
 
 func TestCmdAddAmbientEnabledOnNSServerFails(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(true)
+	serverClose := setupCNIEventClientWithMockServer(true)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
 
 	testCmdAddExpectFail(t, cniConf, pod, ns)
 
@@ -257,9 +281,9 @@ func TestCmdAddAmbientEnabledOnNSServerFails(t *testing.T) {
 }
 
 func TestCmdAddPodWithProxySidecarAmbientEnabledNS(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
 
@@ -268,7 +292,7 @@ func TestCmdAddPodWithProxySidecarAmbientEnabledNS(t *testing.T) {
 
 	pod.Spec.Containers = []corev1.Container{app, proxy}
 	pod.ObjectMeta.Annotations = map[string]string{annotation.SidecarStatus.Name: "true"}
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
 
 	testDoAddRun(t, cniConf, testNSName, pod, ns)
 
@@ -278,9 +302,9 @@ func TestCmdAddPodWithProxySidecarAmbientEnabledNS(t *testing.T) {
 }
 
 func TestCmdAddPodWithGenericSidecar(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
 
@@ -288,7 +312,7 @@ func TestCmdAddPodWithGenericSidecar(t *testing.T) {
 	app := corev1.Container{Name: "app"}
 
 	pod.Spec.Containers = []corev1.Container{app, proxy}
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
 
 	testDoAddRun(t, cniConf, testNSName, pod, ns)
 
@@ -298,15 +322,15 @@ func TestCmdAddPodWithGenericSidecar(t *testing.T) {
 }
 
 func TestCmdAddPodDisabledLabel(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
 
 	app := corev1.Container{Name: "app"}
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
-	pod.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeNone}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
+	pod.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeNone}
 	pod.Spec.Containers = []corev1.Container{app}
 
 	testDoAddRun(t, cniConf, testNSName, pod, ns)
@@ -317,14 +341,14 @@ func TestCmdAddPodDisabledLabel(t *testing.T) {
 }
 
 func TestCmdAddPodEnabledNamespaceDisabled(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	pod, ns := buildFakePodAndNSForClient()
 
 	app := corev1.Container{Name: "app"}
-	pod.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.DataplaneModeAmbient}
+	pod.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.DataplaneModeAmbient}
 	pod.Spec.Containers = []corev1.Container{app}
 
 	testDoAddRun(t, cniConf, testNSName, pod, ns)
@@ -334,16 +358,16 @@ func TestCmdAddPodEnabledNamespaceDisabled(t *testing.T) {
 }
 
 func TestCmdAddPodInExcludedNamespace(t *testing.T) {
-	url, serverClose := setupCNIEventClientWithMockServer(false)
+	serverClose := setupCNIEventClientWithMockServer(false)
 
-	cniConf := buildMockConf(true, url)
+	cniConf := buildMockConf(true)
 
 	excludedNS := "testExcludeNS"
 	pod, ns := buildFakePodAndNSForClient()
 
 	app := corev1.Container{Name: "app"}
 	ns.ObjectMeta.Name = excludedNS
-	ns.ObjectMeta.Labels = map[string]string{constants.DataplaneModeLabel: constants.AmbientRedirectionEnabled}
+	ns.ObjectMeta.Labels = map[string]string{label.IoIstioDataplaneMode.Name: constants.AmbientRedirectionEnabled}
 
 	pod.ObjectMeta.Namespace = excludedNS
 	pod.Spec.Containers = []corev1.Container{app}
@@ -358,7 +382,7 @@ func TestCmdAddPodInExcludedNamespace(t *testing.T) {
 
 func TestCmdAdd(t *testing.T) {
 	pod, ns := buildFakePodAndNSForClient()
-	testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 }
 
 func TestCmdAddTwoContainersWithAnnotation(t *testing.T) {
@@ -368,7 +392,7 @@ func TestCmdAddTwoContainersWithAnnotation(t *testing.T) {
 	pod.Spec.Containers[1].Name = "istio-proxy"
 	pod.ObjectMeta.Annotations[injectAnnotationKey] = "false"
 
-	testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 }
 
 func TestCmdAddTwoContainersWithLabel(t *testing.T) {
@@ -377,7 +401,7 @@ func TestCmdAddTwoContainersWithLabel(t *testing.T) {
 	pod.Spec.Containers[1].Name = "istio-proxy"
 	pod.ObjectMeta.Annotations[label.SidecarInject.Name] = "false"
 
-	testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 }
 
 func TestCmdAddTwoContainers(t *testing.T) {
@@ -387,10 +411,10 @@ func TestCmdAddTwoContainers(t *testing.T) {
 	pod.Spec.Containers[1].Name = "istio-proxy"
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 
-	mockIntercept := testDoAddRun(t, buildMockConf(false, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(false), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) == 0 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if r.includeInboundPorts != "*" {
@@ -406,10 +430,10 @@ func TestCmdAddTwoContainersWithStarInboundPort(t *testing.T) {
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 	pod.ObjectMeta.Annotations[includeInboundPortsKey] = "*"
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 1 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if r.includeInboundPorts != "*" {
@@ -425,10 +449,10 @@ func TestCmdAddTwoContainersWithEmptyInboundPort(t *testing.T) {
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 	pod.ObjectMeta.Annotations[includeInboundPortsKey] = ""
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 1 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if r.includeInboundPorts != "" {
@@ -443,10 +467,10 @@ func TestCmdAddTwoContainersWithEmptyExcludeInboundPort(t *testing.T) {
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 	pod.ObjectMeta.Annotations[excludeInboundPortsKey] = ""
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 1 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if r.excludeInboundPorts != "15020,15021,15090" {
@@ -461,10 +485,10 @@ func TestCmdAddTwoContainersWithExplictExcludeInboundPort(t *testing.T) {
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 	pod.ObjectMeta.Annotations[excludeInboundPortsKey] = "3306"
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) == 0 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if r.excludeInboundPorts != "3306,15020,15021,15090" {
@@ -477,19 +501,19 @@ func TestCmdAddTwoContainersWithoutSideCar(t *testing.T) {
 	pod.Spec.Containers[0].Name = "mockContainer"
 	pod.Spec.Containers[1].Name = "istio-proxy"
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 0 {
-		t.Fatalf("Didnt Expect nsenterFunc to be called because this pod does not contain a sidecar")
+		t.Fatal("Didnt Expect nsenterFunc to be called because this pod does not contain a sidecar")
 	}
 }
 
 func TestCmdAddExcludePod(t *testing.T) {
 	pod, ns := buildFakePodAndNSForClient()
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), "testExcludeNS", pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), "testExcludeNS", pod, ns)
 	if len(mockIntercept.lastRedirect) != 0 {
-		t.Fatalf("failed to exclude pod")
+		t.Fatal("failed to exclude pod")
 	}
 }
 
@@ -498,10 +522,10 @@ func TestCmdAddExcludePodWithIstioInitContainer(t *testing.T) {
 	pod.ObjectMeta.Annotations[sidecarStatusKey] = "true"
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "istio-init"})
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 0 {
-		t.Fatalf("failed to exclude pod")
+		t.Fatal("failed to exclude pod")
 	}
 }
 
@@ -513,10 +537,10 @@ func TestCmdAddExcludePodWithEnvoyDisableEnv(t *testing.T) {
 		Env:  []corev1.EnvVar{{Name: "DISABLE_ENVOY", Value: "true"}},
 	})
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) != 0 {
-		t.Fatalf("failed to exclude pod")
+		t.Fatal("failed to exclude pod")
 	}
 }
 
@@ -530,6 +554,31 @@ func TestCmdAddNoPrevResult(t *testing.T) {
     },
     "loglevel": "debug",
 	"ambient_enabled": %t,
+	"enablement_selectors": [
+		{
+			"podSelector": {
+				"matchLabels": {
+					"istio.io/dataplane-mode": "ambient"
+				}
+			}
+        },
+		{
+			"podSelector": {
+				"matchExpressions": [
+					{
+						"key": "istio.io/dataplane-mode",
+						"operator": "NotIn",
+						"values": ["none"]
+					}
+				]
+			},
+			"namespaceSelector": {
+				"matchLabels": {
+					"istio.io/dataplane-mode": "ambient"
+				}
+			}
+		}
+	],
     "kubernetes": {
         "k8sapiroot": "APIRoot",
         "kubeconfig": "testK8sConfig",
@@ -554,10 +603,10 @@ func TestCmdAddEnableDualStack(t *testing.T) {
 		}, {Name: "mockContainer"},
 	}
 
-	mockIntercept := testDoAddRun(t, buildMockConf(true, ""), testNSName, pod, ns)
+	mockIntercept := testDoAddRun(t, buildMockConf(true), testNSName, pod, ns)
 
 	if len(mockIntercept.lastRedirect) == 0 {
-		t.Fatalf("expected nsenterFunc to be called")
+		t.Fatal("expected nsenterFunc to be called")
 	}
 	r := mockIntercept.lastRedirect[len(mockIntercept.lastRedirect)-1]
 	if !r.dualStack {

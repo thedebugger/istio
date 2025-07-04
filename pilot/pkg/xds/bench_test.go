@@ -46,13 +46,16 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/env"
 	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/yml"
 	"istio.io/istio/pkg/util/protomarshal"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // ConfigInput defines inputs passed to the test config templates
@@ -72,6 +75,10 @@ type ConfigInput struct {
 	SkipType string
 	// ResourceType of proxy to generate configs for. If not set, sidecar is used
 	ProxyType model.NodeType
+	// If true, all objects will be created as Kubernetes objects. Some controllers only support this mode
+	KubernetesClient bool
+	// Optionally, override the push request. Else, a full push is done
+	PushRequest *model.PushRequest
 }
 
 var testCases = []ConfigInput{
@@ -150,6 +157,15 @@ var testCases = []ConfigInput{
 		Name:      "serviceentry-workloadentry",
 		Services:  100,
 		Instances: 1000,
+	},
+
+	// Ambient
+	{
+		Name:             "waypoint",
+		Services:         100,
+		ProxyType:        model.Waypoint,
+		KubernetesClient: true,
+		SkipType:         v3.RouteType, // no routes for waypoint
 	},
 }
 
@@ -238,6 +254,44 @@ func BenchmarkSecretGeneration(b *testing.B) {
 	runBenchmark(b, v3.SecretType, secretCases)
 }
 
+var wdsCases = []ConfigInput{
+	{
+		Name:             "serviceentry-workloadentry",
+		Services:         100,
+		Instances:        1000,
+		KubernetesClient: true,
+		PushRequest: &model.PushRequest{
+			Reason: model.NewReasonStats(model.ProxyRequest),
+			Forced: true,
+		},
+	},
+}
+
+func BenchmarkAddressFullGeneration(b *testing.B) {
+	runBenchmark(b, v3.AddressType, wdsCases)
+}
+
+func TestAddressFullGeneration(t *testing.T) {
+	testBenchmark(t, v3.AddressType, wdsCases)
+}
+
+var wdsIncrementalCases = func() []ConfigInput {
+	cases := slices.Clone(wdsCases)
+	// Request a single resource
+	cases[0].PushRequest = &model.PushRequest{
+		AddressesUpdated: sets.New("Kubernetes/networking.istio.io/WorkloadEntry//random-0"),
+	}
+	return cases
+}()
+
+func BenchmarkAddressIncrementalGeneration(b *testing.B) {
+	runBenchmark(b, v3.AddressType, wdsIncrementalCases)
+}
+
+func TestAddressIncrementalGeneration(t *testing.T) {
+	testBenchmark(t, v3.AddressType, wdsIncrementalCases)
+}
+
 func createGateways(n int) map[string]*meshconfig.Network {
 	out := make(map[string]*meshconfig.Network, n)
 	for i := 0; i < n; i++ {
@@ -271,7 +325,7 @@ func BenchmarkEndpointGeneration(b *testing.B) {
 		b.Run(fmt.Sprintf("%d/%d", tt.endpoints, tt.services), func(b *testing.B) {
 			s := xds.NewFakeDiscoveryServer(b, xds.FakeOptions{
 				Configs: createEndpointsConfig(tt.endpoints, tt.services, numNetworks),
-				NetworksWatcher: mesh.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
+				NetworksWatcher: meshwatcher.NewFixedNetworksWatcher(&meshconfig.MeshNetworks{
 					Networks: createGateways(numNetworks),
 				}),
 			})
@@ -287,9 +341,9 @@ func BenchmarkEndpointGeneration(b *testing.B) {
 			b.ResetTimer()
 			var c model.Resources
 			for n := 0; n < b.N; n++ {
-				watchedResources := []string{}
+				watchedResources := sets.New[string]()
 				for svc := 0; svc < tt.services; svc++ {
-					watchedResources = append(watchedResources, fmt.Sprintf("outbound|80||foo-%d.com", svc))
+					watchedResources.Insert(fmt.Sprintf("outbound|80||foo-%d.com", svc))
 				}
 				wr := &model.WatchedResource{ResourceNames: watchedResources}
 				c, _, _ = s.Discovery.Generators[v3.EndpointType].Generate(proxy, wr, &model.PushRequest{Full: true, Push: s.PushContext()})
@@ -300,6 +354,7 @@ func BenchmarkEndpointGeneration(b *testing.B) {
 }
 
 func runBenchmark(b *testing.B, tpe string, testCases []ConfigInput) {
+	test.SetForTest(b, &features.EnableAmbient, true)
 	configureBenchmark(b)
 	for _, tt := range testCases {
 		if tt.OnlyRunType != "" && tt.OnlyRunType != tpe {
@@ -310,16 +365,7 @@ func runBenchmark(b *testing.B, tpe string, testCases []ConfigInput) {
 			continue
 		}
 		b.Run(tt.Name, func(b *testing.B) {
-			s, proxy := setupAndInitializeTest(b, tt)
-			wr := getWatchedResources(tpe, tt, s, proxy)
-			b.ResetTimer()
-			var c model.Resources
-			for n := 0; n < b.N; n++ {
-				c, _, _ = s.Discovery.Generators[tpe].Generate(proxy, wr, &model.PushRequest{Full: true, Push: s.PushContext()})
-				if len(c) == 0 {
-					b.Fatalf("Got no %v's!", tpe)
-				}
-			}
+			c := runBenchmarkCase(b, tt, tpe, b.N, b.ResetTimer)
 			logDebug(b, c)
 		})
 	}
@@ -338,28 +384,46 @@ func testBenchmark(t *testing.T, tpe string, testCases []ConfigInput) {
 			// No need for large test here
 			tt.Services = 1
 			tt.Instances = 1
-			s, proxy := setupAndInitializeTest(t, tt)
-			wr := getWatchedResources(tpe, tt, s, proxy)
-			c, _, _ := s.Discovery.Generators[tpe].Generate(proxy, wr, &model.PushRequest{Full: true, Push: s.PushContext()})
-			if len(c) == 0 {
-				t.Fatalf("Got no %v's!", tpe)
-			}
+			_ = runBenchmarkCase(t, tt, tpe, 1, func() {})
 		})
 	}
+}
+
+func runBenchmarkCase(t testing.TB, tt ConfigInput, tpe string, n int, reset func()) model.Resources {
+	s, proxy := setupAndInitializeTest(t, tt)
+	wr := getWatchedResources(tpe, tt, s, proxy)
+	pr := &model.PushRequest{Full: true, Push: s.PushContext(), Forced: true}
+	if tt.PushRequest != nil {
+		// Some types get watched resources populated on the first run. So generate with a full push first
+		_, _, _ = s.Discovery.Generators[tpe].Generate(proxy, wr, pr)
+		pr = tt.PushRequest
+		pr.Push = s.PushContext()
+	}
+	var c model.Resources
+	reset()
+	for range n {
+		c, _, _ = s.Discovery.Generators[tpe].Generate(proxy, wr, pr)
+		if len(c) == 0 {
+			t.Fatalf("Got no %v's!", tpe)
+		}
+	}
+	return c
 }
 
 func getWatchedResources(tpe string, tt ConfigInput, s *xds.FakeDiscoveryServer, proxy *model.Proxy) *model.WatchedResource {
 	switch tpe {
 	case v3.SecretType:
-		watchedResources := []string{}
+		watchedResources := sets.New[string]()
 		for i := 0; i < tt.Services; i++ {
-			watchedResources = append(watchedResources, fmt.Sprintf("kubernetes://default/sds-credential-%d", i))
+			watchedResources.Insert(fmt.Sprintf("kubernetes://default/sds-credential-%d", i))
 		}
 		return &model.WatchedResource{ResourceNames: watchedResources}
 	case v3.RouteType:
 		l := s.ConfigGen.BuildListeners(proxy, s.PushContext())
 		routeNames := xdstest.ExtractRoutesFromListeners(l)
-		return &model.WatchedResource{ResourceNames: routeNames}
+		return &model.WatchedResource{ResourceNames: sets.New(routeNames...)}
+	case v3.AddressType:
+		return &model.WatchedResource{TypeUrl: v3.AddressType, ResourceNames: sets.New[string](), Wildcard: true}
 	}
 	return nil
 }
@@ -385,7 +449,7 @@ func setupTest(t testing.TB, config ConfigInput) (*xds.FakeDiscoveryServer, *mod
 				"istio.io/benchmark": "true",
 			},
 			ClusterID:    constants.DefaultClusterName,
-			IstioVersion: "1.23.0",
+			IstioVersion: "1.26.0",
 		},
 		ConfigNamespace:  "default",
 		VerifiedIdentity: &spiffe.Identity{Namespace: "default"},
@@ -454,8 +518,8 @@ func getConfigsWithCache(t testing.TB, input ConfigInput) ([]config.Config, stri
 	if err != nil {
 		t.Fatalf("failed to read config: %v", err)
 	}
-	k8sTypes, count := parseKubernetesTypes(inputYAML)
-	if len(badKinds) != count {
+	k8sTypes, count := parseKubernetesTypes(inputYAML, input.KubernetesClient)
+	if !input.KubernetesClient && len(badKinds) != count {
 		t.Fatalf("Got unknown resources: %v", badKinds)
 	}
 	// setup default namespace if not defined
@@ -470,15 +534,11 @@ func getConfigsWithCache(t testing.TB, input ConfigInput) ([]config.Config, stri
 	return configs, k8sTypes
 }
 
-func parseKubernetesTypes(inputs string) (string, int) {
+func parseKubernetesTypes(inputs string, includeAll bool) (string, int) {
 	matches := 0
 	sb := strings.Builder{}
 	for _, text := range strings.Split(inputs, "\n---") {
-		if strings.Contains(text, "kind: Secret") {
-			sb.WriteString(text + "\n---\n")
-			matches++
-		}
-		if strings.Contains(text, "kind: Service\n") {
+		if includeAll || strings.Contains(text, "kind: Secret") || strings.Contains(text, "kind: Service\n") {
 			sb.WriteString(text + "\n---\n")
 			matches++
 		}
@@ -611,7 +671,7 @@ func makeCacheKey(n int) model.XdsCacheEntry {
 			Hostname:   host.Name(ns + "some" + index + ".example.com"),
 			Attributes: model.ServiceAttributes{Namespace: "test" + index},
 		})
-		drs = append(drs, model.ConvertConsolidatedDestRule(&config.Config{Meta: config.Meta{Name: index, Namespace: index}}))
+		drs = append(drs, model.ConvertConsolidatedDestRule(&config.Config{Meta: config.Meta{Name: index, Namespace: index}}, nil))
 	}
 
 	key := &route.Cache{

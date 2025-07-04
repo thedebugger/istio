@@ -3,7 +3,6 @@ kind: GatewayClass
 metadata:
   creationTimestamp: null
   name: istio
-  namespace: default
 spec: null
 status:
   conditions:
@@ -12,9 +11,6 @@ status:
     reason: Accepted
     status: "True"
     type: Accepted
-  supportedFeatures:
-  - HTTPRouteFeatureA
-  - HTTPRouteFeatureB
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway

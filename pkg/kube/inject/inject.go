@@ -43,7 +43,7 @@ import (
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	proxyConfig "istio.io/api/networking/v1beta1"
-	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	opconfig "istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
@@ -61,15 +61,15 @@ const (
 	// InjectionPolicyDisabled specifies that the sidecar injector
 	// will not inject the sidecar into resources by default for the
 	// namespace(s) being watched. Resources can enable injection
-	// using the "sidecar.istio.io/inject" annotation with value of
-	// true.
+	// using the "sidecar.istio.io/inject" label with value of
+	// "true".
 	InjectionPolicyDisabled InjectionPolicy = "disabled"
 
 	// InjectionPolicyEnabled specifies that the sidecar injector will
 	// inject the sidecar into resources by default for the
 	// namespace(s) being watched. Resources can disable injection
-	// using the "sidecar.istio.io/inject" annotation with value of
-	// false.
+	// using the "sidecar.istio.io/inject" label with value of
+	// "false".
 	InjectionPolicyEnabled InjectionPolicy = "enabled"
 )
 
@@ -194,6 +194,7 @@ func UnmarshalConfig(yml []byte) (Config, error) {
 }
 
 func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, metadata metav1.ObjectMeta) bool { // nolint: lll
+	log := log.WithLabels("pod", metadata.Namespace+"/"+potentialPodName(metadata))
 	// Skip injection when host networking is enabled. The problem is
 	// that the iptables changes are assumed to be within the pod when,
 	// in fact, they are changing the routing at the host level. This
@@ -221,11 +222,16 @@ func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, m
 		// The label is the new API; if both are present we prefer the label
 		objectSelector = lbl
 	}
-	switch strings.ToLower(objectSelector) {
-	// http://yaml.org/type/bool.html
-	case "y", "yes", "true", "on":
+	switch objectSelector {
+	case "true":
 		inject = true
+	case "false":
+		inject = false
 	case "":
+		useDefault = true
+	default:
+		log.Warnf("Invalid value for %s: %q. Only 'true' and 'false' are accepted. Falling back to default injection policy.",
+			label.SidecarInject.Name, objectSelector)
 		useDefault = true
 	}
 
@@ -463,7 +469,14 @@ func RunTemplate(params InjectionParameters) (mergedPod *corev1.Pod, templatePod
 		// these will be in the `containers` field.
 		// So if we see the proxy container in `containers` in the original pod, and in `initContainers` in the template pod,
 		// move the container.
-		if features.EnableNativeSidecars.Get() &&
+		// The sidecar.istio.io/nativeSidecar annotation takes precedence over the global feature flag.
+		native := features.EnableNativeSidecars.Get()
+		if mergedPod.Annotations["sidecar.istio.io/nativeSidecar"] == "true" {
+			native = true
+		} else if mergedPod.Annotations["sidecar.istio.io/nativeSidecar"] == "false" {
+			native = false
+		}
+		if native &&
 			FindContainer(ProxyContainerName, templatePod.Spec.InitContainers) != nil &&
 			FindContainer(ProxyContainerName, mergedPod.Spec.Containers) != nil {
 			mergedPod = mergedPod.DeepCopy()

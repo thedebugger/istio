@@ -165,7 +165,7 @@ func getBindAddresses(ip []string) []string {
 		}
 	}
 	addrs := []string{}
-	if v4 {
+	if v4 || !v6 {
 		if localhost {
 			addrs = append(addrs, "127.0.0.1")
 		} else {
@@ -210,6 +210,7 @@ func (s *Instance) getListenerIPs(port *common.Port) ([]string, error) {
 	if r, f := os.LookupEnv("INSTANCE_IPS"); f {
 		ips := strings.Split(r, ",")
 		if bf, f := os.LookupEnv("BIND_FAMILY"); f {
+			bf := strings.ToLower(bf)
 			ips = slices.FilterInPlace(ips, func(s string) bool {
 				ip, err := netip.ParseAddr(s)
 				if err != nil {
@@ -285,6 +286,7 @@ func (s *Instance) validate() error {
 		case protocol.HTTP2:
 		case protocol.GRPC:
 		case protocol.HBONE:
+		case protocol.DoubleHBONE:
 		default:
 			return fmt.Errorf("protocol %v not currently supported", port.Protocol)
 		}

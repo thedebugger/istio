@@ -19,19 +19,22 @@ package helm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/yaml"
 
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/client-go/pkg/apis/networking/v1alpha3"
+	clientnetworking "istio.io/client-go/pkg/apis/networking/v1"
+	"istio.io/istio/pilot/pkg/leaderelection"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
@@ -43,6 +46,7 @@ import (
 	"istio.io/istio/pkg/test/helm"
 	kubetest "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/shell"
 	"istio.io/istio/pkg/test/util/retry"
 )
 
@@ -71,20 +75,6 @@ const (
 	RetryTimeOut = 5 * time.Minute
 	Timeout      = 2 * time.Minute
 
-	defaultValues = `
-global:
-  hub: %s
-  %s
-  variant: %q
-revision: "%s"
-`
-	ambientProfileOverride = `
-global:
-  hub: %s
-  %s
-  variant: %q
-profile: ambient
-`
 	sampleEnvoyFilter = `
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
@@ -173,22 +163,6 @@ spec:
 // ManifestsChartPath is path of local Helm charts used for testing.
 var ManifestsChartPath = filepath.Join(env.IstioSrc, "manifests/charts")
 
-// adjustValuesForOpenShift adds the "openshift" or "openshift-ambient" profile to the
-// values if tests are running in OpenShift, and returns the modified values
-func adjustValuesForOpenShift(ctx framework.TestContext, values string) string {
-	if !ctx.Settings().OpenShift {
-		return values
-	}
-
-	if !strings.Contains(values, "profile: ") {
-		values += "\nprofile: openshift\n"
-	} else if strings.Contains(values, "profile: ambient") {
-		values = strings.ReplaceAll(values, "profile: ambient", "profile: openshift-ambient")
-	}
-
-	return values
-}
-
 // getValuesOverrides returns the values file created to pass into Helm override default values
 // for the hub and tag.
 //
@@ -199,19 +173,45 @@ func adjustValuesForOpenShift(ctx framework.TestContext, values string) string {
 func GetValuesOverrides(ctx framework.TestContext, hub, tag, variant, revision string, isAmbient bool) string {
 	workDir := ctx.CreateTmpDirectoryOrFail("helm")
 
+	// Create the default base map string for the values file
+	values := map[string]interface{}{
+		"global": map[string]interface{}{
+			"hub":     hub,
+			"variant": variant,
+		},
+		"revision": revision,
+	}
+
+	globalValues := values["global"].(map[string]interface{})
 	// Only use a tag value if not empty. Not having a tag in values means: Use the tag directly from the chart
 	if tag != "" {
-		tag = "tag: " + tag
+		globalValues["tag"] = tag
 	}
 
-	overrideValues := fmt.Sprintf(defaultValues, hub, tag, variant, revision)
-	if isAmbient {
-		overrideValues = fmt.Sprintf(ambientProfileOverride, hub, tag, variant)
+	// Handle Openshift platform override if set
+	if ctx.Settings().OpenShift {
+		globalValues["platform"] = "openshift"
+		// TODO: do FLATTEN_GLOBALS_REPLACEMENT to avoid this set
+		values["platform"] = "openshift"
+	} else {
+		globalValues["platform"] = "" // no platform
 	}
-	overrideValues = adjustValuesForOpenShift(ctx, overrideValues)
+
+	// Handle Ambient profile override if set
+	if isAmbient {
+		values["profile"] = "ambient"
+		// Remove revision for ambient profile
+		delete(values, "revision")
+	}
+
+	// Marshal the map to a YAML string
+	overrideValues, err := yaml.Marshal(values)
+	if err != nil {
+		ctx.Fatalf("failed to marshal override values to YAML: %v", err)
+	}
 
 	overrideValuesFile := filepath.Join(workDir, "values.yaml")
-	if err := os.WriteFile(overrideValuesFile, []byte(overrideValues), os.ModePerm); err != nil {
+	if err := os.WriteFile(overrideValuesFile, overrideValues, os.ModePerm); err != nil {
 		ctx.Fatalf("failed to write iop cr file: %v", err)
 	}
 
@@ -274,14 +274,6 @@ func InstallIstio(t framework.TestContext, cs cluster.Cluster, h *helm.Helm, ove
 	if version != "" {
 		// Prepend ~ to the version, so that we can refer to the latest patch version of a minor version
 		versionArgs = fmt.Sprintf("--repo %s --version ~%s", t.Settings().HelmRepo, version)
-		// Currently the ambient in-place upgrade tests try an upgrade from previous release which is 1.20,
-		// and many of the profile override values seem to be unrecognized by the gateway installation.
-		// So, this is a workaround until we move to 1.21 where we can use --set profile=ambient for the install/upgrade.
-		// TODO: Remove this once the previous release version for the test becomes 1.21
-		// refer: https://github.com/istio/istio/issues/49242
-		if ambientProfile {
-			gatewayOverrideValuesFile = GetValuesOverrides(t, t.Settings().Image.Hub, version, t.Settings().Image.Variant, "", false)
-		}
 	} else {
 		baseChartPath = filepath.Join(ManifestsChartPath, BaseChart)
 		discoveryChartPath = filepath.Join(ManifestsChartPath, ControlChartsDir, DiscoveryChartsDir)
@@ -411,16 +403,38 @@ func DeleteIstio(t framework.TestContext, h *helm.Helm, cs *kube.Cluster, config
 	if err := h.DeleteChart(BaseReleaseName, config.Get(BaseReleaseName)); err != nil {
 		t.Errorf("failed to delete %s release: %v", BaseReleaseName, err)
 	}
+	g := errgroup.Group{}
 	for _, ns := range config.AllNamespaces() {
 		if ns == constants.KubeSystemNamespace {
 			continue
 		}
-		if err := cs.Kube().CoreV1().Namespaces().Delete(context.TODO(), ns, metav1.DeleteOptions{}); err != nil {
-			t.Errorf("failed to delete %s namespace: %v", ns, err)
+		g.Go(func() error {
+			if err := cs.Kube().CoreV1().Namespaces().Delete(context.TODO(), ns, metav1.DeleteOptions{}); err != nil {
+				return fmt.Errorf("failed to delete %s namespace: %v", ns, err)
+			}
+			if err := kubetest.WaitForNamespaceDeletion(cs.Kube(), ns, retry.Timeout(RetryTimeOut)); err != nil {
+				return fmt.Errorf("waiting for %s namespace to be deleted: %v", ns, err)
+			}
+			return nil
+		})
+	}
+	// try to delete all leader election locks. Istiod will drop them on shutdown, but `helm delete` ordering removes the
+	// Role allowing it to do so before it is able to, so it ends up failing to do so.
+	// Help it out to ensure the next test doesn't need to wait 30s.
+	g.Go(func() error {
+		locks := []string{
+			leaderelection.NamespaceController,
+			leaderelection.GatewayDeploymentController,
+			leaderelection.GatewayStatusController,
+			leaderelection.IngressController,
 		}
-		if err := kubetest.WaitForNamespaceDeletion(cs.Kube(), ns, retry.Timeout(RetryTimeOut)); err != nil {
-			t.Errorf("waiting for %s namespace to be deleted: %v", ns, err)
+		for _, lock := range locks {
+			_ = cs.Kube().CoreV1().ConfigMaps(config.Get(IstiodReleaseName)).Delete(context.Background(), lock, metav1.DeleteOptions{})
 		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -517,7 +531,7 @@ func VerifyValidatingWebhookConfigurations(ctx framework.TestContext, cs cluster
 // verifyValidation verifies that Istio resource validation is active on the cluster.
 func verifyValidation(ctx framework.TestContext, revision string) {
 	ctx.Helper()
-	invalidGateway := &v1alpha3.Gateway{
+	invalidGateway := &clientnetworking.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "invalid-istio-gateway",
 			Namespace: IstioNamespace,
@@ -531,10 +545,39 @@ func verifyValidation(ctx framework.TestContext, revision string) {
 		}
 	}
 	createOptions := metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}}
-	istioClient := ctx.Clusters().Default().Istio().NetworkingV1alpha3()
+	istioClient := ctx.Clusters().Default().Istio().NetworkingV1()
 	retry.UntilOrFail(ctx, func() bool {
 		_, err := istioClient.Gateways(IstioNamespace).Create(context.TODO(), invalidGateway, createOptions)
 		rejected := err != nil
 		return rejected
 	})
+}
+
+// TODO BML this relabeling/reannotating is only required if the previous release is =< 1.23,
+// and should be dropped once 1.24 is released.
+func AdoptPre123CRDResourcesIfNeeded() {
+	requiredAdoptionLabels := []string{"app.kubernetes.io/managed-by=Helm"}
+	requiredAdoptionAnnos := []string{"meta.helm.sh/release-name=istio-base", "meta.helm.sh/release-namespace=istio-system"}
+
+	for _, labelToAdd := range requiredAdoptionLabels {
+		// We have wildly inconsistent existing labeling pre-1.24, so have to cover all possible cases.
+		execCmd1 := fmt.Sprintf("kubectl label crds -l chart=istio %v", labelToAdd)
+		execCmd2 := fmt.Sprintf("kubectl label crds -l app.kubernetes.io/part-of=istio %v", labelToAdd)
+		_, err1 := shell.Execute(false, execCmd1)
+		_, err2 := shell.Execute(false, execCmd2)
+		if errors.Join(err1, err2) != nil {
+			scopes.Framework.Infof("couldn't relabel CRDs for Helm adoption: %s. Likely not needed for this release", labelToAdd)
+		}
+	}
+
+	for _, annoToAdd := range requiredAdoptionAnnos {
+		// We have wildly inconsistent existing labeling pre-1.24, so have to cover all possible cases.
+		execCmd1 := fmt.Sprintf("kubectl annotate crds -l chart=istio %v", annoToAdd)
+		execCmd2 := fmt.Sprintf("kubectl annotate crds -l app.kubernetes.io/part-of=istio %v", annoToAdd)
+		_, err1 := shell.Execute(false, execCmd1)
+		_, err2 := shell.Execute(false, execCmd2)
+		if errors.Join(err1, err2) != nil {
+			scopes.Framework.Infof("couldn't reannotate CRDs for Helm adoption: %s. Likely not needed for this release", annoToAdd)
+		}
+	}
 }

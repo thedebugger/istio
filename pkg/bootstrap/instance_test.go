@@ -43,9 +43,9 @@ import (
 
 	"istio.io/api/annotation"
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/bootstrap/platform"
+	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/util/protomarshal"
@@ -78,21 +78,20 @@ var (
 // REFRESH_GOLDEN=true go test ./pkg/bootstrap/...
 func TestGolden(t *testing.T) {
 	cases := []struct {
-		base                          string
-		envVars                       map[string]string
-		annotations                   map[string]string
-		sdsUDSPath                    string
-		sdsTokenPath                  string
-		expectLightstepAccessToken    bool
-		stats                         stats
-		checkLocality                 bool
-		stsPort                       int
-		platformMeta                  map[string]string
-		setup                         func()
-		teardown                      func()
-		check                         func(got *bootstrap.Bootstrap, t *testing.T)
-		compliancePolicy              string
-		enableDefferedClusterCreation bool
+		base                       string
+		envVars                    map[string]string
+		annotations                map[string]string
+		sdsUDSPath                 string
+		sdsTokenPath               string
+		expectLightstepAccessToken bool
+		stats                      stats
+		checkLocality              bool
+		stsPort                    int
+		platformMeta               map[string]string
+		setup                      func()
+		teardown                   func()
+		check                      func(got *bootstrap.Bootstrap, t *testing.T)
+		compliancePolicy           string
 	}{
 		{
 			base: "xdsproxy",
@@ -107,6 +106,15 @@ func TestGolden(t *testing.T) {
 		},
 		{
 			base: "default",
+		},
+		{
+			base: "ambient",
+			envVars: map[string]string{
+				"ISTIO_META_ENABLE_HBONE": "true", // This is our indication that this proxy is in an ambient installation
+			},
+		},
+		{
+			base: "explicit_internal_address",
 		},
 		{
 			base: "running",
@@ -158,18 +166,11 @@ func TestGolden(t *testing.T) {
 			base: "metrics_no_statsd",
 		},
 		{
-			base: "tracing_opencensusagent",
-		},
-		{
 			base: "tracing_none",
 		},
 		{
 			// Specify zipkin/statsd address, similar with the default config in v1 tests
 			base: "all",
-		},
-		{
-			base:                          "deferred_cluster_creation",
-			enableDefferedClusterCreation: true,
 		},
 		{
 			base: "stats_inclusion",
@@ -229,7 +230,6 @@ func TestGolden(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run("Bootstrap-"+c.base, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableDeferredClusterCreation, c.enableDefferedClusterCreation)
 			out := t.TempDir()
 			if c.setup != nil {
 				c.setup()
@@ -271,10 +271,11 @@ func TestGolden(t *testing.T) {
 				PilotSubjectAltName: []string{
 					"spiffe://cluster.local/ns/istio-system/sa/istio-pilot-service-account",
 				},
-				OutlierLogPath:      "/dev/stdout",
-				annotationFilePath:  annoFile.Name(),
-				EnvoyPrometheusPort: 15090,
-				EnvoyStatusPort:     15021,
+				OutlierLogPath:             "/dev/stdout",
+				annotationFilePath:         annoFile.Name(),
+				EnvoyPrometheusPort:        15090,
+				EnvoyStatusPort:            15021,
+				WorkloadIdentitySocketFile: "test.sock",
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -340,7 +341,7 @@ func TestGolden(t *testing.T) {
 				t.Fatalf("invalid generated file %s: %v", c.base, err)
 			}
 
-			checkStatsMatcher(t, realM, goldenM, c.stats)
+			checkStatsMatcher(t, realM, goldenM, c.stats, node.Metadata)
 			checkStatsTags(t, goldenM)
 
 			if c.check != nil {
@@ -423,17 +424,112 @@ func checkOpencensusConfig(t *testing.T, got, want *bootstrap.Bootstrap) {
 func checkStatsTags(t *testing.T, got *bootstrap.Bootstrap) {
 	for _, tag := range got.StatsConfig.StatsTags {
 		// TODO: Add checks for other tags
-		if tag.TagName == "cluster_name" {
+		switch tag.TagName {
+		case "cluster_name":
 			checkClusterNameTag(t, tag.GetRegex())
+		case "http_conn_manager_prefix":
+			checkHTTPConnManagerPrefixTag(t, tag.GetRegex())
 		}
 	}
 }
 
 // Envoy will remove the first capture group and set the tag to the second capture group.
-// We double check that the regex returns what we want here.
+// We double check that all of the regexes we set return what we want here.
+
+func checkHTTPConnManagerPrefixTag(t *testing.T, regex string) {
+	if regex == "" {
+		t.Fatal("cluster_name tag regex is empty")
+	}
+
+	compiledRegex, err := regexp.Compile(regex)
+	if err != nil {
+		t.Fatalf("invalid regex for cluster_name tag: %v", err)
+	}
+
+	tc := []struct {
+		name               string
+		statPrefix         string
+		firstCaptureGroup  string
+		secondCaptureGroup string
+	}{
+		{
+			name:               "http_conn_manager_prefix stats tag - ipv4 address - single-segment",
+			statPrefix:         "http.0.0.0.0;.downstream_rq_total",
+			firstCaptureGroup:  "0.0.0.0;.",
+			secondCaptureGroup: "0.0.0.0",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - ipv4 address - multi-segment",
+			statPrefix:         "http.0.0.0.0;.jwt_authn.allowed",
+			firstCaptureGroup:  "0.0.0.0;.",
+			secondCaptureGroup: "0.0.0.0",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - ipv6 address - single-segment",
+			statPrefix:         "http.2001:0000:130F:0000:0000:09C0:876A:130B;.downstream_rq_total",
+			firstCaptureGroup:  "2001:0000:130F:0000:0000:09C0:876A:130B;.",
+			secondCaptureGroup: "2001:0000:130F:0000:0000:09C0:876A:130B",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - ipv6 address - multi-segment",
+			statPrefix:         "http.2001:0000:130F:0000:0000:09C0:876A:130B;.jwt_authn.allowed",
+			firstCaptureGroup:  "2001:0000:130F:0000:0000:09C0:876A:130B;.",
+			secondCaptureGroup: "2001:0000:130F:0000:0000:09C0:876A:130B",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - direction-prefixed ipv4 - single-segment",
+			statPrefix:         "http.inbound_0.0.0.0;.downstream_rq_total",
+			firstCaptureGroup:  "inbound_0.0.0.0;.",
+			secondCaptureGroup: "inbound_0.0.0.0",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - direction-prefixed ipv4 - multi-segment",
+			statPrefix:         "http.inbound_0.0.0.0;.jwt_authn.allowed",
+			firstCaptureGroup:  "inbound_0.0.0.0;.",
+			secondCaptureGroup: "inbound_0.0.0.0",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - direction-prefixed ipv6 - single-segment",
+			statPrefix:         "http.inbound_2001:0000:130F:0000:0000:09C0:876A:130B;.downstream_rq_total",
+			firstCaptureGroup:  "inbound_2001:0000:130F:0000:0000:09C0:876A:130B;.",
+			secondCaptureGroup: "inbound_2001:0000:130F:0000:0000:09C0:876A:130B",
+		},
+		{
+			name:               "http_conn_manager_prefix stats tag - direction-prefixed ipv6 - multi-segment",
+			statPrefix:         "http.inbound_2001:0000:130F:0000:0000:09C0:876A:130B;.jwt_authn.allowed",
+			firstCaptureGroup:  "inbound_2001:0000:130F:0000:0000:09C0:876A:130B;.",
+			secondCaptureGroup: "inbound_2001:0000:130F:0000:0000:09C0:876A:130B",
+		},
+	}
+
+	for _, tt := range tc {
+		t.Run(tt.name, func(t *testing.T) {
+			subMatches := compiledRegex.FindStringSubmatch(tt.statPrefix)
+			if subMatches == nil {
+				t.Fatalf("cluster_name tag regex does not match cluster name %s", tt.statPrefix)
+			}
+
+			// The first index is the whole match followed by N number of capture groups.
+			// There are 2 capture groups we expect in the regex, so we always check for 3
+			if len(subMatches) != 3 {
+				t.Fatalf("unexpected number of capture groups: %d. Submatches: %v", len(subMatches), subMatches)
+			}
+			// Now we examine both of the capture groups (which start at index 1)
+			if subMatches[1] != tt.firstCaptureGroup {
+				t.Fatalf("first capture group does not match %s, got %s", tt.firstCaptureGroup, subMatches[1])
+			}
+
+			// Finally, check the second capture group
+			if subMatches[2] != tt.secondCaptureGroup {
+				t.Fatalf("second capture group does not match %s, got %s", tt.secondCaptureGroup, subMatches[2])
+			}
+		})
+	}
+}
+
 func checkClusterNameTag(t *testing.T, regex string) {
 	if regex == "" {
-		t.Fatalf("cluster_name tag regex is empty")
+		t.Fatal("cluster_name tag regex is empty")
 	}
 
 	compiledRegex, err := regexp.Compile(regex)
@@ -479,7 +575,6 @@ func checkClusterNameTag(t *testing.T, regex string) {
 			if len(subMatches) != 3 {
 				t.Fatalf("unexpected number of capture groups: %d. Submatches: %v", len(subMatches), subMatches)
 			}
-
 			// Now we examine both of the capture groups (which start at index 1)
 			if subMatches[1] != tt.firstCaptureGroup {
 				t.Fatalf("first capture group does not match %s, got %s", tt.firstCaptureGroup, subMatches[1])
@@ -493,11 +588,14 @@ func checkClusterNameTag(t *testing.T, regex string) {
 	}
 }
 
-func checkStatsMatcher(t *testing.T, got, want *bootstrap.Bootstrap, stats stats) {
+func checkStatsMatcher(t *testing.T, got, want *bootstrap.Bootstrap, stats stats, meta *model.BootstrapNodeMetadata) {
 	gsm := got.GetStatsConfig().GetStatsMatcher()
-
+	variablePrefixes := ""
+	if meta.EnableHBONE {
+		variablePrefixes = "workload_discovery,"
+	}
 	if stats.prefixes == "" {
-		stats.prefixes = v2Prefixes + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
+		stats.prefixes = v2Prefixes + variablePrefixes + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	} else {
 		stats.prefixes = v2Prefixes + stats.prefixes + "," + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	}

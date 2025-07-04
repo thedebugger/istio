@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
@@ -54,22 +55,52 @@ func SelectVirtualServices(vsidx virtualServiceIndex, configNamespace string, ho
 	}
 
 	wnsImportedHosts, wnsFound := hostsByNamespace[wildcardNamespace]
-	loopAndAdd := func(vses []config.Config) {
-		for _, c := range vses {
-			configNamespace := c.Namespace
-			// Selection algorithm:
-			// virtualservices have a list of hosts in the API spec
-			// if any host in the list matches one service hostname, select the virtual service
-			// and break out of the loop.
+	var loopAndAdd func(vses []config.Config)
+	if features.UnifiedSidecarScoping {
+		loopAndAdd = func(vses []config.Config) {
+			for _, gwMatch := range []bool{true, false} {
+				for _, c := range vses {
+					gwExact := UseGatewaySemantics(c) && c.Namespace == configNamespace
+					if gwMatch != gwExact {
+						continue
+					}
+					configNamespace := c.Namespace
+					// Selection algorithm:
+					// virtualservices have a list of hosts in the API spec
+					// if any host in the list matches one service hostname, select the virtual service
+					// and break out of the loop.
 
-			// Check if there is an explicit import of form ns/* or ns/host
-			if importedHosts, nsFound := hostsByNamespace[configNamespace]; nsFound {
-				addVirtualService(c, importedHosts)
+					// Check if there is an explicit import of form ns/* or ns/host
+					if importedHosts, nsFound := hostsByNamespace[configNamespace]; nsFound {
+						addVirtualService(c, importedHosts)
+					}
+
+					// Check if there is an import of form */host or */*
+					if wnsFound {
+						addVirtualService(c, wnsImportedHosts)
+					}
+				}
 			}
+		}
+	} else {
+		// Legacy path
+		loopAndAdd = func(vses []config.Config) {
+			for _, c := range vses {
+				configNamespace := c.Namespace
+				// Selection algorithm:
+				// virtualservices have a list of hosts in the API spec
+				// if any host in the list matches one service hostname, select the virtual service
+				// and break out of the loop.
 
-			// Check if there is an import of form */host or */*
-			if wnsFound {
-				addVirtualService(c, wnsImportedHosts)
+				// Check if there is an explicit import of form ns/* or ns/host
+				if importedHosts, nsFound := hostsByNamespace[configNamespace]; nsFound {
+					addVirtualService(c, importedHosts)
+				}
+
+				// Check if there is an import of form */host or */*
+				if wnsFound {
+					addVirtualService(c, wnsImportedHosts)
+				}
 			}
 		}
 	}
@@ -82,11 +113,17 @@ func SelectVirtualServices(vsidx virtualServiceIndex, configNamespace string, ho
 	return importedVirtualServices
 }
 
-func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta config.Meta) {
-	// Kubernetes Gateway API semantics support shortnames
-	if UseGatewaySemantics(config.Config{Meta: meta}) {
-		return
+func resolveVirtualServiceShortnames(config config.Config) config.Config {
+	// Kubernetes Gateway API semantics do not support shortnames
+	if UseGatewaySemantics(config) {
+		return config
 	}
+
+	// values returned from ConfigStore.List are immutable.
+	// Therefore, we make a copy
+	r := config.DeepCopy()
+	rule := r.Spec.(*networking.VirtualService)
+	meta := r.Meta
 
 	// resolve top level hosts
 	for i, h := range rule.Hosts {
@@ -151,6 +188,7 @@ func resolveVirtualServiceShortnames(rule *networking.VirtualService, meta confi
 			}
 		}
 	}
+	return r
 }
 
 // Return merged virtual services and the root->delegate vs map
@@ -542,58 +580,4 @@ func UseIngressSemantics(cfg config.Config) bool {
 // semantics.
 func UseGatewaySemantics(cfg config.Config) bool {
 	return cfg.Annotations[constants.InternalRouteSemantics] == constants.RouteSemanticsGateway
-}
-
-// VirtualServiceDependencies returns dependent configs of the vs,
-// for internal vs generated from gateway-api routes, it returns the parent routes,
-// otherwise it just returns the vs as is.
-func VirtualServiceDependencies(vs config.Config) []ConfigKey {
-	if !UseGatewaySemantics(vs) {
-		return []ConfigKey{
-			{
-				Kind:      kind.VirtualService,
-				Namespace: vs.Namespace,
-				Name:      vs.Name,
-			},
-		}
-	}
-
-	// synthetic vs, get internal parents
-	internalParents := strings.Split(vs.Annotations[constants.InternalParentNames], ",")
-	out := make([]ConfigKey, 0, len(internalParents))
-	for _, p := range internalParents {
-		// kind/name.namespace
-		ks, nsname, ok := strings.Cut(p, "/")
-		if !ok {
-			log.Errorf("invalid InternalParentName parts: %s", p)
-			continue
-		}
-		var k kind.Kind
-		switch ks {
-		case kind.HTTPRoute.String():
-			k = kind.HTTPRoute
-		case kind.TCPRoute.String():
-			k = kind.TCPRoute
-		case kind.TLSRoute.String():
-			k = kind.TLSRoute
-		case kind.GRPCRoute.String():
-			k = kind.GRPCRoute
-		case kind.UDPRoute.String():
-			k = kind.UDPRoute
-		default:
-			// shouldn't happen
-			continue
-		}
-		name, ns, ok := strings.Cut(nsname, ".")
-		if !ok {
-			log.Errorf("invalid InternalParentName name: %s", nsname)
-			continue
-		}
-		out = append(out, ConfigKey{
-			Kind:      k,
-			Name:      name,
-			Namespace: ns,
-		})
-	}
-	return out
 }

@@ -92,9 +92,9 @@ func bindCmdlineFlags(cfg *config.Config, cmd *cobra.Command) {
 		"Comma separated list of outbound ports to be excluded from redirection to Envoy.",
 		&cfg.OutboundPortsExclude)
 
-	flag.BindEnv(fs, constants.KubeVirtInterfaces, "k",
+	flag.BindEnv(fs, constants.RerouteVirtualInterfaces, "k",
 		"Comma separated list of virtual interfaces whose inbound traffic (from VM) will be treated as outbound.",
-		&cfg.KubeVirtInterfaces)
+		&cfg.RerouteVirtualInterfaces)
 
 	flag.BindEnv(fs, constants.InboundTProxyMark, "t", "", &cfg.InboundTProxyMark)
 
@@ -102,11 +102,6 @@ func bindCmdlineFlags(cfg *config.Config, cmd *cobra.Command) {
 
 	flag.BindEnv(fs, constants.DryRun, "n", "Do not call any external dependencies like iptables.",
 		&cfg.DryRun)
-
-	flag.BindEnv(fs, constants.TraceLogging, "", "Insert tracing logs for each iptables rules, using the LOG chain.", &cfg.TraceLogging)
-
-	flag.BindEnv(fs, constants.RestoreFormat, "f", "Print iptables rules in iptables-restore interpretable format.",
-		&cfg.RestoreFormat)
 
 	flag.BindEnv(fs, constants.IptablesProbePort, "", "Set listen port for failure detection.", &cfg.IptablesProbePort)
 
@@ -136,6 +131,18 @@ func bindCmdlineFlags(cfg *config.Config, cmd *cobra.Command) {
 		&cfg.NetworkNamespace)
 
 	flag.BindEnv(fs, constants.CNIMode, "", "Whether to run as CNI plugin.", &cfg.HostFilesystemPodNetwork)
+
+	flag.BindEnv(fs, constants.Reconcile, "", "Reconcile pre-existing and incompatible iptables rules instead of failing if drift is detected.",
+		&cfg.Reconcile)
+
+	flag.BindEnv(fs, constants.CleanupOnly, "", "Perform a forced cleanup without creating new iptables chains or rules.",
+		&cfg.CleanupOnly)
+
+	// This flag is a safety measure in case the idempotency changes of #50328 backfire.
+	// Allow bypassing of iptables idempotency handling, and attempts to apply iptables rules regardless of table state, which may cause unrecoverable failures.
+	// Consider removing it after several releases with no reported issues.
+	flag.BindEnv(fs, constants.ForceApply, "", "Apply iptables changes even if they appear to already be in place.",
+		&cfg.ForceApply)
 }
 
 func GetCommand(logOpts *log.Options) *cobra.Command {
@@ -193,14 +200,16 @@ func ProgramIptables(cfg *config.Config) error {
 		ext = &dep.DependenciesStub{}
 	} else {
 		ext = &dep.RealDependencies{
-			HostFilesystemPodNetwork: cfg.HostFilesystemPodNetwork,
-			NetworkNamespace:         cfg.NetworkNamespace,
+			UsePodScopedXtablesLock: cfg.HostFilesystemPodNetwork,
+			NetworkNamespace:        cfg.NetworkNamespace,
 		}
 	}
 
-	iptConfigurator := capture.NewIptablesConfigurator(cfg, ext)
-
 	if !cfg.SkipRuleApply {
+		iptConfigurator, err := capture.NewIptablesConfigurator(cfg, ext)
+		if err != nil {
+			return err
+		}
 		if err := iptConfigurator.Run(); err != nil {
 			return err
 		}

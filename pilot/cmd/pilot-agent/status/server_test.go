@@ -781,6 +781,19 @@ func TestAppProbe(t *testing.T) {
 			statusCode: http.StatusOK,
 		},
 		{
+			name:      "http-prestopz-path",
+			probePath: "app-lifecycle/hello-world/prestopz",
+			config: KubeAppProbers{
+				"/app-lifecycle/hello-world/prestopz": &Prober{
+					HTTPGet: &apimirror.HTTPGetAction{
+						Path: "hello/texas",
+						Port: apimirror.IntOrString{IntVal: int32(appPort)},
+					},
+				},
+			},
+			statusCode: http.StatusOK,
+		},
+		{
 			name:      "http-livez-path",
 			probePath: "app-health/hello-world/livez",
 			config: KubeAppProbers{
@@ -878,7 +891,7 @@ func TestAppProbe(t *testing.T) {
 	testFn := func(t *testing.T, tc test) {
 		appProber, err := json.Marshal(tc.config)
 		if err != nil {
-			t.Fatalf("invalid app probers")
+			t.Fatal("invalid app probers")
 		}
 		config := Options{
 			KubeAppProbers: string(appProber),
@@ -1045,7 +1058,7 @@ func TestHttpsAppProbe(t *testing.T) {
 			client := http.Client{}
 			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%d/%s", statusPort, tc.probePath), nil)
 			if err != nil {
-				t.Fatalf("failed to create request")
+				t.Fatal("failed to create request")
 			}
 			resp, err := client.Do(req)
 			if err != nil {
@@ -1381,7 +1394,7 @@ func TestProbeHeader(t *testing.T) {
 				},
 			})
 			if err != nil {
-				t.Fatalf("invalid app probers")
+				t.Fatal("invalid app probers")
 			}
 			config := Options{
 				KubeAppProbers: string(appProber),
@@ -1441,9 +1454,13 @@ func TestHandleQuit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			shutdown := make(chan struct{})
+			drainDisabled := false
 			s := NewTestServer(t, Options{
-				Shutdown: func() {
+				Shutdown: func(err error) {
 					close(shutdown)
+				},
+				DisableDrain: func() {
+					drainDisabled = true
 				},
 			})
 			req, err := http.NewRequest(tt.method, "/quitquitquit", nil)
@@ -1460,17 +1477,19 @@ func TestHandleQuit(t *testing.T) {
 			if resp.Code != tt.expected {
 				t.Fatalf("Expected response code %v got %v", tt.expected, resp.Code)
 			}
-
 			if tt.expected == http.StatusOK {
+				if !drainDisabled {
+					t.Fatalf("Expected drain to be disabled")
+				}
 				select {
 				case <-shutdown:
 				case <-time.After(time.Second):
-					t.Fatalf("Failed to receive expected shutdown")
+					t.Fatal("Failed to receive expected shutdown")
 				}
 			} else {
 				select {
 				case <-shutdown:
-					t.Fatalf("unexpected shutdown")
+					t.Fatal("unexpected shutdown")
 				default:
 				}
 			}

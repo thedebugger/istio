@@ -7,9 +7,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
   namespace: istio-system
@@ -24,9 +23,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
   namespace: istio-system
@@ -65,7 +63,6 @@ data:
       scheme: https
       tls_config:
         ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        insecure_skip_verify: true
     - bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       job_name: kubernetes-nodes
       kubernetes_sd_configs:
@@ -83,7 +80,6 @@ data:
       scheme: https
       tls_config:
         ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        insecure_skip_verify: true
     - bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       job_name: kubernetes-nodes-cadvisor
       kubernetes_sd_configs:
@@ -101,7 +97,6 @@ data:
       scheme: https
       tls_config:
         ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        insecure_skip_verify: true
     - honor_labels: true
       job_name: kubernetes-service-endpoints
       kubernetes_sd_configs:
@@ -359,9 +354,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
 rules:
@@ -381,7 +375,6 @@ rules:
       - list
       - watch
   - apiGroups:
-      - "extensions"
       - "networking.k8s.io"
     resources:
       - ingresses/status
@@ -411,9 +404,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
 subjects:
@@ -433,9 +425,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
   namespace: istio-system
@@ -460,9 +451,8 @@ metadata:
     app.kubernetes.io/component: server
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/instance: prometheus
-    app.kubernetes.io/version: v2.52.0
-    helm.sh/chart: prometheus-25.21.0
-    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/version: v3.4.1
+    helm.sh/chart: prometheus-27.20.0
     app.kubernetes.io/part-of: prometheus
   name: prometheus
   namespace: istio-system
@@ -483,9 +473,8 @@ spec:
         app.kubernetes.io/component: server
         app.kubernetes.io/name: prometheus
         app.kubernetes.io/instance: prometheus
-        app.kubernetes.io/version: v2.52.0
-        helm.sh/chart: prometheus-25.21.0
-        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/version: v3.4.1
+        helm.sh/chart: prometheus-27.20.0
         app.kubernetes.io/part-of: prometheus
         
         sidecar.istio.io/inject: "false"
@@ -494,18 +483,35 @@ spec:
       serviceAccountName: prometheus
       containers:
         - name: prometheus-server-configmap-reload
-          image: "ghcr.io/prometheus-operator/prometheus-config-reloader:v0.73.2"
+          image: "ghcr.io/prometheus-operator/prometheus-config-reloader:v0.83.0"
           imagePullPolicy: "IfNotPresent"
           args:
             - --watched-dir=/etc/config
+            - --listen-address=0.0.0.0:8080
             - --reload-url=http://127.0.0.1:9090/-/reload
+          ports:
+            - containerPort: 8080
+              name: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+              scheme: HTTP
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+              scheme: HTTP
+            periodSeconds: 10
           volumeMounts:
             - name: config-volume
               mountPath: /etc/config
               readOnly: true
 
         - name: prometheus-server
-          image: "prom/prometheus:v2.52.0"
+          image: "prom/prometheus:v3.4.1"
           imagePullPolicy: "IfNotPresent"
           args:
             - --storage.tsdb.retention.time=15d

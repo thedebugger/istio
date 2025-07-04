@@ -49,7 +49,7 @@ endif
 export VERSION
 
 # Base version of Istio image to use
-BASE_VERSION ?= master-2024-06-02T19-03-25
+BASE_VERSION ?= master-2025-07-01T19-01-28
 ISTIO_BASE_REGISTRY ?= gcr.io/istio-release
 
 export GO111MODULE ?= on
@@ -211,13 +211,13 @@ STANDARD_BINARIES:=./istioctl/cmd/istioctl \
   ./pilot/cmd/pilot-discovery \
   ./pkg/test/echo/cmd/client \
   ./pkg/test/echo/cmd/server \
-  ./samples/extauthz/cmd/extauthz \
-  ./operator/cmd/operator
+  ./samples/extauthz/cmd/extauthz
 
+CNI_BINARIES:=./cni/cmd/istio-cni \
+	./cni/cmd/install-cni
 # These are binaries that require Linux to build, and should
 # be skipped on other platforms. Notably this includes the current Linux-only Istio CNI plugin
-LINUX_AGENT_BINARIES:=./cni/cmd/istio-cni \
-  ./cni/cmd/install-cni \
+LINUX_AGENT_BINARIES:=$(CNI_BINARIES) \
   $(AGENT_BINARIES)
 
 BINARIES:=$(STANDARD_BINARIES) $(AGENT_BINARIES) $(LINUX_AGENT_BINARIES)
@@ -228,7 +228,8 @@ RELEASE_SIZE_TEST_BINARIES:=pilot-discovery pilot-agent istioctl envoy ztunnel c
 # agent: enables agent-specific files. Usually this is used to trim dependencies where they would be hard to trim through standard refactoring
 # disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
 # not set vtprotobuf: this adds some performance improvement, but at a binary cost increase that is not worth it for the agent
-AGENT_TAGS=agent,disable_pgv
+# notrace: helps with https://github.com/istio/istio/issues/56636 and reduces bnary size
+AGENT_TAGS=agent,disable_pgv,grpcnotrace,retrynotrace
 # disable_pgv: disables protoc-gen-validation. This is not used buts adds many MB to Envoy protos
 # vtprotobuf: enables optimized protobuf marshalling.
 STANDARD_TAGS=vtprotobuf,disable_pgv
@@ -246,6 +247,10 @@ build: depend ## Builds all go binaries.
 build-linux: depend
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(STANDARD_TAGS) $(STANDARD_BINARIES)
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=$(AGENT_TAGS) $(LINUX_AGENT_BINARIES)
+
+.PHONY: build-cni
+build-cni: depend
+	GOOS=$(GOOS_LOCAL) GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT)/ -tags=$(AGENT_TAGS) $(CNI_BINARIES)
 
 # Create targets for TARGET_OUT_LINUX/binary
 # There are two use cases here:
@@ -279,51 +284,29 @@ MARKDOWN_LINT_ALLOWLIST=localhost:8080,storage.googleapis.com/istio-artifacts/pi
 lint-helm-global:
 	find manifests -name 'Chart.yaml' -print0 | ${XARGS} -L 1 dirname | xargs -r helm lint
 
-lint: lint-python lint-copyright-banner lint-scripts lint-go lint-dockerfiles lint-markdown lint-yaml lint-licenses lint-helm-global check-agent-deps ## Runs all linters.
+lint: lint-python lint-copyright-banner lint-scripts lint-go lint-dockerfiles lint-markdown lint-yaml lint-licenses lint-helm-global ## Runs all linters.
 	@bin/check_samples.sh
 	@testlinter
 	@envvarlinter istioctl pilot security
-
-# Allow-list:
-# (k8s) some Machinery, utils, klog
-# (proto) Istio API non-CRDs, MeshConfig and ProxyConfig
-# (proto) Envoy TLS proto for SDS
-# (proto) Envoy Wasm filters for wasm xDS proxy
-# (proto) xDS discovery service for xDS proxy
-# (proto) SDS secret and contrib QAT and cryptomb
-.PHONY: check-agent-deps
-check-agent-deps:
-	@go list -f '{{ join .Deps "\n" }}' -tags=agent \
-			./pilot/cmd/pilot-agent/... \
-			./pkg/istio-agent/... | sort | uniq |\
-		grep -Pv '^k8s.io/(utils|klog)/' |\
-		grep -Pv '^k8s.io/apimachinery/pkg/types' |\
-		grep -Pv '^k8s.io/apimachinery/pkg/util/(rand|version)' |\
-		grep -Pv 'envoy/type/|envoy/annotations|envoy/config/core/' |\
-		grep -Pv 'envoy/extensions/transport_sockets/tls/' |\
-		grep -Pv 'envoy/service/(discovery|secret)/v3' |\
-		grep -Pv 'envoy/extensions/wasm/' |\
-		grep -Pv 'envoy/extensions/filters/(http|network)/wasm/' |\
-		grep -Pv 'contrib/envoy/extensions/private_key_providers/' |\
-		grep -Pv 'istio\.io/api/(annotation|label|mcp|mesh|networking|analysis/v1alpha1|meta/v1alpha1|security/v1alpha1|type)' |\
-		(! grep -P '^k8s.io|^sigs.k8s.io/gateway-api|cel|antlr|jwx/jwk|envoy/|istio.io/api')
 
 go-gen:
 	@mkdir -p /tmp/bin
 	@PATH="${PATH}":/tmp/bin go generate ./...
 
 refresh-goldens:
-	@REFRESH_GOLDEN=true go test ${GOBUILDFLAGS} ./operator/... \
+	REFRESH_GOLDEN=true go test ${GOBUILDFLAGS} ./operator/... \
 		./pkg/bootstrap/... \
 		./pkg/kube/inject/... \
+		./pilot/pkg/config/kube/gateway/... \
 		./pilot/pkg/security/authz/builder/... \
-		./cni/pkg/plugin/...
+		./pilot/pkg/serviceregistry/kube/controller/ambient/... \
+		./cni/pkg/iptables/... \
+		./cni/pkg/plugin/... \
+		./istioctl/pkg/workload/... \
+		./istioctl/pkg/writer/envoy/configdump/... \
+		./istioctl/pkg/writer/ztunnel/configdump/...
 
 update-golden: refresh-goldens
-
-# Keep dummy target since some build pipelines depend on this
-gen-charts:
-	@echo "This target is no longer required and will be removed in the future"
 
 gen-addons:
 	manifests/addons/gen.sh
@@ -341,9 +324,8 @@ gen: \
 
 gen-check: gen check-clean-repo
 
-CHARTS = gateway default ztunnel istio-operator base "gateways/istio-ingress" "gateways/istio-egress" "istio-control/istio-discovery" istiod-remote istio-cni
+CHARTS = gateway default ztunnel base "gateways/istio-ingress" "gateways/istio-egress" "istio-control/istio-discovery" istio-cni
 copy-templates:
-	rm manifests/charts/istiod-remote/templates/*
 	rm manifests/charts/gateways/istio-egress/templates/*
 
 	# gateway charts
@@ -351,40 +333,13 @@ copy-templates:
 	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/ingress/egress/g' {} \;
 	find ./manifests/charts/gateways/istio-egress/templates -type f -exec sed -i -e 's/Ingress/Egress/g' {} \;
 
-	# external istiod remote cluster charts
-	cp manifests/charts/base/templates/services.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/base/templates/endpoints.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/base/templates/reader-serviceaccount.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/istio-control/istio-discovery/templates/mutatingwebhook.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/istio-control/istio-discovery/templates/reader-clusterrole.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/istio-control/istio-discovery/templates/reader-clusterrolebinding.yaml manifests/charts/istiod-remote/templates
-
-	# external istiod config cluster charts
-	cp manifests/charts/istio-control/istio-discovery/files/injection-template.yaml manifests/charts/istiod-remote/files
-	cp manifests/charts/istio-control/istio-discovery/files/gateway-injection-template.yaml manifests/charts/istiod-remote/files
-	cp manifests/charts/istio-control/istio-discovery/templates/istiod-injector-configmap.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/istio-control/istio-discovery/templates/configmap.yaml manifests/charts/istiod-remote/templates
-	cp manifests/charts/istio-control/istio-discovery/templates/_helpers.tpl manifests/charts/istiod-remote/templates
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/base/crds/crd-all.gen.yaml > manifests/charts/istiod-remote/templates/crd-all.gen.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/base/templates/validatingadmissionpolicy.yaml > manifests/charts/istiod-remote/templates/defaultrevisionvalidatingadmissionpolicy.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/validatingadmissionpolicy.yaml > manifests/charts/istiod-remote/templates/validatingadmissionpolicy.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/base/templates/default.yaml > manifests/charts/istiod-remote/templates/default.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/validatingwebhookconfiguration.yaml > manifests/charts/istiod-remote/templates/validatingwebhookconfiguration.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/serviceaccount.yaml > manifests/charts/istiod-remote/templates/serviceaccount.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/role.yaml > manifests/charts/istiod-remote/templates/role.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/rolebinding.yaml > manifests/charts/istiod-remote/templates/rolebinding.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/clusterrole.yaml > manifests/charts/istiod-remote/templates/clusterrole.yaml
-	sed -e '1 i {{- if .Values.global.configCluster }}' -e '$$ a {{- end }}' manifests/charts/istio-control/istio-discovery/templates/clusterrolebinding.yaml > manifests/charts/istiod-remote/templates/clusterrolebinding.yaml
-
 	# copy istio-discovery values, but apply some local customizations
-	cp manifests/charts/istio-control/istio-discovery/values.yaml manifests/charts/istiod-remote/
-	yq -i '.defaults.telemetry.enabled=false | .defaults.global.externalIstiod=true | .defaults.global.omitSidecarInjectorConfigMap=true | .defaults.pilot.configMap=false' manifests/charts/istiod-remote/values.yaml
 	warning=$$(cat manifests/helm-profiles/warning-edit.txt | sed ':a;N;$$!ba;s/\n/\\n/g') ; \
 	for chart in $(CHARTS) ; do \
 		for profile in manifests/helm-profiles/*.yaml ; do \
 			sed "1s|^|$${warning}\n\n|" $$profile > manifests/charts/$$chart/files/profile-$$(basename $$profile) ; \
 		done; \
-		[[ "$$chart" == "ztunnel" ]] && flatten="true" || flatten="false" ; \
+		[[ "$$chart" == "ztunnel" ]] || [[ "$$chart" == "gateway" ]] && flatten="true" || flatten="false" ; \
 		cat manifests/zzz_profile.yaml | \
 		  sed "s/FLATTEN_GLOBALS_REPLACEMENT/$${flatten}/g" \
 		  > manifests/charts/$$chart/templates/zzz_profile.yaml ; \

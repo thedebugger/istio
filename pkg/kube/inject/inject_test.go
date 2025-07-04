@@ -35,7 +35,7 @@ import (
 	"istio.io/api/annotation"
 	meshapi "istio.io/api/mesh/v1alpha1"
 	proxyConfig "istio.io/api/networking/v1beta1"
-	opconfig "istio.io/istio/operator/pkg/apis/istio/v1alpha1"
+	opconfig "istio.io/istio/operator/pkg/apis"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/util"
@@ -54,6 +54,22 @@ import (
 // TestInjection tests both the mutating webhook and kube-inject. It does this by sharing the same input and output
 // test files and running through the two different code paths.
 func TestInjection(t *testing.T) {
+	multi := multicluster.NewFakeController()
+	client := kube.NewFakeClient(
+		&corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-ns",
+				Annotations: map[string]string{
+					securityv1.UIDRangeAnnotation:           "1000620000/10000",
+					securityv1.SupplementalGroupsAnnotation: "1000620000/10000",
+				},
+			},
+		})
+	multiclusterNamespaceController := multicluster.BuildMultiClusterKclientComponent[*corev1.Namespace](multi, kubetypes.Filter{})
+	stop := test.NewStop(t)
+	multi.Add(constants.DefaultClusterName, client, stop)
+	client.RunAndWait(stop)
+
 	type testCase struct {
 		in            string
 		want          string
@@ -73,7 +89,7 @@ func TestInjection(t *testing.T) {
 			want: "hello.yaml.cni.injected",
 			setFlags: []string{
 				"components.cni.enabled=true",
-				"values.istio_cni.provider=default",
+				"values.cni.provider=default",
 				"values.global.network=network1",
 			},
 		},
@@ -100,11 +116,6 @@ func TestInjection(t *testing.T) {
 			in:       "hello.yaml",
 			want:     "hello-never.yaml.injected",
 			setFlags: []string{"values.global.imagePullPolicy=Never"},
-		},
-		{
-			in:       "enable-core-dump.yaml",
-			want:     "enable-core-dump.yaml.injected",
-			setFlags: []string{"values.global.proxy.enableCoreDump=true"},
 		},
 		{
 			in:   "format-duration.yaml",
@@ -147,6 +158,17 @@ func TestInjection(t *testing.T) {
 			},
 		},
 		{
+			// Verifies that the kubevirtInterfaces list are applied properly from parameters..
+			in:   "reroute-virtual-interfaces.yaml",
+			want: "reroute-virtual-interfaces.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.statusPort=123`,
+				`values.global.proxy.readinessInitialDelaySeconds=100`,
+				`values.global.proxy.readinessPeriodSeconds=200`,
+				`values.global.proxy.readinessFailureThreshold=300`,
+			},
+		},
+		{
 			// Verifies that global.imagePullSecrets are applied properly
 			in:         "hello.yaml",
 			want:       "hello-image-secrets-in-values.yaml.injected",
@@ -176,7 +198,7 @@ func TestInjection(t *testing.T) {
 			want: "hello-cncf-networks.yaml.injected",
 			setFlags: []string{
 				`components.cni.enabled=true`,
-				`values.istio_cni.provider=multus`,
+				`values.cni.provider=multus`,
 			},
 		},
 		{
@@ -185,7 +207,7 @@ func TestInjection(t *testing.T) {
 			want: "hello-existing-cncf-networks.yaml.injected",
 			setFlags: []string{
 				`components.cni.enabled=true`,
-				`values.istio_cni.provider=multus`,
+				`values.cni.provider=multus`,
 			},
 		},
 		{
@@ -194,7 +216,7 @@ func TestInjection(t *testing.T) {
 			want: "hello-existing-cncf-networks-json.yaml.injected",
 			setFlags: []string{
 				`components.cni.enabled=true`,
-				`values.istio_cni.provider=multus`,
+				`values.cni.provider=multus`,
 			},
 		},
 		{
@@ -329,6 +351,34 @@ func TestInjection(t *testing.T) {
 			},
 		},
 		{
+			in:   "native-sidecar-opt-in.yaml",
+			want: "native-sidecar-opt-in.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, features.EnableNativeSidecars.Name, "true")
+			},
+		},
+		{
+			in:   "native-sidecar-opt-in.yaml",
+			want: "native-sidecar-opt-in.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, features.EnableNativeSidecars.Name, "false")
+			},
+		},
+		{
+			in:   "native-sidecar-opt-out.yaml",
+			want: "native-sidecar-opt-out.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, features.EnableNativeSidecars.Name, "true")
+			},
+		},
+		{
+			in:   "native-sidecar-opt-out.yaml",
+			want: "native-sidecar-opt-out.yaml.injected",
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, features.EnableNativeSidecars.Name, "false")
+			},
+		},
+		{
 			in:         "custom-template.yaml",
 			want:       "custom-template.yaml.injected",
 			inFilePath: "custom-template.iop.yaml",
@@ -378,6 +428,29 @@ func TestInjection(t *testing.T) {
 			},
 		},
 		{
+			// Test webhook custom injection on OpenShift.
+			in:   "hello-openshift-custom-injection.yaml",
+			want: "hello-openshift-custom-injection.yaml.injected",
+			setFlags: []string{
+				"components.cni.enabled=true",
+			},
+			skipInjection: true,
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, platform.Platform.Name, platform.OpenShift)
+			},
+		},
+		{
+			in:   "hello-openshift-tproxy.yaml",
+			want: "hello-openshift-tproxy.yaml.injected",
+			setFlags: []string{
+				"components.cni.enabled=true",
+			},
+			skipInjection: true,
+			setup: func(t test.Failer) {
+				test.SetEnvForTest(t, platform.Platform.Name, platform.OpenShift)
+			},
+		},
+		{
 			// Validates localhost probes get injected correctly
 			in:   "hello-probes-localhost.yaml",
 			want: "hello-probes-localhost.yaml.injected",
@@ -386,6 +459,16 @@ func TestInjection(t *testing.T) {
 					Mode: meshapi.MeshConfig_InboundTrafficPolicy_LOCALHOST,
 				}
 			},
+		},
+		{
+			in:         "sidecar-spire.yaml",
+			want:       "sidecar-spire.yaml.injected",
+			inFilePath: "spire-template.iop.yaml",
+		},
+		{
+			in:         "gateway-spire.yaml",
+			want:       "gateway-spire.yaml.injected",
+			inFilePath: "spire-template.iop.yaml",
 		},
 	}
 	// Keep track of tests we add options above
@@ -403,7 +486,7 @@ func TestInjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(files) < 3 {
-		t.Fatalf("Didn't find test files - something must have gone wrong")
+		t.Fatal("Didn't find test files - something must have gone wrong")
 	}
 	// Automatically add any other test files in the folder. This ensures we don't
 	// forget to add to this list, that we don't have duplicates, etc
@@ -426,21 +509,9 @@ func TestInjection(t *testing.T) {
 		cases = append(cases, testCase{in: f.Name(), want: want})
 	}
 
-	// Precompute injection settings. This may seem like a premature optimization, but due to the size of
-	// YAMLs, with -race this was taking >10min in some cases to generate!
-	if util.Refresh() {
-		cleanupOldFiles(t)
-		writeInjectionSettings(t, "default", nil, "")
-		for i, c := range cases {
-			if c.setFlags != nil || c.inFilePath != "" {
-				writeInjectionSettings(t, fmt.Sprintf("%s.%d", c.in, i), c.setFlags, c.inFilePath)
-			}
-		}
-	}
 	// Preload default settings. Computation here is expensive, so this speeds the tests up substantially
-	defaultTemplate, defaultValues, defaultMesh := readInjectionSettings(t, "default")
+	defaultTemplate, defaultValues, defaultMesh := getInjectionSettings(t, nil, "")
 	for i, c := range cases {
-		i, c := i, c
 		testName := fmt.Sprintf("[%02d] %s", i, c.want)
 		if c.expectedError != "" {
 			testName = fmt.Sprintf("[%02d] %s", i, c.in)
@@ -459,7 +530,7 @@ func TestInjection(t *testing.T) {
 			}
 			sidecarTemplate, valuesConfig := defaultTemplate, defaultValues
 			if c.setFlags != nil || c.inFilePath != "" {
-				sidecarTemplate, valuesConfig, mc = readInjectionSettings(t, fmt.Sprintf("%s.%d", c.in, i))
+				sidecarTemplate, valuesConfig, mc = getInjectionSettings(t, c.setFlags, c.inFilePath)
 			}
 			if c.mesh != nil {
 				c.mesh(mc)
@@ -497,7 +568,7 @@ func TestInjection(t *testing.T) {
 					t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
 				}
 				if c.expectedError != "" {
-					t.Fatalf("expected error but got none")
+					t.Fatal("expected error but got none")
 				}
 				if c.expectedLog != "" {
 					hasExpectedLog := false
@@ -526,7 +597,7 @@ func TestInjection(t *testing.T) {
 			}
 			// Next run the webhook test. This one is a bit trickier as the webhook operates
 			// on Pods, but the inputs are Deployments/StatefulSets/etc. As a result, we need
-			// to convert these to pods, then run the injection This test will *not*
+			// to convert these to pods, then run the injection. This test will *not*
 			// overwrite golden files, as we do not have identical textual output as
 			// kube-inject. Instead, we just compare the desired/actual pod specs.
 			t.Run("webhook", func(t *testing.T) {
@@ -535,30 +606,14 @@ func TestInjection(t *testing.T) {
 					ProxyConfigs: &model.ProxyConfigs{},
 				})
 
-				multi := multicluster.NewFakeController()
-				client := kube.NewFakeClient(
-					&corev1.Namespace{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "test-ns",
-							Annotations: map[string]string{
-								securityv1.UIDRangeAnnotation:           "1000620000/10000",
-								securityv1.SupplementalGroupsAnnotation: "1000620000/10000",
-							},
-						},
-					})
-
 				webhook := &Webhook{
 					Config:       sidecarTemplate,
 					meshConfig:   mc,
 					env:          env,
 					valuesConfig: valuesConfig,
 					revision:     "default",
-					namespaces:   multicluster.BuildMultiClusterKclientComponent[*corev1.Namespace](multi, kubetypes.Filter{}),
+					namespaces:   multiclusterNamespaceController,
 				}
-
-				stop := test.NewStop(t)
-				multi.Add(constants.DefaultClusterName, client, stop)
-				client.RunAndWait(stop)
 
 				// Split multi-part yaml documents. Input and output will have the same number of parts.
 				inputYAMLs := splitYamlFile(inputFilePath, t)
@@ -988,7 +1043,6 @@ func TestAppendMultusNetwork(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			actual := appendMultusNetwork(tc.in, "istio-cni")
@@ -1198,7 +1252,7 @@ func BenchmarkInjection(b *testing.B) {
 	for _, tt := range cases {
 		b.Run(tt.name, func(b *testing.B) {
 			// Preload default settings. Computation here is expensive, so this speeds the tests up substantially
-			sidecarTemplate, valuesConfig, mc := readInjectionSettings(b, "default")
+			sidecarTemplate, valuesConfig, mc := getInjectionSettings(b, nil, "")
 			env := &model.Environment{}
 			env.SetPushContext(&model.PushContext{
 				ProxyConfigs: &model.ProxyConfigs{},

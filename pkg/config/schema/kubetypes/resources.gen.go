@@ -5,15 +5,20 @@ package kubetypes
 import (
 	k8sioapiadmissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	k8sioapiappsv1 "k8s.io/api/apps/v1"
+	k8sioapiautoscalingv2 "k8s.io/api/autoscaling/v2"
 	k8sioapicertificatesv1 "k8s.io/api/certificates/v1"
+	k8sioapicertificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	k8sioapicoordinationv1 "k8s.io/api/coordination/v1"
 	k8sioapicorev1 "k8s.io/api/core/v1"
 	k8sioapidiscoveryv1 "k8s.io/api/discovery/v1"
 	k8sioapinetworkingv1 "k8s.io/api/networking/v1"
+	k8sioapipolicyv1 "k8s.io/api/policy/v1"
 	k8sioapiextensionsapiserverpkgapisapiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	sigsk8siogatewayapiapisv1 "sigs.k8s.io/gateway-api/apis/v1"
 	sigsk8siogatewayapiapisv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	sigsk8siogatewayapiapisv1alpha3 "sigs.k8s.io/gateway-api/apis/v1alpha3"
 	sigsk8siogatewayapiapisv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	sigsk8siogatewayapiapisxv1alpha1 "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	istioioapiextensionsv1alpha1 "istio.io/api/extensions/v1alpha1"
 	istioioapimeshv1alpha1 "istio.io/api/mesh/v1alpha1"
@@ -22,10 +27,11 @@ import (
 	istioioapisecurityv1beta1 "istio.io/api/security/v1beta1"
 	istioioapitelemetryv1alpha1 "istio.io/api/telemetry/v1alpha1"
 	apiistioioapiextensionsv1alpha1 "istio.io/client-go/pkg/apis/extensions/v1alpha1"
+	apiistioioapinetworkingv1 "istio.io/client-go/pkg/apis/networking/v1"
 	apiistioioapinetworkingv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	apiistioioapinetworkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
-	apiistioioapisecurityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
-	apiistioioapitelemetryv1alpha1 "istio.io/client-go/pkg/apis/telemetry/v1alpha1"
+	apiistioioapisecurityv1 "istio.io/client-go/pkg/apis/security/v1"
+	apiistioioapitelemetryv1 "istio.io/client-go/pkg/apis/telemetry/v1"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/gvk"
 )
@@ -34,10 +40,14 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 	switch obj.(type) {
 	case *istioioapisecurityv1beta1.AuthorizationPolicy:
 		return gvk.AuthorizationPolicy, true
-	case *apiistioioapisecurityv1beta1.AuthorizationPolicy:
+	case *apiistioioapisecurityv1.AuthorizationPolicy:
 		return gvk.AuthorizationPolicy, true
+	case *sigsk8siogatewayapiapisv1alpha3.BackendTLSPolicy:
+		return gvk.BackendTLSPolicy, true
 	case *k8sioapicertificatesv1.CertificateSigningRequest:
 		return gvk.CertificateSigningRequest, true
+	case *k8sioapicertificatesv1beta1.ClusterTrustBundle:
+		return gvk.ClusterTrustBundle, true
 	case *k8sioapicorev1.ConfigMap:
 		return gvk.ConfigMap, true
 	case *k8sioapiextensionsapiserverpkgapisapiextensionsv1.CustomResourceDefinition:
@@ -48,7 +58,7 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.Deployment, true
 	case *istioioapinetworkingv1alpha3.DestinationRule:
 		return gvk.DestinationRule, true
-	case *apiistioioapinetworkingv1alpha3.DestinationRule:
+	case *apiistioioapinetworkingv1.DestinationRule:
 		return gvk.DestinationRule, true
 	case *k8sioapidiscoveryv1.EndpointSlice:
 		return gvk.EndpointSlice, true
@@ -62,12 +72,14 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.GRPCRoute, true
 	case *istioioapinetworkingv1alpha3.Gateway:
 		return gvk.Gateway, true
-	case *apiistioioapinetworkingv1alpha3.Gateway:
+	case *apiistioioapinetworkingv1.Gateway:
 		return gvk.Gateway, true
 	case *sigsk8siogatewayapiapisv1beta1.GatewayClass:
 		return gvk.GatewayClass, true
 	case *sigsk8siogatewayapiapisv1beta1.HTTPRoute:
 		return gvk.HTTPRoute, true
+	case *k8sioapiautoscalingv2.HorizontalPodAutoscaler:
+		return gvk.HorizontalPodAutoscaler, true
 	case *k8sioapinetworkingv1.Ingress:
 		return gvk.Ingress, true
 	case *k8sioapinetworkingv1.IngressClass:
@@ -88,10 +100,12 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.Node, true
 	case *istioioapisecurityv1beta1.PeerAuthentication:
 		return gvk.PeerAuthentication, true
-	case *apiistioioapisecurityv1beta1.PeerAuthentication:
+	case *apiistioioapisecurityv1.PeerAuthentication:
 		return gvk.PeerAuthentication, true
 	case *k8sioapicorev1.Pod:
 		return gvk.Pod, true
+	case *k8sioapipolicyv1.PodDisruptionBudget:
+		return gvk.PodDisruptionBudget, true
 	case *istioioapinetworkingv1beta1.ProxyConfig:
 		return gvk.ProxyConfig, true
 	case *apiistioioapinetworkingv1beta1.ProxyConfig:
@@ -100,7 +114,7 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.ReferenceGrant, true
 	case *istioioapisecurityv1beta1.RequestAuthentication:
 		return gvk.RequestAuthentication, true
-	case *apiistioioapisecurityv1beta1.RequestAuthentication:
+	case *apiistioioapisecurityv1.RequestAuthentication:
 		return gvk.RequestAuthentication, true
 	case *k8sioapicorev1.Secret:
 		return gvk.Secret, true
@@ -110,11 +124,11 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.ServiceAccount, true
 	case *istioioapinetworkingv1alpha3.ServiceEntry:
 		return gvk.ServiceEntry, true
-	case *apiistioioapinetworkingv1alpha3.ServiceEntry:
+	case *apiistioioapinetworkingv1.ServiceEntry:
 		return gvk.ServiceEntry, true
 	case *istioioapinetworkingv1alpha3.Sidecar:
 		return gvk.Sidecar, true
-	case *apiistioioapinetworkingv1alpha3.Sidecar:
+	case *apiistioioapinetworkingv1.Sidecar:
 		return gvk.Sidecar, true
 	case *k8sioapiappsv1.StatefulSet:
 		return gvk.StatefulSet, true
@@ -124,7 +138,7 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.TLSRoute, true
 	case *istioioapitelemetryv1alpha1.Telemetry:
 		return gvk.Telemetry, true
-	case *apiistioioapitelemetryv1alpha1.Telemetry:
+	case *apiistioioapitelemetryv1.Telemetry:
 		return gvk.Telemetry, true
 	case *sigsk8siogatewayapiapisv1alpha2.UDPRoute:
 		return gvk.UDPRoute, true
@@ -132,7 +146,7 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.ValidatingWebhookConfiguration, true
 	case *istioioapinetworkingv1alpha3.VirtualService:
 		return gvk.VirtualService, true
-	case *apiistioioapinetworkingv1alpha3.VirtualService:
+	case *apiistioioapinetworkingv1.VirtualService:
 		return gvk.VirtualService, true
 	case *istioioapiextensionsv1alpha1.WasmPlugin:
 		return gvk.WasmPlugin, true
@@ -140,12 +154,16 @@ func getGvk(obj any) (config.GroupVersionKind, bool) {
 		return gvk.WasmPlugin, true
 	case *istioioapinetworkingv1alpha3.WorkloadEntry:
 		return gvk.WorkloadEntry, true
-	case *apiistioioapinetworkingv1alpha3.WorkloadEntry:
+	case *apiistioioapinetworkingv1.WorkloadEntry:
 		return gvk.WorkloadEntry, true
 	case *istioioapinetworkingv1alpha3.WorkloadGroup:
 		return gvk.WorkloadGroup, true
-	case *apiistioioapinetworkingv1alpha3.WorkloadGroup:
+	case *apiistioioapinetworkingv1.WorkloadGroup:
 		return gvk.WorkloadGroup, true
+	case *sigsk8siogatewayapiapisxv1alpha1.XBackendTrafficPolicy:
+		return gvk.XBackendTrafficPolicy, true
+	case *sigsk8siogatewayapiapisxv1alpha1.XListenerSet:
+		return gvk.XListenerSet, true
 	default:
 		return config.GroupVersionKind{}, false
 	}

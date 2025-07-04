@@ -21,9 +21,10 @@ import (
 	"time"
 
 	"github.com/mitchellh/copystructure"
-	"gopkg.in/yaml.v3"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/api/annotation"
+	"istio.io/api/label"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
@@ -54,8 +55,8 @@ type Configurable interface {
 	// Short form for Config().NamespacedName().
 	NamespacedName() NamespacedName
 
-	// ServiceAccountName returns the service account string for this service.
-	ServiceAccountName() string
+	// SpiffeIdentity returns the spiffe identity for this service (without the spiffe:// prefix)
+	SpiffeIdentity() string
 
 	// ClusterLocalFQDN returns the fully qualified domain name for cluster-local host.
 	ClusterLocalFQDN() string
@@ -183,6 +184,9 @@ type Config struct {
 
 	// WorkloadWaypointProxy specifies if this workload should have an associated Waypoint for workload-addressed traffic
 	WorkloadWaypointProxy string
+
+	// Specify IP family to which echo will bind
+	BindFamily string
 }
 
 // Getter for a custom echo deployment
@@ -221,8 +225,8 @@ func (c Config) AccountName() string {
 	return "default"
 }
 
-// ServiceAccountName returns the service account name for this service.
-func (c Config) ServiceAccountName() string {
+// SpiffeIdentity returns the service account name for this service.
+func (c Config) SpiffeIdentity() string {
 	return "cluster.local/ns/" + c.NamespaceName() + "/sa/" + c.Service
 }
 
@@ -366,7 +370,7 @@ func (c Config) HasSidecar() bool {
 
 func (c Config) IsUncaptured() bool {
 	// TODO this can be more robust to not require labeling initial echo config (check namespace + isWaypoint + not sidecar)
-	return len(c.Subsets) > 0 && c.Subsets[0].Labels != nil && c.Subsets[0].Labels[constants.DataplaneModeLabel] == constants.DataplaneModeNone
+	return len(c.Subsets) > 0 && c.Subsets[0].Labels != nil && c.Subsets[0].Labels[label.IoIstioDataplaneMode.Name] == constants.DataplaneModeNone
 }
 
 func (c Config) HasProxyCapabilities() bool {
@@ -414,11 +418,11 @@ func (c Config) WaypointClient() bool {
 func (c Config) ZTunnelCaptured() bool {
 	haveSubsets := len(c.Subsets) > 0
 	if c.Namespace.IsAmbient() && haveSubsets &&
-		c.Subsets[0].Labels[constants.DataplaneModeLabel] != constants.DataplaneModeNone &&
+		c.Subsets[0].Labels[label.IoIstioDataplaneMode.Name] != constants.DataplaneModeNone &&
 		!c.HasSidecar() {
 		return true
 	}
-	return haveSubsets && c.Subsets[0].Annotations[constants.AmbientRedirection] == constants.AmbientRedirectionEnabled
+	return haveSubsets && c.Subsets[0].Annotations[annotation.AmbientRedirection.Name] == constants.AmbientRedirectionEnabled
 }
 
 // DeepCopy creates a clone of IstioEndpoint.

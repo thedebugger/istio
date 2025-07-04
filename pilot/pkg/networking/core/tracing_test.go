@@ -39,6 +39,8 @@ import (
 	"istio.io/istio/pkg/test/util/assert"
 )
 
+const DefaultZipkinEndpoint = "/api/v2/spans"
+
 func TestConfigureTracingExhaustiveness(t *testing.T) {
 	model.AssertProvidersHandled(configureFromProviderConfigHandled)
 }
@@ -75,14 +77,16 @@ func TestConfigureTracing(t *testing.T) {
 			name: "default providers",
 			inSpec: &model.TracingConfig{
 				ClientSpec: model.TracingSpec{
-					Disabled: true,
+					Disabled:        true,
+					EnableIstioTags: true,
 				},
 				ServerSpec: model.TracingSpec{
-					Provider: fakeZipkin(),
+					Provider:        fakeZipkin(),
+					EnableIstioTags: true,
 				},
 			},
 			opts:            fakeOptsWithDefaultProviders(),
-			want:            fakeTracingConfig(fakeZipkinProvider(clusterName, authority, true), 55.5, 256, defaultTracingTags()),
+			want:            fakeTracingConfig(fakeZipkinProvider(clusterName, authority, DefaultZipkinEndpoint, true), 55.5, 256, defaultTracingTags()),
 			wantReqIDExtCtx: &requestidextension.UUIDRequestIDExtensionContext{},
 		},
 		{
@@ -93,9 +97,16 @@ func TestConfigureTracing(t *testing.T) {
 		},
 		{
 			name:            "only telemetry api (no provider)",
-			inSpec:          fakeTracingSpecNoProvider(99.999, false, true),
+			inSpec:          fakeTracingSpecNoProvider(99.999, false, true, true),
 			opts:            fakeOptsOnlyZipkinTelemetryAPI(),
 			want:            fakeTracingConfigNoProvider(99.999, 0, append(defaultTracingTags(), fakeEnvTag)),
+			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
+		},
+		{
+			name:            "only telemetry api (no provider) and disabled istio tags",
+			inSpec:          fakeTracingSpecNoProvider(99.999, false, true, false),
+			opts:            fakeOptsOnlyZipkinTelemetryAPI(),
+			want:            fakeTracingConfigNoProvider(99.999, 0, append([]*tracing.CustomTag{}, fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
@@ -107,51 +118,55 @@ func TestConfigureTracing(t *testing.T) {
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
-			name:            "only telemetry api (with provider)",
-			inSpec:          fakeTracingSpec(fakeZipkin(), 99.999, false, true),
-			opts:            fakeOptsOnlyZipkinTelemetryAPI(),
-			want:            fakeTracingConfig(fakeZipkinProvider(clusterName, authority, true), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			name:   "only telemetry api (with provider)",
+			inSpec: fakeTracingSpec(fakeZipkin(), 99.999, false, true, true),
+			opts:   fakeOptsOnlyZipkinTelemetryAPI(),
+			want: fakeTracingConfig(fakeZipkinProvider(clusterName, authority, DefaultZipkinEndpoint, true),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
-			name:            "zipkin enable 64bit trace id",
-			inSpec:          fakeTracingSpec(fakeZipkinEnable64bitTraceID(), 99.999, false, true),
-			opts:            fakeOptsOnlyZipkinTelemetryAPI(),
-			want:            fakeTracingConfig(fakeZipkinProvider(clusterName, authority, false), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			name:   "zipkin enable 64bit trace id",
+			inSpec: fakeTracingSpec(fakeZipkinEnable64bitTraceID(), 99.999, false, true, true),
+			opts:   fakeOptsOnlyZipkinTelemetryAPI(),
+			want: fakeTracingConfig(fakeZipkinProvider(clusterName, authority, DefaultZipkinEndpoint, false),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
 			name:            "both tracing enabled (no provider)",
-			inSpec:          fakeTracingSpecNoProvider(99.999, false, true),
+			inSpec:          fakeTracingSpecNoProvider(99.999, false, true, true),
 			opts:            fakeOptsMeshAndTelemetryAPI(true /* enable tracing */),
 			want:            fakeTracingConfigNoProvider(99.999, 13, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
 			name:            "both tracing disabled (no provider)",
-			inSpec:          fakeTracingSpecNoProvider(99.999, false, true),
+			inSpec:          fakeTracingSpecNoProvider(99.999, false, true, true),
 			opts:            fakeOptsMeshAndTelemetryAPI(false /* no enable tracing */),
 			want:            fakeTracingConfigNoProvider(99.999, 13, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
-			name:            "both tracing enabled (with provider)",
-			inSpec:          fakeTracingSpec(fakeZipkin(), 99.999, false, true),
-			opts:            fakeOptsMeshAndTelemetryAPI(true /* enable tracing */),
-			want:            fakeTracingConfig(fakeZipkinProvider(clusterName, authority, true), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			name:   "both tracing enabled (with provider)",
+			inSpec: fakeTracingSpec(fakeZipkin(), 99.999, false, true, true),
+			opts:   fakeOptsMeshAndTelemetryAPI(true /* enable tracing */),
+			want: fakeTracingConfig(fakeZipkinProvider(clusterName, authority, DefaultZipkinEndpoint, true),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
 			name:   "both tracing disabled (with provider)",
-			inSpec: fakeTracingSpec(fakeZipkin(), 99.999, false, true),
+			inSpec: fakeTracingSpec(fakeZipkin(), 99.999, false, true, true),
 			opts:   fakeOptsMeshAndTelemetryAPI(false /* no enable tracing */),
-			want:   fakeTracingConfig(fakeZipkinProvider(clusterName, authority, true), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			want: fakeTracingConfig(fakeZipkinProvider(clusterName, authority, DefaultZipkinEndpoint, true),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
 			name:   "basic config (with datadog provider)",
-			inSpec: fakeTracingSpec(fakeDatadog(), 99.999, false, true),
+			inSpec: fakeTracingSpec(fakeDatadog(), 99.999, false, true, true),
 			opts:   fakeOptsOnlyDatadogTelemetryAPI(),
 			want:   fakeTracingConfig(fakeDatadogProvider("fake-cluster", "testhost", clusterName), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 
@@ -159,14 +174,14 @@ func TestConfigureTracing(t *testing.T) {
 		},
 		{
 			name:            "basic config (with skywalking provider)",
-			inSpec:          fakeTracingSpec(fakeSkywalking(), 99.999, false, false),
+			inSpec:          fakeTracingSpec(fakeSkywalking(), 99.999, false, false, true),
 			opts:            fakeOptsOnlySkywalkingTelemetryAPI(),
 			want:            fakeTracingConfigForSkywalking(fakeSkywalkingProvider(clusterName, authority), 99.999, 0, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &requestidextension.UUIDRequestIDExtensionContext{UseRequestIDForTraceSampling: false},
 		},
 		{
 			name:   "basic config (with opentelemetry provider via grpc)",
-			inSpec: fakeTracingSpec(fakeOpenTelemetryGrpc(), 99.999, false, true),
+			inSpec: fakeTracingSpec(fakeOpenTelemetryGrpc(), 99.999, false, true, true),
 			opts:   fakeOptsOnlyOpenTelemetryGrpcTelemetryAPI(),
 			want:   fakeTracingConfig(fakeOpenTelemetryGrpcProvider(clusterName, authority), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 
@@ -174,14 +189,14 @@ func TestConfigureTracing(t *testing.T) {
 		},
 		{
 			name:            "basic config (with opentelemetry provider via http)",
-			inSpec:          fakeTracingSpec(fakeOpenTelemetryHTTP(), 99.999, false, true),
+			inSpec:          fakeTracingSpec(fakeOpenTelemetryHTTP(), 99.999, false, true, true),
 			opts:            fakeOptsOnlyOpenTelemetryHTTPTelemetryAPI(),
 			want:            fakeTracingConfig(fakeOpenTelemetryHTTPProvider(clusterName, authority), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
 			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 		{
 			name:   "basic config (with opentelemetry provider with resource detectors)",
-			inSpec: fakeTracingSpec(fakeOpenTelemetryResourceDetectors(), 99.999, false, true),
+			inSpec: fakeTracingSpec(fakeOpenTelemetryResourceDetectors(), 99.999, false, true, true),
 			opts:   fakeOptsOnlyOpenTelemetryResourceDetectorsTelemetryAPI(),
 			want: fakeTracingConfig(
 				fakeOpenTelemetryResourceDetectorsProvider(clusterName, authority), 99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
@@ -204,10 +219,26 @@ func TestConfigureTracing(t *testing.T) {
 		},
 		{
 			name:            "invalid provider",
-			inSpec:          fakeTracingSpec(fakePrometheus(), 99.999, false, true),
+			inSpec:          fakeTracingSpec(fakePrometheus(), 99.999, false, true, true),
 			opts:            fakeOptsMeshAndTelemetryAPI(true /* enable tracing */),
 			want:            nil,
 			wantReqIDExtCtx: nil,
+		},
+		{
+			name:   "basic config (with opentelemetry provider via grpc with initial metadata)",
+			inSpec: fakeTracingSpec(fakeOpenTelemetryGrpcWithInitialMetadata(), 99.999, false, true, true),
+			opts:   fakeOptsOnlyOpenTelemetryGrpcWithInitialMetadataTelemetryAPI(),
+			want: fakeTracingConfig(fakeOpenTelemetryGrpcWithInitialMetadataProvider(clusterName, authority),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
+		},
+		{
+			name:   "only telemetry api (with provider)",
+			inSpec: fakeTracingSpec(fakeZipkinWithEndpoint(), 99.999, false, true, true),
+			opts:   fakeOptsZipkinTelemetryWithEndpoint(),
+			want: fakeTracingConfig(fakeZipkinProvider(clusterName, authority, "/custom/path/api/v2/spans", true),
+				99.999, 256, append(defaultTracingTags(), fakeEnvTag)),
+			wantReqIDExtCtx: &defaultUUIDExtensionCtx,
 		},
 	}
 
@@ -272,8 +303,8 @@ func TestConfigureDynatraceSampler(t *testing.T) {
 			// Use a different value for RandomSamplingPercentage to ensure it is changed to 100%
 			// when a custom sampler is used for the OTel tracing provider
 			inSpec := &model.TracingConfig{
-				ClientSpec: tracingSpec(httpProvider, 50, false, false),
-				ServerSpec: tracingSpec(httpProvider, 50, false, false),
+				ClientSpec: tracingSpec(httpProvider, 50, false, false, true),
+				ServerSpec: tracingSpec(httpProvider, 50, false, false, true),
 			}
 
 			opts := fakeOptsOnlyOpenTelemetryHTTPTelemetryAPI()
@@ -386,8 +417,10 @@ func TestConfigureDynatraceSamplerWithCustomHttp(t *testing.T) {
 					Timeout: &durationpb.Duration{Seconds: 3},
 					Headers: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
 						{
-							Name:  expectedHeader,
-							Value: expectedToken,
+							Name: expectedHeader,
+							HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+								Value: expectedToken,
+							},
 						},
 					},
 				},
@@ -398,8 +431,8 @@ func TestConfigureDynatraceSamplerWithCustomHttp(t *testing.T) {
 	// Use a different value for RandomSamplingPercentage to ensure it is changed to 100%
 	// when a custom sampler is used for the OTel tracing provider
 	inSpec := &model.TracingConfig{
-		ClientSpec: tracingSpec(httpProvider, 50, false, false),
-		ServerSpec: tracingSpec(httpProvider, 50, false, false),
+		ClientSpec: tracingSpec(httpProvider, 50, false, false, true),
+		ServerSpec: tracingSpec(httpProvider, 50, false, false, true),
 	}
 
 	opts := fakeOptsOnlyOpenTelemetryHTTPTelemetryAPI()
@@ -417,8 +450,10 @@ func TestConfigureDynatraceSamplerWithCustomHttp(t *testing.T) {
 					Timeout: &durationpb.Duration{Seconds: 3},
 					Headers: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
 						{
-							Name:  expectedHeader,
-							Value: expectedToken,
+							Name: expectedHeader,
+							HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+								Value: expectedToken,
+							},
 						},
 					},
 				},
@@ -650,6 +685,34 @@ func fakeOptsOnlyZipkinTelemetryAPI() gatewayListenerOpts {
 	return opts
 }
 
+func fakeOptsZipkinTelemetryWithEndpoint() gatewayListenerOpts {
+	var opts gatewayListenerOpts
+	opts.push = &model.PushContext{
+		Mesh: &meshconfig.MeshConfig{
+			ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+				{
+					Name: "foo",
+					Provider: &meshconfig.MeshConfig_ExtensionProvider_Zipkin{
+						Zipkin: &meshconfig.MeshConfig_ExtensionProvider_ZipkinTracingProvider{
+							Service:      "zipkin",
+							Port:         9411,
+							MaxTagLength: 256,
+							Path:         "/custom/path/api/v2/spans",
+						},
+					},
+				},
+			},
+		},
+	}
+	opts.proxy = &model.Proxy{
+		Metadata: &model.NodeMetadata{
+			ProxyConfig: &model.NodeMetaProxyConfig{},
+		},
+	}
+
+	return opts
+}
+
 func fakeZipkin() *meshconfig.MeshConfig_ExtensionProvider {
 	return &meshconfig.MeshConfig_ExtensionProvider{
 		Name: "foo",
@@ -658,6 +721,20 @@ func fakeZipkin() *meshconfig.MeshConfig_ExtensionProvider {
 				Service:      "zipkin",
 				Port:         9411,
 				MaxTagLength: 256,
+			},
+		},
+	}
+}
+
+func fakeZipkinWithEndpoint() *meshconfig.MeshConfig_ExtensionProvider {
+	return &meshconfig.MeshConfig_ExtensionProvider{
+		Name: "foo",
+		Provider: &meshconfig.MeshConfig_ExtensionProvider_Zipkin{
+			Zipkin: &meshconfig.MeshConfig_ExtensionProvider_ZipkinTracingProvider{
+				Service:      "zipkin",
+				Port:         9411,
+				MaxTagLength: 256,
+				Path:         "/custom/path/api/v2/spans",
 			},
 		},
 	}
@@ -820,6 +897,30 @@ func fakeOpenTelemetryGrpc() *meshconfig.MeshConfig_ExtensionProvider {
 	}
 }
 
+func fakeOpenTelemetryGrpcWithInitialMetadata() *meshconfig.MeshConfig_ExtensionProvider {
+	return &meshconfig.MeshConfig_ExtensionProvider{
+		Name: "opentelemetry",
+		Provider: &meshconfig.MeshConfig_ExtensionProvider_Opentelemetry{
+			Opentelemetry: &meshconfig.MeshConfig_ExtensionProvider_OpenTelemetryTracingProvider{
+				Service:      "tracing.example.com",
+				Port:         8090,
+				MaxTagLength: 256,
+				Grpc: &meshconfig.MeshConfig_ExtensionProvider_GrpcService{
+					InitialMetadata: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
+						{
+							Name: "Authentication",
+							HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+								Value: "token-xxxxx",
+							},
+						},
+					},
+					Timeout: &durationpb.Duration{Seconds: 3},
+				},
+			},
+		},
+	}
+}
+
 func fakeOpenTelemetryHTTP() *meshconfig.MeshConfig_ExtensionProvider {
 	return &meshconfig.MeshConfig_ExtensionProvider{
 		Name: "opentelemetry",
@@ -833,8 +934,10 @@ func fakeOpenTelemetryHTTP() *meshconfig.MeshConfig_ExtensionProvider {
 					Timeout: &durationpb.Duration{Seconds: 3},
 					Headers: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
 						{
-							Name:  "custom-header",
-							Value: "custom-value",
+							Name: "custom-header",
+							HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+								Value: "custom-value",
+							},
 						},
 					},
 				},
@@ -881,6 +984,44 @@ func fakeOptsOnlyOpenTelemetryGrpcTelemetryAPI() gatewayListenerOpts {
 	return opts
 }
 
+func fakeOptsOnlyOpenTelemetryGrpcWithInitialMetadataTelemetryAPI() gatewayListenerOpts {
+	var opts gatewayListenerOpts
+	opts.push = &model.PushContext{
+		Mesh: &meshconfig.MeshConfig{
+			ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+				{
+					Name: "opentelemetry",
+					Provider: &meshconfig.MeshConfig_ExtensionProvider_Opentelemetry{
+						Opentelemetry: &meshconfig.MeshConfig_ExtensionProvider_OpenTelemetryTracingProvider{
+							Service:      "tracing.example.com",
+							Port:         8090,
+							MaxTagLength: 256,
+							Grpc: &meshconfig.MeshConfig_ExtensionProvider_GrpcService{
+								InitialMetadata: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
+									{
+										Name: "Authentication",
+										HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+											Value: "token-xxxxx",
+										},
+									},
+								},
+								Timeout: &durationpb.Duration{Seconds: 3},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	opts.proxy = &model.Proxy{
+		Metadata: &model.NodeMetadata{
+			ProxyConfig: &model.NodeMetaProxyConfig{},
+		},
+	}
+
+	return opts
+}
+
 func fakeOptsOnlyOpenTelemetryHTTPTelemetryAPI() gatewayListenerOpts {
 	var opts gatewayListenerOpts
 	opts.push = &model.PushContext{
@@ -898,8 +1039,10 @@ func fakeOptsOnlyOpenTelemetryHTTPTelemetryAPI() gatewayListenerOpts {
 								Timeout: &durationpb.Duration{Seconds: 3},
 								Headers: []*meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
 									{
-										Name:  "custom-header",
-										Value: "custom-value",
+										Name: "custom-header",
+										HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+											Value: "custom-value",
+										},
 									},
 								},
 							},
@@ -935,8 +1078,9 @@ func fakeInboundOptsOnlySkywalkingTelemetryAPI() gatewayListenerOpts {
 	return opts
 }
 
-func fakeTracingSpecNoProvider(sampling float64, disableReporting bool, useRequestIDForTraceSampling bool) *model.TracingConfig {
-	return fakeTracingSpec(nil, sampling, disableReporting, useRequestIDForTraceSampling)
+// nolint: unparam
+func fakeTracingSpecNoProvider(sampling float64, disableReporting bool, useRequestIDForTraceSampling bool, enableIstiotags bool) *model.TracingConfig {
+	return fakeTracingSpec(nil, sampling, disableReporting, useRequestIDForTraceSampling, enableIstiotags)
 }
 
 func fakeTracingSpecNoProviderWithNilCustomTag(sampling float64, disableReporting bool, useRequestIDForTraceSampling bool) *model.TracingConfig {
@@ -945,10 +1089,11 @@ func fakeTracingSpecNoProviderWithNilCustomTag(sampling float64, disableReportin
 
 func fakeTracingSpec(provider *meshconfig.MeshConfig_ExtensionProvider, sampling float64, disableReporting bool,
 	useRequestIDForTraceSampling bool,
+	enableIstioTags bool,
 ) *model.TracingConfig {
 	t := &model.TracingConfig{
-		ClientSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling),
-		ServerSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling),
+		ClientSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling, enableIstioTags),
+		ServerSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling, enableIstioTags),
 	}
 	return t
 }
@@ -957,7 +1102,7 @@ func fakeClientOnlyTracingSpec(provider *meshconfig.MeshConfig_ExtensionProvider
 	useRequestIDForTraceSampling bool,
 ) *model.TracingConfig {
 	t := &model.TracingConfig{
-		ClientSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling),
+		ClientSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling, true),
 		ServerSpec: model.TracingSpec{
 			Disabled: true,
 		},
@@ -972,13 +1117,14 @@ func fakeServerOnlyTracingSpec(provider *meshconfig.MeshConfig_ExtensionProvider
 		ClientSpec: model.TracingSpec{
 			Disabled: true,
 		},
-		ServerSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling),
+		ServerSpec: tracingSpec(provider, sampling, disableReporting, useRequestIDForTraceSampling, true),
 	}
 	return t
 }
 
 func tracingSpec(provider *meshconfig.MeshConfig_ExtensionProvider, sampling float64, disableReporting bool,
 	useRequestIDForTraceSampling bool,
+	enableIstioTags bool,
 ) model.TracingSpec {
 	return model.TracingSpec{
 		Provider:                 provider,
@@ -994,6 +1140,7 @@ func tracingSpec(provider *meshconfig.MeshConfig_ExtensionProvider, sampling flo
 			},
 		},
 		UseRequestIDForTraceSampling: useRequestIDForTraceSampling,
+		EnableIstioTags:              enableIstioTags,
 	}
 }
 
@@ -1009,6 +1156,7 @@ func fakeTracingSpecWithNilCustomTag(provider *meshconfig.MeshConfig_ExtensionPr
 				"test": nil,
 			},
 			UseRequestIDForTraceSampling: useRequestIDForTraceSampling,
+			EnableIstioTags:              true,
 		},
 		ServerSpec: model.TracingSpec{
 			Provider:                 provider,
@@ -1018,6 +1166,7 @@ func fakeTracingSpecWithNilCustomTag(provider *meshconfig.MeshConfig_ExtensionPr
 				"test": nil,
 			},
 			UseRequestIDForTraceSampling: useRequestIDForTraceSampling,
+			EnableIstioTags:              true,
 		},
 	}
 	return t
@@ -1065,10 +1214,10 @@ var fakeEnvTag = &tracing.CustomTag{
 	},
 }
 
-func fakeZipkinProvider(expectClusterName, expectAuthority string, enableTraceID bool) *tracingcfg.Tracing_Http {
+func fakeZipkinProvider(expectClusterName, expectAuthority, expectEndpoint string, enableTraceID bool) *tracingcfg.Tracing_Http {
 	fakeZipkinProviderConfig := &tracingcfg.ZipkinConfig{
 		CollectorCluster:         expectClusterName,
-		CollectorEndpoint:        "/api/v2/spans",
+		CollectorEndpoint:        expectEndpoint,
 		CollectorEndpointVersion: tracingcfg.ZipkinConfig_HTTP_JSON,
 		CollectorHostname:        expectAuthority,
 		TraceId_128Bit:           enableTraceID,
@@ -1115,6 +1264,31 @@ func fakeDatadogProvider(expectServcieName, expectHostName, expectClusterName st
 func fakeOpenTelemetryGrpcProvider(expectClusterName, expectAuthority string) *tracingcfg.Tracing_Http {
 	fakeOTelGrpcProviderConfig := &tracingcfg.OpenTelemetryConfig{
 		GrpcService: &core.GrpcService{
+			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+					ClusterName: expectClusterName,
+					Authority:   expectAuthority,
+				},
+			},
+		},
+	}
+	fakeOtelGrpcAny := protoconv.MessageToAny(fakeOTelGrpcProviderConfig)
+	return &tracingcfg.Tracing_Http{
+		Name:       envoyOpenTelemetry,
+		ConfigType: &tracingcfg.Tracing_Http_TypedConfig{TypedConfig: fakeOtelGrpcAny},
+	}
+}
+
+func fakeOpenTelemetryGrpcWithInitialMetadataProvider(expectClusterName, expectAuthority string) *tracingcfg.Tracing_Http {
+	fakeOTelGrpcProviderConfig := &tracingcfg.OpenTelemetryConfig{
+		GrpcService: &core.GrpcService{
+			InitialMetadata: []*core.HeaderValue{
+				{
+					Key:   "Authentication",
+					Value: "token-xxxxx",
+				},
+			},
+			Timeout: &durationpb.Duration{Seconds: 3},
 			TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
 				EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
 					ClusterName: expectClusterName,
@@ -1193,5 +1367,49 @@ func fakeOpenTelemetryResourceDetectorsProvider(expectClusterName, expectAuthori
 	return &tracingcfg.Tracing_Http{
 		Name:       envoyOpenTelemetry,
 		ConfigType: &tracingcfg.Tracing_Http_TypedConfig{TypedConfig: fakeOtelHTTPAny},
+	}
+}
+
+func TestGetHeaderValue(t *testing.T) {
+	t.Setenv("CUSTOM_ENV_NAME", "custom-env-value")
+	cases := []struct {
+		name     string
+		input    *meshconfig.MeshConfig_ExtensionProvider_HttpHeader
+		expected string
+	}{
+		{
+			name: "custom-value",
+			input: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
+				HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_Value{
+					Value: "custom-value",
+				},
+			},
+			expected: "custom-value",
+		},
+		{
+			name: "read-from-env",
+			input: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
+				HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_EnvName{
+					EnvName: "CUSTOM_ENV_NAME",
+				},
+			},
+			expected: "custom-env-value",
+		},
+		{
+			name: "read-from-env-not-exists",
+			input: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader{
+				HeaderValue: &meshconfig.MeshConfig_ExtensionProvider_HttpHeader_EnvName{
+					EnvName: "CUSTOM_ENV_NAME1",
+				},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := getHeaderValue(tc.input)
+			assert.Equal(t, tc.expected, got)
+		})
 	}
 }

@@ -3,7 +3,6 @@ kind: GatewayClass
 metadata:
   creationTimestamp: null
   name: istio
-  namespace: default
 spec: null
 status:
   conditions:
@@ -12,9 +11,6 @@ status:
     reason: Accepted
     status: "True"
     type: Accepted
-  supportedFeatures:
-  - HTTPRouteFeatureA
-  - HTTPRouteFeatureB
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
@@ -24,6 +20,9 @@ metadata:
   namespace: istio-system
 spec: null
 status:
+  addresses:
+  - type: IPAddress
+    value: 1.2.3.4
   conditions:
   - lastTransitionTime: fake
     message: Resource accepted
@@ -31,10 +30,9 @@ status:
     status: "True"
     type: Accepted
   - lastTransitionTime: fake
-    message: 'Failed to assign to any requested addresses: port 443 not found for
-      hostname "istio-ingressgateway.istio-system.svc.domain.suffix"'
-    reason: AddressNotUsable
-    status: "False"
+    message: Resource programmed, assigned to service(s) istio-ingressgateway.istio-system.svc.domain.suffix:443
+    reason: Programmed
+    status: "True"
     type: Programmed
   listeners:
   - attachedRoutes: 1

@@ -41,6 +41,7 @@ import (
 	cluster2 "istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
@@ -136,14 +137,16 @@ func NewConfigGenTest(t test.Failer, opts TestOptions) *ConfigGenTest {
 	}
 
 	env := model.NewEnvironment()
-	env.Watcher = mesh.NewFixedWatcher(m)
+	env.Watcher = meshwatcher.NewTestWatcher(m)
 
 	xdsUpdater := opts.XDSUpdater
 	if xdsUpdater == nil {
 		xdsUpdater = model.NewEndpointIndexUpdater(env.EndpointIndex)
 	}
 
-	serviceDiscovery := aggregate.NewController(aggregate.Options{})
+	serviceDiscovery := aggregate.NewController(aggregate.Options{
+		ConfigClusterID: opts.ClusterID,
+	})
 	se := serviceentry.NewController(
 		configController,
 		xdsUpdater,
@@ -168,7 +171,7 @@ func NewConfigGenTest(t test.Failer, opts TestOptions) *ConfigGenTest {
 		serviceDiscovery.AddRegistry(reg)
 	}
 	if opts.NetworksWatcher == nil {
-		opts.NetworksWatcher = mesh.NewFixedNetworksWatcher(nil)
+		opts.NetworksWatcher = meshwatcher.NewFixedNetworksWatcher(nil)
 	}
 	env.ServiceDiscovery = serviceDiscovery
 	env.ConfigStore = configController
@@ -192,9 +195,7 @@ func NewConfigGenTest(t test.Failer, opts TestOptions) *ConfigGenTest {
 		if err := env.InitNetworksManager(xdsUpdater); err != nil {
 			t.Fatal(err)
 		}
-		if err := env.PushContext().InitContext(env, nil, nil); err != nil {
-			t.Fatalf("Failed to initialize push context: %v", err)
-		}
+		env.PushContext().InitContext(env, nil, nil)
 	}
 	return fake
 }

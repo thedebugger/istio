@@ -56,8 +56,15 @@ const (
 	// CredentialNameSocketPath is the well-known path to the Unix Domain Socket for Credential Name.
 	CredentialNameSocketPath = "./var/run/secrets/credential-uds/socket"
 
+	// FileCredentialNameSocketPath is the well-known path to the Unix Domain Socket used for loading files.
+	// This is only used when there is a custom SDS server, otherwise WorkloadIdentityPath is used.
+	FileCredentialNameSocketPath = "./var/run/secrets/credential-uds/files-socket"
+
 	// CredentialMetaDataName is the name in node meta data.
 	CredentialMetaDataName = "credential"
+	// CredentialFileMetaDataName is the name in node metadata indicating we should use a custom SDS cluster, sds-files-grpc,
+	// for file-based certificates.
+	CredentialFileMetaDataName = "file-credential"
 
 	// SDSExternalClusterName is the name of the cluster for external SDS connections which is defined via CredentialNameSocketPath
 	SDSExternalClusterName = "sds-external"
@@ -118,18 +125,15 @@ const (
 
 	// FileRootSystemCACert is a unique resource name signaling that the system CA certificate should be used
 	FileRootSystemCACert = "file-root:system"
+
+	// CACRLFilePath is the well-known path for the plugged-in CA's CRL file
+	CACRLFilePath = "/var/run/secrets/istio/crl/ca-crl.pem"
 )
 
 // TODO: For 1.8, make sure MeshConfig is updated with those settings,
 // they should be dynamic to allow migrations without restart.
 // Both are critical.
 var (
-	// Require3PToken disables the use of K8S 1P tokens. Note that 1P tokens can be used to request
-	// 3P TOKENS. A 1P token is the token automatically mounted by Kubelet and used for authentication with
-	// the Apiserver.
-	Require3PToken = env.Register("REQUIRE_3P_TOKEN", false,
-		"Reject k8s default tokens, without audience. If false, default K8S token will be accepted")
-
 	// TokenAudiences specifies a list of audiences for SDS trustworthy JWT. This is to make sure that the CSR requests
 	// contain the JWTs intended for Citadel.
 	TokenAudiences = strings.Split(env.Register("TOKEN_AUDIENCES", "istio-ca",
@@ -205,6 +209,10 @@ type Options struct {
 	// well-known ./etc/certs location.
 	FileMountedCerts bool
 
+	// ServeOnlyFiles indicates we should run the local SDS server, but only to serve file certificates.
+	// This is used when an external SDS server is used only for mTLS certificates.
+	ServeOnlyFiles bool
+
 	// PilotCertProvider is the provider of the Pilot certificate (PILOT_CERT_PROVIDER env)
 	// Determines the root CA file to use for connecting to CA gRPC:
 	// - istiod
@@ -221,6 +229,11 @@ type Options struct {
 	// The ratio of cert lifetime to refresh a cert. For example, at 0.10 and 1 hour TTL,
 	// we would refresh 6 minutes before expiration.
 	SecretRotationGracePeriodRatio float64
+
+	// The amount of randomness to add to SecretRotationGracePeriodRatio. This is used
+	// to prevent spikes in resource consumption when large fleets of proxies try to renew
+	// their certs simultaneously.
+	SecretRotationGracePeriodRatioJitter float64
 
 	// STS port
 	STSPort int
@@ -256,6 +269,9 @@ type Options struct {
 	KeyFilePath string
 	// The path for an existing root certificate bundle
 	RootCertFilePath string
+
+	// Extra headers to add to the CA connection.
+	CAHeaders map[string]string
 }
 
 // Client interface defines the clients need to implement to talk to CA for CSR.

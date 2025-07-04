@@ -59,7 +59,7 @@ func readConfigFile(filename string) ([]byte, error) {
 
 func StableXdsStatusCommand(ctx cli.Context) *cobra.Command {
 	cmd := XdsStatusCommand(ctx)
-	unstableFlags := []string{"xds-via-agents", "xds-via-agents-limit"}
+	unstableFlags := []string{}
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
 		for _, flag := range unstableFlags {
 			if cmd.PersistentFlags().Changed(flag) {
@@ -78,6 +78,8 @@ func XdsStatusCommand(ctx cli.Context) *cobra.Command {
 	var opts clioptions.ControlPlaneOptions
 	var centralOpts clioptions.CentralControlPlaneOptions
 	var multiXdsOpts multixds.Options
+	var outputFormat string
+	var verbosity int
 
 	statusCmd := &cobra.Command{
 		Use:   "proxy-status [<type>/]<name>[.<namespace>]",
@@ -111,7 +113,9 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
   # Retrieve proxy status information via XDS from specific control plane in multi-control plane in-cluster configuration
   # (Select a specific control plane in an in-cluster canary Istio configuration.)
   istioctl ps --xds-label istio.io/rev=default
-`,
+
+  # Show the status of a specific proxy in JSON format
+  istioctl proxy-status --output json`,
 		Aliases: []string{"ps"},
 		RunE: func(c *cobra.Command, args []string) error {
 			kubeClient, err := ctx.CLIClientWithRevision(opts.Revision)
@@ -163,8 +167,10 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
 				return err
 			}
 			sw := pilot.XdsStatusWriter{
-				Writer:    c.OutOrStdout(),
-				Namespace: ctx.Namespace(),
+				Writer:       c.OutOrStdout(),
+				Namespace:    ctx.Namespace(),
+				OutputFormat: outputFormat,
+				Verbosity:    verbosity,
 			}
 			return sw.PrintAll(xdsResponses)
 		},
@@ -173,13 +179,13 @@ Retrieves last sent and last acknowledged xDS sync from Istiod to each Envoy in 
 
 	opts.AttachControlPlaneFlags(statusCmd)
 	centralOpts.AttachControlPlaneFlags(statusCmd)
-	statusCmd.PersistentFlags().StringVarP(&configDumpFile, "file", "f", "",
+	statusCmd.PersistentFlags().StringVar(&configDumpFile, "file", "",
 		"Envoy config dump JSON file")
-	statusCmd.PersistentFlags().BoolVar(&multiXdsOpts.XdsViaAgents, "xds-via-agents", false,
-		"Access Istiod via the tap service of each agent")
-	statusCmd.PersistentFlags().IntVar(&multiXdsOpts.XdsViaAgentsLimit, "xds-via-agents-limit", 100,
-		"Maximum number of pods being visited by istioctl when `xds-via-agent` flag is true."+
-			"To iterate all the agent pods without limit, set to 0")
+
+	statusCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", "table",
+		"Output format: table or json")
+	statusCmd.PersistentFlags().IntVarP(&verbosity, "verbosity", "v", 0,
+		"Verbosity level for proxy status output. 0=default, 1=show all xDS types (max verbosity)")
 
 	return statusCmd
 }

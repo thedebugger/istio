@@ -39,6 +39,7 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/multicluster"
+	"istio.io/istio/pkg/monitoring/monitortest"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/util/sets"
@@ -46,6 +47,32 @@ import (
 	caerror "istio.io/istio/security/pkg/pki/error"
 	"istio.io/istio/security/pkg/pki/util"
 	"istio.io/istio/security/pkg/server/ca/authenticate"
+)
+
+const (
+	testCert = `-----BEGIN CERTIFICATE-----
+Y2VydA==
+-----END CERTIFICATE-----
+`
+
+	testIntermediateCert = `-----BEGIN CERTIFICATE-----
+aW50ZXJtZWRpYXRlMQ==
+-----END CERTIFICATE-----
+`
+
+	testIntermediateCert2 = `-----BEGIN CERTIFICATE-----
+aW50ZXJtZWRpYXRlMg==
+-----END CERTIFICATE-----
+`
+
+	testCertChain = testIntermediateCert // this chain has only one intermediate
+
+	testMultiCertChain = testIntermediateCert + "\n" + testIntermediateCert2 // cert chain with multiple intermediates
+
+	testRootCert = `-----BEGIN CERTIFICATE-----
+cm9vdF9jZXJ0
+-----END CERTIFICATE-----
+`
 )
 
 type mockAuthenticator struct {
@@ -96,13 +123,13 @@ func TestCreateCertificateE2EUsingClientCertAuthenticator(t *testing.T) {
 
 	server := &Server{
 		ca: &mockca.FakeCA{
-			SignedCert:    []byte("cert"),
-			KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+			SignedCert:    []byte(testCert),
+			KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 		},
 		Authenticators: []security.Authenticator{auth},
 		monitoring:     newMonitoringMetrics(),
 	}
-	mockCertChain := []string{"cert", "cert_chain", "root_cert"}
+	mockCertChain := []string{testCert, testCertChain, testRootCert}
 	mockIPAddr := &net.IPAddr{IP: net.IPv4(192, 168, 1, 1)}
 	testCerts := map[string]struct {
 		certChain    [][]*x509.Certificate
@@ -236,10 +263,23 @@ func TestCreateCertificate(t *testing.T) {
 		"Successful signing": {
 			authenticators: []security.Authenticator{&mockAuthenticator{identities: []string{"test-identity"}}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain: []string{"cert", "cert_chain", "root_cert"},
+			certChain: []string{testCert, testCertChain, testRootCert},
+			code:      codes.OK,
+		},
+		"Successful signing w/ multi-cert chain": {
+			authenticators: []security.Authenticator{&mockAuthenticator{identities: []string{"test-identity"}}},
+			ca: &mockca.FakeCA{
+				SignedCert: []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil,
+					[]byte(testMultiCertChain),
+					[]byte(testRootCert),
+					nil,
+				),
+			},
+			certChain: []string{testCert, testIntermediateCert, testIntermediateCert2, testRootCert}, // the response should have one cert per element in slice
 			code:      codes.OK,
 		},
 	}
@@ -348,10 +388,10 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 				kubernetesInfo: ztunnelCaller,
 			}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain:           []string{"cert", "cert_chain", "root_cert"},
+			certChain:           []string{testCert, testCertChain, testRootCert},
 			trustedNodeAccounts: sets.Set[types.NamespacedName]{},
 			code:                codes.Unauthenticated,
 		},
@@ -362,10 +402,10 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 				kubernetesInfo: ztunnelCaller,
 			}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain:           []string{"cert", "cert_chain", "root_cert"},
+			certChain:           []string{testCert, testCertChain, testRootCert},
 			pods:                []pod{ztunnelPod, podOtherNode},
 			impersonatePod:      podOtherNode,
 			callerClusterID:     cluster.ID("fake"),
@@ -379,10 +419,10 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 				kubernetesInfo: ztunnelCaller,
 			}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain:           []string{"cert", "cert_chain", "root_cert"},
+			certChain:           []string{testCert, testCertChain, testRootCert},
 			pods:                []pod{ztunnelPod, podSameNode},
 			impersonatePod:      podSameNode,
 			callerClusterID:     cluster.ID("fake"),
@@ -396,10 +436,10 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 				kubernetesInfo: ztunnelCaller,
 			}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain:           []string{"cert", "cert_chain", "root_cert"},
+			certChain:           []string{testCert, testCertChain, testRootCert},
 			pods:                []pod{ztunnelPod},
 			impersonatePod:      podSameNodeRemote,
 			callerClusterID:     cluster.ID("fake"),
@@ -415,10 +455,10 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 				kubernetesInfo: ztunnelCallerRemote,
 			}},
 			ca: &mockca.FakeCA{
-				SignedCert:    []byte("cert"),
-				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte("cert_chain"), []byte("root_cert")),
+				SignedCert:    []byte(testCert),
+				KeyCertBundle: util.NewKeyCertBundleFromPem(nil, nil, []byte(testCertChain), []byte(testRootCert), nil),
 			},
-			certChain:           []string{"cert", "cert_chain", "root_cert"},
+			certChain:           []string{testCert, testCertChain, testRootCert},
 			pods:                []pod{ztunnelPod, podSameNode},
 			impersonatePod:      podSameNodeRemote,
 			callerClusterID:     cluster.ID("fake-remote"),
@@ -497,4 +537,116 @@ func TestCreateCertificateE2EWithImpersonateIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecordCertsExipryMetrics(t *testing.T) {
+	t.Run("test certificate metric recording", func(t *testing.T) {
+		mt := monitortest.New(t)
+		now := time.Now()
+		rootTTL := time.Hour
+		certTTL := time.Hour / 2
+		rootCertBytes, rootKeyBytes, err := util.GenCertKeyFromOptions(util.CertOptions{
+			Host:         "citadel.testing.istio.io",
+			Org:          "MyOrg",
+			NotBefore:    now,
+			IsCA:         true,
+			IsSelfSigned: true,
+			TTL:          rootTTL,
+			RSAKeySize:   2048,
+		})
+		if err != nil {
+			t.Errorf("failed to gen root cert for Citadel self signed cert %v", err)
+		}
+
+		rootCert, err := util.ParsePemEncodedCertificate(rootCertBytes)
+		if err != nil {
+			t.Errorf("failed to parse pem %v", err)
+		}
+
+		rootKey, err := util.ParsePemEncodedKey(rootKeyBytes)
+		if err != nil {
+			t.Errorf("failed to parse pem %v", err)
+		}
+
+		caCertBytes, caCertKeyBytes, err := util.GenCertKeyFromOptions(util.CertOptions{
+			Host:         "citadel.testing.istio.io",
+			Org:          "MyOrg",
+			NotBefore:    now,
+			TTL:          certTTL,
+			IsServer:     true,
+			IsCA:         true,
+			IsSelfSigned: false,
+			RSAKeySize:   2048,
+			SignerCert:   rootCert,
+			SignerPriv:   rootKey,
+		})
+		if err != nil {
+			t.Fatalf("failed to gen CA cert %v", err)
+		}
+
+		kb := util.NewKeyCertBundleFromPem(
+			caCertBytes, caCertKeyBytes, caCertBytes, rootCertBytes, nil,
+		)
+
+		RecordCertsExpiry(kb)
+
+		mt.Assert(rootCertExpiryTimestamp.Name(), nil, monitortest.AlmostEquals(float64(now.Add(rootTTL).Unix()), 1e-7))
+		mt.Assert(certChainExpiryTimestamp.Name(), nil, monitortest.AlmostEquals(float64(now.Add(certTTL).Unix()), 1e-7))
+		eps := float64(time.Minute) // so the tests aren't flaky
+		mt.Assert(rootCertExpirySeconds.Name(), nil, monitortest.AlmostEquals(rootTTL.Seconds(), eps))
+		mt.Assert(certChainExpirySeconds.Name(), nil, monitortest.AlmostEquals(certTTL.Seconds(), eps))
+
+		now = time.Now()
+		rootTTL = time.Hour * 60
+		certTTL = time.Hour * 20
+		rootCertBytes, rootKeyBytes, err = util.GenCertKeyFromOptions(util.CertOptions{
+			Host:         "other-citadel.testing.istio.io",
+			Org:          "other-MyOrg",
+			NotBefore:    now,
+			IsCA:         true,
+			IsSelfSigned: true,
+			TTL:          rootTTL,
+			RSAKeySize:   2048,
+		})
+		if err != nil {
+			t.Errorf("failed to gen root cert %v", err)
+		}
+
+		rootCert, err = util.ParsePemEncodedCertificate(rootCertBytes)
+		if err != nil {
+			t.Errorf("failed to parse pem %v", err)
+		}
+
+		rootKey, err = util.ParsePemEncodedKey(rootKeyBytes)
+		if err != nil {
+			t.Errorf("failed to parse pem %v", err)
+		}
+
+		caCertBytes, caCertKeyBytes, err = util.GenCertKeyFromOptions(util.CertOptions{
+			Host:         "other-citadel.testing.istio.io",
+			Org:          "other-MyOrg",
+			NotBefore:    now,
+			TTL:          certTTL,
+			IsServer:     true,
+			IsCA:         true,
+			IsSelfSigned: false,
+			RSAKeySize:   2048,
+			SignerCert:   rootCert,
+			SignerPriv:   rootKey,
+		})
+		if err != nil {
+			t.Fatalf("failed to gen CA cert %v", err)
+		}
+
+		kb = util.NewKeyCertBundleFromPem(
+			caCertBytes, caCertKeyBytes, caCertBytes, rootCertBytes, nil,
+		)
+
+		RecordCertsExpiry(kb)
+
+		mt.Assert(rootCertExpiryTimestamp.Name(), nil, monitortest.AlmostEquals(float64(now.Add(rootTTL).Unix()), 1e-7))
+		mt.Assert(certChainExpiryTimestamp.Name(), nil, monitortest.AlmostEquals(float64(now.Add(certTTL).Unix()), 1e-7))
+		mt.Assert(rootCertExpirySeconds.Name(), nil, monitortest.AlmostEquals(rootTTL.Seconds(), eps))
+		mt.Assert(certChainExpirySeconds.Name(), nil, monitortest.AlmostEquals(certTTL.Seconds(), eps))
+	})
 }

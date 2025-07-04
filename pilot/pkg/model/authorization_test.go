@@ -19,17 +19,17 @@ import (
 	"reflect"
 	"testing"
 
-	"google.golang.org/protobuf/proto"
-
+	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	authpb "istio.io/api/security/v1beta1"
 	selectorpb "istio.io/api/type/v1beta1"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
@@ -53,14 +53,14 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 			},
 		},
 	}
-	policyWithSelector := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	policyWithSelector := protomarshal.Clone(policy)
 	policyWithSelector.Selector = &selectorpb.WorkloadSelector{
 		MatchLabels: labels.Instance{
 			"app":     "httpbin",
 			"version": "v1",
 		},
 	}
-	policyWithTargetRef := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	policyWithTargetRef := protomarshal.Clone(policy)
 	policyWithTargetRef.TargetRef = &selectorpb.PolicyTargetReference{
 		Group:     gvk.KubernetesGateway.Group,
 		Kind:      gvk.KubernetesGateway.Kind,
@@ -68,21 +68,27 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		Namespace: "bar",
 	}
 
-	policyWithServiceRef := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	policyWithServiceRef := protomarshal.Clone(policy)
 	policyWithServiceRef.TargetRef = &selectorpb.PolicyTargetReference{
 		Group:     gvk.Service.Group,
 		Kind:      gvk.Service.Kind,
 		Name:      "foo-svc",
 		Namespace: "foo",
 	}
+	policyWithGWClassRef := protomarshal.Clone(policy)
+	policyWithGWClassRef.TargetRef = &selectorpb.PolicyTargetReference{
+		Group: gvk.GatewayClass.Group,
+		Kind:  gvk.GatewayClass.Kind,
+		Name:  "istio-waypoint",
+	}
 
-	denyPolicy := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	denyPolicy := protomarshal.Clone(policy)
 	denyPolicy.Action = authpb.AuthorizationPolicy_DENY
 
-	auditPolicy := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	auditPolicy := protomarshal.Clone(policy)
 	auditPolicy.Action = authpb.AuthorizationPolicy_AUDIT
 
-	customPolicy := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	customPolicy := protomarshal.Clone(policy)
 	customPolicy.Action = authpb.AuthorizationPolicy_CUSTOM
 
 	cases := []struct {
@@ -97,14 +103,14 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "no policies",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "foo",
+				WorkloadNamespace: "foo",
 			},
 			wantAllow: nil,
 		},
 		{
 			name: "no policies in namespace foo",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "foo",
+				WorkloadNamespace: "foo",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
@@ -115,9 +121,9 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "no policies with a targetRef in namespace foo",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "foo",
+				WorkloadNamespace: "foo",
 				WorkloadLabels: labels.Instance{
-					constants.GatewayNameLabel: "my-gateway",
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway",
 				},
 			},
 			configs: []config.Config{
@@ -128,7 +134,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "one allow policy",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
@@ -144,7 +150,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "one deny policy",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", denyPolicy),
@@ -160,7 +166,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "one audit policy",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", auditPolicy),
@@ -176,7 +182,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "one custom policy",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", customPolicy),
@@ -192,7 +198,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "two policies",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "foo", policy),
@@ -215,7 +221,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "mixing allow, deny, and audit policies",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
@@ -253,9 +259,9 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "targetRef is an exact match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 				WorkloadLabels: labels.Instance{
-					constants.GatewayNameLabel: "my-gateway",
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway",
 				},
 			},
 			configs: []config.Config{
@@ -272,7 +278,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "selector exact match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 				WorkloadLabels: labels.Instance{
 					"app":     "httpbin",
 					"version": "v1",
@@ -292,7 +298,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "selector subset match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 				WorkloadLabels: labels.Instance{
 					"app":     "httpbin",
 					"version": "v1",
@@ -313,9 +319,9 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "targetRef is not a match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 				WorkloadLabels: labels.Instance{
-					constants.GatewayNameLabel: "my-gateway2",
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway2",
 				},
 			},
 			configs: []config.Config{
@@ -326,7 +332,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "selector not match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 				WorkloadLabels: labels.Instance{
 					"app":     "httpbin",
 					"version": "v2",
@@ -340,7 +346,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "namespace not match",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "foo",
+				WorkloadNamespace: "foo",
 				WorkloadLabels: labels.Instance{
 					"app":     "httpbin",
 					"version": "v1",
@@ -354,7 +360,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "root namespace",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
@@ -370,7 +376,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "root namespace equals config namespace",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "istio-config",
+				WorkloadNamespace: "istio-config",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
@@ -386,7 +392,7 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 		{
 			name: "root namespace and config namespace",
 			selectionOpts: WorkloadPolicyMatcher{
-				Namespace: "bar",
+				WorkloadNamespace: "bar",
 			},
 			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
@@ -409,10 +415,12 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 			name: "waypoint service attached",
 			selectionOpts: WorkloadPolicyMatcher{
 				IsWaypoint: true,
-				Service:    "foo-svc",
-				Namespace:  "foo",
+				Services: []ServiceInfoForPolicyMatcher{
+					{Name: "foo-svc", Namespace: "foo", Registry: provider.Kubernetes},
+				},
+				WorkloadNamespace: "foo",
 				WorkloadLabels: labels.Instance{
-					constants.GatewayNameLabel: "foo-waypoint",
+					label.IoK8sNetworkingGatewayGatewayName.Name: "foo-waypoint",
 					// labels match in selector policy but ignore them for waypoint
 					"app":     "httpbin",
 					"version": "v1",
@@ -423,6 +431,32 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 				newConfig("authz-2", "foo", policyWithSelector),
 			},
 			wantAllow: []AuthorizationPolicy{
+				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
+			},
+		},
+		{
+			name: "waypoint with default policies",
+			selectionOpts: WorkloadPolicyMatcher{
+				IsWaypoint: true,
+				Services: []ServiceInfoForPolicyMatcher{
+					{Name: "foo-svc", Namespace: "foo", Registry: provider.Kubernetes},
+				},
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "foo-waypoint",
+					// labels match in selector policy but ignore them for waypoint
+					"app":     "httpbin",
+					"version": "v1",
+				},
+				RootNamespace: "istio-config",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "foo", policyWithServiceRef),
+				newConfig("default", "istio-config", policyWithGWClassRef),
+				newConfig("default-non-waypoint", "istio-config", policyWithSelector),
+			},
+			wantAllow: []AuthorizationPolicy{
+				{Name: "default", Namespace: "istio-config", Spec: policyWithGWClassRef},
 				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
 			},
 		},
@@ -456,7 +490,7 @@ func createFakeAuthorizationPolicies(configs []config.Config) *AuthorizationPoli
 	}
 	environment := &Environment{
 		ConfigStore: store,
-		Watcher:     mesh.NewFixedWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-config"}),
+		Watcher:     meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-config"}),
 	}
 	authzPolicies := GetAuthorizationPolicies(environment)
 	return authzPolicies

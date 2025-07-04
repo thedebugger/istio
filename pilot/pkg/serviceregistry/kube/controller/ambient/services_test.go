@@ -24,9 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
-	networkingclient "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/features"
+	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/kube/krt"
@@ -101,9 +101,6 @@ func TestServiceEntryServices(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "auto-assigned",
 					Namespace: "ns",
-					Labels: map[string]string{
-						constants.EnableV2AutoAllocationLabel: "true",
-					},
 				},
 				Spec: networking.ServiceEntry{
 					Hosts: []string{"assign-me.example.com"},
@@ -117,9 +114,11 @@ func TestServiceEntryServices(t *testing.T) {
 				Status: networking.ServiceEntryStatus{
 					Addresses: []*networking.ServiceEntryAddress{
 						{
+							Host:  "assign-me.example.com",
 							Value: "240.240.0.1",
 						},
 						{
+							Host:  "assign-me.example.com",
 							Value: "2001:2::1",
 						},
 					},
@@ -149,15 +148,96 @@ func TestServiceEntryServices(t *testing.T) {
 			},
 		},
 		{
+			name:   "Uses multiple auto-assigned addresses",
+			inputs: []any{},
+			se: &networkingclient.ServiceEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "multi-host-auto-assigned",
+					Namespace: "ns",
+				},
+				Spec: networking.ServiceEntry{
+					Hosts: []string{
+						"multi-host-assign-me.example.com",
+						"second-host-assign-me.example.com",
+					},
+					Ports: []*networking.ServicePort{{
+						Number: 80,
+						Name:   "http",
+					}},
+					SubjectAltNames: []string{"san1"},
+					Resolution:      networking.ServiceEntry_DNS,
+				},
+				Status: networking.ServiceEntryStatus{
+					Addresses: []*networking.ServiceEntryAddress{
+						{
+							Host:  "multi-host-assign-me.example.com",
+							Value: "240.240.0.1",
+						},
+						{
+							Host:  "multi-host-assign-me.example.com",
+							Value: "2001:2::1",
+						},
+						{
+							Host:  "second-host-assign-me.example.com",
+							Value: "240.240.0.2",
+						},
+						{
+							Host:  "second-host-assign-me.example.com",
+							Value: "2001:2::2",
+						},
+					},
+				},
+			},
+			result: []*workloadapi.Service{
+				{
+					Name:      "multi-host-auto-assigned",
+					Namespace: "ns",
+					Hostname:  "multi-host-assign-me.example.com",
+					Addresses: []*workloadapi.NetworkAddress{
+						{
+							Network: testNW,
+							Address: netip.AddrFrom4([4]byte{240, 240, 0, 1}).AsSlice(),
+						},
+						{
+							Network: testNW,
+							Address: netip.MustParseAddr("2001:2::1").AsSlice(),
+						},
+					},
+					Ports: []*workloadapi.Port{{
+						ServicePort: 80,
+						TargetPort:  80,
+					}},
+					SubjectAltNames: []string{"san1"},
+				},
+				{
+					Name:      "multi-host-auto-assigned",
+					Namespace: "ns",
+					Hostname:  "second-host-assign-me.example.com",
+					Addresses: []*workloadapi.NetworkAddress{
+						{
+							Network: testNW,
+							Address: netip.AddrFrom4([4]byte{240, 240, 0, 2}).AsSlice(),
+						},
+						{
+							Network: testNW,
+							Address: netip.MustParseAddr("2001:2::2").AsSlice(),
+						},
+					},
+					Ports: []*workloadapi.Port{{
+						ServicePort: 80,
+						TargetPort:  80,
+					}},
+					SubjectAltNames: []string{"san1"},
+				},
+			},
+		},
+		{
 			name:   "Does not use auto-assigned addresses user provided address",
 			inputs: []any{},
 			se: &networkingclient.ServiceEntry{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "user-provided",
 					Namespace: "ns",
-					Labels: map[string]string{
-						constants.EnableV2AutoAllocationLabel: "true",
-					},
 				},
 				Spec: networking.ServiceEntry{
 					Addresses: []string{"1.2.3.4"},
@@ -172,9 +252,11 @@ func TestServiceEntryServices(t *testing.T) {
 				Status: networking.ServiceEntryStatus{
 					Addresses: []*networking.ServiceEntryAddress{
 						{
+							Host:  "user-provided.example.com",
 							Value: "240.240.0.1",
 						},
 						{
+							Host:  "user-provided.example.com",
 							Value: "2001:2::1",
 						},
 					},
@@ -206,9 +288,6 @@ func TestServiceEntryServices(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "none-resolution",
 					Namespace: "ns",
-					Labels: map[string]string{
-						constants.EnableV2AutoAllocationLabel: "true",
-					},
 				},
 				Spec: networking.ServiceEntry{
 					Hosts: []string{"none-resolution.example.com"},
@@ -222,9 +301,11 @@ func TestServiceEntryServices(t *testing.T) {
 				Status: networking.ServiceEntryStatus{
 					Addresses: []*networking.ServiceEntryAddress{
 						{
+							Host:  "none-resolution.example.com",
 							Value: "240.240.0.1",
 						},
 						{
+							Host:  "none-resolution.example.com",
 							Value: "2001:2::1",
 						},
 					},
@@ -251,6 +332,9 @@ func TestServiceEntryServices(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "user-opt-out",
 					Namespace: "ns",
+					Labels: map[string]string{
+						label.NetworkingEnableAutoallocateIp.Name: "false",
+					},
 				},
 				Spec: networking.ServiceEntry{
 					Hosts: []string{"user-opt-out.example.com"},
@@ -264,9 +348,11 @@ func TestServiceEntryServices(t *testing.T) {
 				Status: networking.ServiceEntryStatus{
 					Addresses: []*networking.ServiceEntryAddress{
 						{
+							Host:  "user-opt-out.example.com",
 							Value: "240.240.0.1",
 						},
 						{
+							Host:  "user-opt-out.example.com",
 							Value: "2001:2::1",
 						},
 					},
@@ -293,9 +379,6 @@ func TestServiceEntryServices(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "partial-wildcard",
 					Namespace: "ns",
-					Labels: map[string]string{
-						constants.EnableV2AutoAllocationLabel: "true",
-					},
 				},
 				Spec: networking.ServiceEntry{
 					Hosts: []string{"*.wildcard.example.com", "this-is-ok.example.com"},
@@ -309,9 +392,11 @@ func TestServiceEntryServices(t *testing.T) {
 				Status: networking.ServiceEntryStatus{
 					Addresses: []*networking.ServiceEntryAddress{
 						{
+							Host:  "this-is-ok.example.com",
 							Value: "240.240.0.1",
 						},
 						{
+							Host:  "this-is-ok.example.com",
 							Value: "2001:2::1",
 						},
 					},
@@ -351,12 +436,148 @@ func TestServiceEntryServices(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:   "prefer same node traffic distribution",
+			inputs: []any{},
+			se: &networkingclient.ServiceEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Annotations: map[string]string{
+						"networking.istio.io/traffic-distribution": "PreferSameNode",
+					},
+				},
+				Spec: networking.ServiceEntry{
+					Addresses: []string{"1.2.3.4"},
+					Hosts:     []string{"a.example.com"},
+					Ports: []*networking.ServicePort{{
+						Number: 80,
+						Name:   "http",
+					}},
+					Resolution: networking.ServiceEntry_DNS,
+				},
+			},
+			result: []*workloadapi.Service{
+				{
+					Name:      "name",
+					Namespace: "ns",
+					Hostname:  "a.example.com",
+					Addresses: []*workloadapi.NetworkAddress{{
+						Network: testNW,
+						Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+					}},
+					LoadBalancing: &workloadapi.LoadBalancing{
+						RoutingPreference: []workloadapi.LoadBalancing_Scope{
+							workloadapi.LoadBalancing_NETWORK,
+							workloadapi.LoadBalancing_REGION,
+							workloadapi.LoadBalancing_ZONE,
+							workloadapi.LoadBalancing_SUBZONE,
+							workloadapi.LoadBalancing_NODE,
+						},
+						Mode: workloadapi.LoadBalancing_FAILOVER,
+					},
+					Ports: []*workloadapi.Port{{
+						ServicePort: 80,
+						TargetPort:  80,
+					}},
+				},
+			},
+		},
+		{
+			name:   "prefer same zone distribution",
+			inputs: []any{},
+			se: &networkingclient.ServiceEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Annotations: map[string]string{
+						"networking.istio.io/traffic-distribution": "PreferSameZone",
+					},
+				},
+				Spec: networking.ServiceEntry{
+					Addresses: []string{"1.2.3.4"},
+					Hosts:     []string{"a.example.com"},
+					Ports: []*networking.ServicePort{{
+						Number: 80,
+						Name:   "http",
+					}},
+					Resolution: networking.ServiceEntry_DNS,
+				},
+			},
+			result: []*workloadapi.Service{
+				{
+					Name:      "name",
+					Namespace: "ns",
+					Hostname:  "a.example.com",
+					Addresses: []*workloadapi.NetworkAddress{{
+						Network: testNW,
+						Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+					}},
+					LoadBalancing: &workloadapi.LoadBalancing{
+						RoutingPreference: []workloadapi.LoadBalancing_Scope{
+							workloadapi.LoadBalancing_NETWORK,
+							workloadapi.LoadBalancing_REGION,
+							workloadapi.LoadBalancing_ZONE,
+						},
+						Mode: workloadapi.LoadBalancing_FAILOVER,
+					},
+					Ports: []*workloadapi.Port{{
+						ServicePort: 80,
+						TargetPort:  80,
+					}},
+				},
+			},
+		},
+		{
+			name:   "prefer close traffic distribution",
+			inputs: []any{},
+			se: &networkingclient.ServiceEntry{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+					Annotations: map[string]string{
+						"networking.istio.io/traffic-distribution": "PreferClose",
+					},
+				},
+				Spec: networking.ServiceEntry{
+					Addresses: []string{"1.2.3.4"},
+					Hosts:     []string{"a.example.com"},
+					Ports: []*networking.ServicePort{{
+						Number: 80,
+						Name:   "http",
+					}},
+					Resolution: networking.ServiceEntry_DNS,
+				},
+			},
+			result: []*workloadapi.Service{
+				{
+					Name:      "name",
+					Namespace: "ns",
+					Hostname:  "a.example.com",
+					Addresses: []*workloadapi.NetworkAddress{{
+						Network: testNW,
+						Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+					}},
+					LoadBalancing: &workloadapi.LoadBalancing{
+						RoutingPreference: []workloadapi.LoadBalancing_Scope{
+							workloadapi.LoadBalancing_NETWORK,
+							workloadapi.LoadBalancing_REGION,
+							workloadapi.LoadBalancing_ZONE,
+						},
+						Mode: workloadapi.LoadBalancing_FAILOVER,
+					},
+					Ports: []*workloadapi.Port{{
+						ServicePort: 80,
+						TargetPort:  80,
+					}},
+				},
+			},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			features.EnableIPAutoallocate = true
 			mock := krttest.NewMock(t, tt.inputs)
-			a := newAmbientUnitTest()
+			a := newAmbientUnitTest(t)
 			builder := a.serviceEntryServiceBuilder(
 				krttest.GetMockCollection[Waypoint](mock),
 				krttest.GetMockCollection[*v1.Namespace](mock),
@@ -371,6 +592,16 @@ func TestServiceEntryServices(t *testing.T) {
 }
 
 func TestServiceServices(t *testing.T) {
+	waypointAddr := &workloadapi.GatewayAddress{
+		Destination: &workloadapi.GatewayAddress_Hostname{
+			Hostname: &workloadapi.NamespacedHostname{
+				Namespace: "ns",
+				Hostname:  "hostname.example",
+			},
+		},
+		// TODO: look up the HBONE port instead of hardcoding it
+		HboneMtlsPort: 15008,
+	}
 	cases := []struct {
 		name   string
 		inputs []any
@@ -405,6 +636,21 @@ func TestServiceServices(t *testing.T) {
 					ServicePort: 80,
 				}},
 			},
+		},
+		{
+			name:   "external name",
+			inputs: []any{},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: v1.ServiceSpec{
+					Type:         v1.ServiceTypeExternalName,
+					ExternalName: "example.com",
+				},
+			},
+			result: nil,
 		},
 		{
 			name:   "target ports",
@@ -472,7 +718,7 @@ func TestServiceServices(t *testing.T) {
 			},
 		},
 		{
-			name:   "traffic distribution",
+			name:   "traffic distribution prefer close",
 			inputs: []any{},
 			svc: &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -501,9 +747,121 @@ func TestServiceServices(t *testing.T) {
 						workloadapi.LoadBalancing_NETWORK,
 						workloadapi.LoadBalancing_REGION,
 						workloadapi.LoadBalancing_ZONE,
-						workloadapi.LoadBalancing_SUBZONE,
 					},
 					Mode: workloadapi.LoadBalancing_FAILOVER,
+				},
+				Ports: []*workloadapi.Port{{
+					ServicePort: 80,
+				}},
+			},
+		},
+
+		{
+			name:   "traffic distribution prefer same zone",
+			inputs: []any{},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: v1.ServiceSpec{
+					TrafficDistribution: ptr.Of(v1.ServiceTrafficDistributionPreferSameZone),
+					ClusterIP:           "1.2.3.4",
+					Ports: []v1.ServicePort{{
+						Port: 80,
+						Name: "http",
+					}},
+				},
+			},
+			result: &workloadapi.Service{
+				Name:      "name",
+				Namespace: "ns",
+				Hostname:  "name.ns.svc.domain.suffix",
+				Addresses: []*workloadapi.NetworkAddress{{
+					Network: testNW,
+					Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+				}},
+				LoadBalancing: &workloadapi.LoadBalancing{
+					RoutingPreference: []workloadapi.LoadBalancing_Scope{
+						workloadapi.LoadBalancing_NETWORK,
+						workloadapi.LoadBalancing_REGION,
+						workloadapi.LoadBalancing_ZONE,
+					},
+					Mode: workloadapi.LoadBalancing_FAILOVER,
+				},
+				Ports: []*workloadapi.Port{{
+					ServicePort: 80,
+				}},
+			},
+		},
+
+		{
+			name:   "traffic distribution prefer same node",
+			inputs: []any{},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: v1.ServiceSpec{
+					TrafficDistribution: ptr.Of(v1.ServiceTrafficDistributionPreferSameNode),
+					ClusterIP:           "1.2.3.4",
+					Ports: []v1.ServicePort{{
+						Port: 80,
+						Name: "http",
+					}},
+				},
+			},
+			result: &workloadapi.Service{
+				Name:      "name",
+				Namespace: "ns",
+				Hostname:  "name.ns.svc.domain.suffix",
+				Addresses: []*workloadapi.NetworkAddress{{
+					Network: testNW,
+					Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+				}},
+				LoadBalancing: &workloadapi.LoadBalancing{
+					RoutingPreference: []workloadapi.LoadBalancing_Scope{
+						workloadapi.LoadBalancing_NETWORK,
+						workloadapi.LoadBalancing_REGION,
+						workloadapi.LoadBalancing_ZONE,
+						workloadapi.LoadBalancing_SUBZONE,
+						workloadapi.LoadBalancing_NODE,
+					},
+					Mode: workloadapi.LoadBalancing_FAILOVER,
+				},
+				Ports: []*workloadapi.Port{{
+					ServicePort: 80,
+				}},
+			},
+		},
+		{
+			name:   "publishNotReadyAddresses",
+			inputs: []any{},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "name",
+					Namespace: "ns",
+				},
+				Spec: v1.ServiceSpec{
+					PublishNotReadyAddresses: true,
+					ClusterIP:                "1.2.3.4",
+					Ports: []v1.ServicePort{{
+						Port: 80,
+						Name: "http",
+					}},
+				},
+			},
+			result: &workloadapi.Service{
+				Name:      "name",
+				Namespace: "ns",
+				Hostname:  "name.ns.svc.domain.suffix",
+				Addresses: []*workloadapi.NetworkAddress{{
+					Network: testNW,
+					Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
+				}},
+				LoadBalancing: &workloadapi.LoadBalancing{
+					HealthPolicy: workloadapi.LoadBalancing_ALLOW_ALL,
 				},
 				Ports: []*workloadapi.Port{{
 					ServicePort: 80,
@@ -519,7 +877,7 @@ func TestServiceServices(t *testing.T) {
 						Namespace: "waypoint-ns",
 					},
 					TrafficType: constants.AllTraffic,
-					Addresses:   []netip.Addr{netip.AddrFrom4([4]byte{5, 6, 7, 8})},
+					Address:     waypointAddr,
 					AllowedRoutes: WaypointSelector{
 						FromNamespaces: gatewayv1.NamespacesFromSelector,
 						Selector:       labels.ValidatedSetSelector(map[string]string{v1.LabelMetadataName: "ns"}),
@@ -539,8 +897,8 @@ func TestServiceServices(t *testing.T) {
 					Name:      "name",
 					Namespace: "ns",
 					Labels: map[string]string{
-						constants.AmbientUseWaypointLabel:          "waypoint",
-						constants.AmbientUseWaypointNamespaceLabel: "waypoint-ns",
+						label.IoIstioUseWaypoint.Name:          "waypoint",
+						label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
 					},
 				},
 				Spec: v1.ServiceSpec{
@@ -559,15 +917,7 @@ func TestServiceServices(t *testing.T) {
 					Network: testNW,
 					Address: netip.AddrFrom4([4]byte{1, 2, 3, 4}).AsSlice(),
 				}},
-				Waypoint: &workloadapi.GatewayAddress{
-					Destination: &workloadapi.GatewayAddress_Address{
-						Address: &workloadapi.NetworkAddress{
-							Network: testNW,
-							Address: netip.AddrFrom4([4]byte{5, 6, 7, 8}).AsSlice(),
-						},
-					},
-					HboneMtlsPort: 15008,
-				},
+				Waypoint: waypointAddr,
 				Ports: []*workloadapi.Port{{
 					ServicePort: 80,
 				}},
@@ -582,7 +932,7 @@ func TestServiceServices(t *testing.T) {
 						Namespace: "waypoint-ns",
 					},
 					TrafficType: constants.AllTraffic,
-					Addresses:   []netip.Addr{netip.AddrFrom4([4]byte{5, 6, 7, 8})},
+					Address:     waypointAddr,
 					AllowedRoutes: WaypointSelector{
 						FromNamespaces: gatewayv1.NamespacesFromSelector,
 						Selector:       labels.ValidatedSetSelector(map[string]string{v1.LabelMetadataName: "not-ns"}),
@@ -602,8 +952,8 @@ func TestServiceServices(t *testing.T) {
 					Name:      "name",
 					Namespace: "ns",
 					Labels: map[string]string{
-						constants.AmbientUseWaypointLabel:          "waypoint",
-						constants.AmbientUseWaypointNamespaceLabel: "waypoint-ns",
+						label.IoIstioUseWaypoint.Name:          "waypoint",
+						label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
 					},
 				},
 				Spec: v1.ServiceSpec{
@@ -632,13 +982,147 @@ func TestServiceServices(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := krttest.NewMock(t, tt.inputs)
-			a := newAmbientUnitTest()
+			a := newAmbientUnitTest(t)
 			builder := a.serviceServiceBuilder(
 				krttest.GetMockCollection[Waypoint](mock),
 				krttest.GetMockCollection[*v1.Namespace](mock),
 			)
 			res := builder(krt.TestingDummyContext{}, tt.svc)
-			assert.Equal(t, res.Service, tt.result)
+			if res == nil {
+				assert.Equal(t, nil, tt.result)
+			} else {
+				assert.Equal(t, res.Service, tt.result)
+			}
+		})
+	}
+}
+
+func TestServiceConditions(t *testing.T) {
+	waypointAddr := &workloadapi.GatewayAddress{
+		Destination: &workloadapi.GatewayAddress_Hostname{
+			Hostname: &workloadapi.NamespacedHostname{
+				Namespace: "ns",
+				Hostname:  "hostname.example",
+			},
+		},
+		// TODO: look up the HBONE port instead of hardcoding it
+		HboneMtlsPort: 15008,
+	}
+
+	waypoint := Waypoint{
+		Named: krt.Named{
+			Name:      "waypoint",
+			Namespace: "waypoint-ns",
+		},
+		TrafficType: constants.AllTraffic,
+		Address:     waypointAddr,
+		AllowedRoutes: WaypointSelector{
+			FromNamespaces: gatewayv1.NamespacesFromSelector,
+			Selector:       labels.ValidatedSetSelector(map[string]string{v1.LabelMetadataName: "ns"}),
+		},
+	}
+
+	ns := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ns",
+			Labels: map[string]string{
+				v1.LabelMetadataName: "ns",
+			},
+		},
+	}
+
+	makeServiceWithLabels := func(labels map[string]string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "name",
+				Namespace: "ns",
+				Labels:    labels,
+			},
+			Spec: v1.ServiceSpec{
+				ClusterIP: "1.2.3.4",
+				Ports: []v1.ServicePort{{
+					Port: 80,
+					Name: "http",
+				}},
+			},
+		}
+	}
+
+	cases := []struct {
+		name       string
+		inputs     []any
+		svc        *v1.Service
+		result     *workloadapi.Service
+		conditions model.ConditionSet
+	}{
+		{
+			name: "service bound to waypoint",
+			inputs: []any{
+				waypoint,
+				ns,
+			},
+			svc: makeServiceWithLabels(map[string]string{
+				label.IoIstioUseWaypoint.Name:          "waypoint",
+				label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
+			}),
+			conditions: map[model.ConditionType]*model.Condition{
+				model.WaypointBound: {
+					Status:  true,
+					Reason:  string(model.WaypointAccepted),
+					Message: "Successfully attached to waypoint waypoint-ns/waypoint",
+				},
+			},
+		},
+		{
+			name: "service bound to waypoint and using waypoint for ingress",
+			inputs: []any{
+				waypoint,
+				ns,
+			},
+			svc: makeServiceWithLabels(map[string]string{
+				label.IoIstioUseWaypoint.Name:          "waypoint",
+				label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
+				"istio.io/ingress-use-waypoint":        "true",
+			}),
+			conditions: map[model.ConditionType]*model.Condition{
+				model.WaypointBound: {
+					Status:  true,
+					Reason:  string(model.WaypointAccepted),
+					Message: "Successfully attached to waypoint waypoint-ns/waypoint. Ingress traffic will traverse the waypoint",
+				},
+			},
+		},
+		{
+			name: "service bound to waypoint and ingress label is malformed",
+			inputs: []any{
+				waypoint,
+				ns,
+			},
+			svc: makeServiceWithLabels(map[string]string{
+				label.IoIstioUseWaypoint.Name:          "waypoint",
+				label.IoIstioUseWaypointNamespace.Name: "waypoint-ns",
+				"istio.io/ingress-use-waypoint":        "eurt",
+			}),
+			conditions: map[model.ConditionType]*model.Condition{
+				model.WaypointBound: {
+					Status: true,
+					Reason: string(model.WaypointAccepted),
+					Message: "Successfully attached to waypoint waypoint-ns/waypoint. " +
+						"Ingress traffic is not using the waypoint, set the istio.io/ingress-use-waypoint label to true if desired.",
+				},
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := krttest.NewMock(t, tt.inputs)
+			a := newAmbientUnitTest(t)
+			builder := a.serviceServiceBuilder(
+				krttest.GetMockCollection[Waypoint](mock),
+				krttest.GetMockCollection[*v1.Namespace](mock),
+			)
+			res := builder(krt.TestingDummyContext{}, tt.svc)
+			assert.Equal(t, res.GetConditions(), tt.conditions)
 		})
 	}
 }

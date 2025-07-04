@@ -15,7 +15,9 @@
 package core
 
 import (
+	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/util/sets"
@@ -30,6 +32,9 @@ const (
 
 	// ConnectOriginate is the name for the resources associated with the origination of HTTP CONNECT.
 	ConnectOriginate = "connect_originate"
+
+	// ForwardInnerConnect is the name for resources associated with the forwarding of an inner CONNECT tunnel.
+	ForwardInnerConnect = "forward_inner_connect"
 
 	// EncapClusterName is the name of the cluster used for traffic to the connect_originate listener.
 	EncapClusterName = "encap"
@@ -52,7 +57,7 @@ func findWaypointResources(node *model.Proxy, push *model.PushContext) ([]model.
 	waypointServices := &waypointServices{}
 	for _, s := range serviceInfos {
 		hostName := host.Name(s.Service.Hostname)
-		svc, ok := push.ServiceIndex.HostnameAndNamespace[hostName][s.Namespace]
+		svc, ok := push.ServiceIndex.HostnameAndNamespace[hostName][s.Service.Namespace]
 		if !ok {
 			continue
 		}
@@ -81,7 +86,8 @@ func findWaypointResources(node *model.Proxy, push *model.PushContext) ([]model.
 func filterWaypointOutboundServices(
 	referencedServices map[string]sets.String,
 	waypointServices map[host.Name]*model.Service,
-	extraServices sets.String,
+	extraNamespacedHostnames sets.Set[model.NamespacedHostname],
+	extraHostnames sets.String,
 	services []*model.Service,
 ) []*model.Service {
 	outboundServices := sets.New[string]()
@@ -97,9 +103,23 @@ func filterWaypointOutboundServices(
 	}
 	res := make([]*model.Service, 0, len(outboundServices))
 	for _, s := range services {
-		if outboundServices.Contains(s.Hostname.String()) || extraServices.Contains(s.Hostname.String()) {
+		if outboundServices.Contains(s.Hostname.String()) ||
+			extraHostnames.Contains(s.Hostname.String()) ||
+			extraNamespacedHostnames.Contains(model.NamespacedHostname{
+				Hostname:  s.Hostname,
+				Namespace: s.Attributes.Namespace,
+			}) {
 			res = append(res, s)
 		}
 	}
 	return res
+}
+
+func isEastWestGateway(node *model.Proxy) bool {
+	if node == nil || node.Type != model.Waypoint {
+		return false
+	}
+	controller, isManagedGateway := node.Labels[label.GatewayManaged.Name]
+
+	return isManagedGateway && controller == constants.ManagedGatewayEastWestControllerLabel
 }

@@ -24,6 +24,7 @@ import (
 
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestUpdateExistingContents(t *testing.T) {
@@ -31,7 +32,7 @@ func TestUpdateExistingContents(t *testing.T) {
 	src := NewKubeSource(collections.Istio)
 
 	applyAndValidate := func(version string) {
-		configTemplate := `apiVersion: networking.istio.io/v1beta1
+		configTemplate := `apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: productpage
@@ -57,4 +58,17 @@ spec:
 	applyAndValidate("v1")
 	// Apply v2 config and validate overwrite
 	applyAndValidate("v2")
+}
+
+func TestUnknownSchema(t *testing.T) {
+	src := NewKubeSource(collections.Istio)
+	assert.NoError(t, src.ApplyContent("test", `apiVersion: networking.istio.io/v1
+kind: WoKnows
+`))
+	assert.NoError(t, src.ApplyContent("test", `kind: List
+apiVersion: v1
+items:
+- apiVersion: networking.istio.io/v1
+  kind: WoKnows
+`))
 }

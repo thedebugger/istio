@@ -36,8 +36,9 @@ import (
 
 // Various locks used throughout the code
 const (
-	NamespaceController     = "istio-namespace-controller-election"
-	ServiceExportController = "istio-serviceexport-controller-election"
+	NamespaceController          = "istio-namespace-controller-election"
+	ClusterTrustBundleController = "istio-clustertrustbundle-controller-election"
+	ServiceExportController      = "istio-serviceexport-controller-election"
 	// This holds the legacy name to not conflict with older control plane deployments which are just
 	// doing the ingress syncing.
 	IngressController = "istio-leader"
@@ -45,8 +46,9 @@ const (
 	// this was formally "istio-gateway-leader"; because they are a different API group we need a different
 	// election to ensure we do not only handle one or the other.
 	GatewayStatusController = "istio-gateway-status-leader"
-	StatusController        = "istio-status-leader"
-	AnalyzeController       = "istio-analyze-leader"
+	// StatusController controls writing Istio status to objects
+	StatusController  = "istio-status-leader"
+	AnalyzeController = "istio-analyze-leader"
 	// GatewayDeploymentController controls translating Kubernetes Gateway objects into various derived
 	// resources (Service, Deployment, etc).
 	// Unlike other types which use ConfigMaps, we use a Lease here. This is because:
@@ -79,6 +81,9 @@ type LeaderElection struct {
 	perRevision    bool
 	remote         bool
 	defaultWatcher revisions.DefaultWatcher
+
+	// If set, will use the more modern lease lock
+	useLeaseLock bool
 
 	// Records which "cycle" the election is on. This is incremented each time an election is won and then lost
 	// This is mostly just for testing
@@ -158,7 +163,7 @@ func (l *LeaderElection) create() (*k8sleaderelection.LeaderElector, error) {
 			Key:      key,
 		},
 	}
-	if l.perRevision {
+	if l.perRevision || l.useLeaseLock {
 		lock = &k8sresourcelock.LeaseLock{
 			LeaseMeta: metav1.ObjectMeta{Namespace: l.namespace, Name: l.electionID},
 			Client:    l.client.CoordinationV1(),
@@ -219,22 +224,34 @@ func (l *LeaderElection) AddRunFunction(f func(stop <-chan struct{})) *LeaderEle
 // NewLeaderElection creates a leader election instance with the provided ID. This follows standard Kubernetes
 // elections, with one difference: the "default" revision will steal the lock from other revisions.
 func NewLeaderElection(namespace, name, electionID, revision string, client kube.Client) *LeaderElection {
-	return newLeaderElection(namespace, name, electionID, revision, false, false, client)
+	return newLeaderElection(namespace, name, electionID, revision, false, false, false, client)
+}
+
+// NewLeaseLeaderElection creates a leader election instance with the provided ID. This follows standard Kubernetes
+// elections, with one difference: the "default" revision will steal the lock from other revisions.
+// The Lease object is used for maintaining the locking
+func NewLeaseLeaderElection(namespace, name, electionID, revision string, client kube.Client) *LeaderElection {
+	return newLeaderElection(namespace, name, electionID, revision, false, false, true, client)
 }
 
 // NewPerRevisionLeaderElection creates a *per revision* leader election. This means there will be one leader for each revision.
 func NewPerRevisionLeaderElection(namespace, name, electionID, revision string, client kube.Client) *LeaderElection {
-	return newLeaderElection(namespace, name, electionID, revision, true, false, client)
+	// PerRevision is new, so always use the more modern lease lock
+	return newLeaderElection(namespace, name, electionID, revision, true, false, true, client)
 }
 
 func NewLeaderElectionMulticluster(namespace, name, electionID, revision string, remote bool, client kube.Client) *LeaderElection {
-	return newLeaderElection(namespace, name, electionID, revision, false, remote, client)
+	return newLeaderElection(namespace, name, electionID, revision, false, remote, false, client)
 }
 
-func newLeaderElection(namespace, name, electionID, revision string, perRevision bool, remote bool, client kube.Client) *LeaderElection {
+func newLeaderElection(namespace, name, electionID, revision string, perRevision bool, remote bool, leaseLock bool, client kube.Client) *LeaderElection {
 	var watcher revisions.DefaultWatcher
 	if features.EnableLeaderElection {
 		watcher = revisions.NewDefaultWatcher(client, revision)
+	}
+	// Default revision for consistency. Note that on Kubernetes, there is ~always a revision set.
+	if revision == "" {
+		revision = "default"
 	}
 	if name == "" {
 		hn, _ := os.Hostname()
@@ -250,6 +267,7 @@ func newLeaderElection(namespace, name, electionID, revision string, perRevision
 		electionID:     electionID,
 		revision:       revision,
 		perRevision:    perRevision,
+		useLeaseLock:   leaseLock,
 		enabled:        features.EnableLeaderElection,
 		remote:         remote,
 		defaultWatcher: watcher,

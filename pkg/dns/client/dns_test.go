@@ -24,10 +24,10 @@ import (
 
 	"github.com/miekg/dns"
 	"go.uber.org/atomic"
-	"google.golang.org/protobuf/proto"
 
 	dnsProto "istio.io/istio/pkg/dns/proto"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -94,7 +94,7 @@ func TestBuildAlternateHosts(t *testing.T) {
 	}
 
 	nt := d.NameTable()
-	nt = proto.Clone(nt).(*dnsProto.NameTable)
+	nt = protomarshal.Clone(nt)
 	d.BuildAlternateHosts(nt, func(althosts map[string]struct{}, ipv4 []netip.Addr, ipv6 []netip.Addr, _ []string) {
 		for host := range althosts {
 			if _, exists := nt.Table[host]; !exists {
@@ -156,6 +156,10 @@ func testDNS(t *testing.T, d *LocalDNSServer) {
 			name:     "success: k8s host - fqdn",
 			host:     "productpage.ns1.svc.cluster.local.",
 			expected: a("productpage.ns1.svc.cluster.local.", []netip.Addr{netip.MustParseAddr("9.9.9.9")}),
+		},
+		{
+			name: "not found: k8s host, fqdn with search namespace[0]",
+			host: "productpage.ns1.svc.cluster.local.ns1.svc.cluster.local.", // This should not exist in the table.
 		},
 		{
 			name:     "success: k8s host - name.namespace",
@@ -549,7 +553,7 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 	}()
 	select {
 	case <-time.After(time.Second * 10):
-		t.Fatalf("setup timeout")
+		t.Fatal("setup timeout")
 	case <-up:
 	}
 
@@ -570,7 +574,7 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 	}()
 	select {
 	case <-time.After(time.Second * 10):
-		t.Fatalf("setup timeout")
+		t.Fatal("setup timeout")
 	case <-up:
 	}
 	t.Cleanup(func() { _ = server.Shutdown() })
@@ -578,7 +582,7 @@ func makeUpstream(t test.Failer, responses map[string]string) string {
 
 	select {
 	case <-time.After(time.Second * 10):
-		t.Fatalf("setup timeout")
+		t.Fatal("setup timeout")
 	case <-up:
 	}
 	t.Cleanup(func() { _ = tcp.Shutdown() })

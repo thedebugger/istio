@@ -3,7 +3,6 @@ kind: GatewayClass
 metadata:
   creationTimestamp: null
   name: istio
-  namespace: default
 spec: null
 status:
   conditions:
@@ -12,9 +11,6 @@ status:
     reason: Accepted
     status: "True"
     type: Accepted
-  supportedFeatures:
-  - HTTPRouteFeatureA
-  - HTTPRouteFeatureB
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: Gateway
@@ -118,9 +114,8 @@ status:
       type: ResolvedRefs
     controllerName: istio.io/gateway-controller
     parentRef:
-      group: ""
-      kind: Service
-      name: example
+      name: gateway
+      namespace: istio-system
   - conditions:
     - lastTransitionTime: fake
       message: Route was valid
@@ -134,8 +129,9 @@ status:
       type: ResolvedRefs
     controllerName: istio.io/gateway-controller
     parentRef:
-      name: gateway
-      namespace: istio-system
+      group: ""
+      kind: Service
+      name: example
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: HTTPRoute

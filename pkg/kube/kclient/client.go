@@ -36,6 +36,7 @@ import (
 	"istio.io/istio/pkg/kube/kubetypes"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/sets"
 )
 
@@ -95,34 +96,39 @@ func (n *informerClient[T]) Start(stopCh <-chan struct{}) {
 type internalIndex struct {
 	key     string
 	indexer cache.Indexer
+	filter  func(t any) bool
 }
 
-func (i internalIndex) Lookup(key string) []interface{} {
+func (i internalIndex) Lookup(key string) []any {
 	res, err := i.indexer.ByIndex(i.key, key)
 	if err != nil {
 		// This should only happen if the index key (i.key, not key) does not exist which should be impossible.
 		log.Fatalf("index lookup failed: %v", err)
+	}
+	if i.filter != nil {
+		return slices.FilterInPlace(res, i.filter)
 	}
 	return res
 }
 
 var _ RawIndexer = internalIndex{}
 
-func (n *informerClient[T]) Index(extract func(o T) []string) RawIndexer {
-	// We just need some unique key, any will do
-	key := fmt.Sprintf("%p", extract)
-	if err := n.informer.AddIndexers(map[string]cache.IndexFunc{
-		key: func(obj interface{}) ([]string, error) {
-			t := controllers.Extract[T](obj)
-			return extract(t), nil
-		},
-	}); err != nil {
-		// Should only happen on key conflict or on stop
-		log.Warnf("failed to add indexer: %v", err)
+func (n *informerClient[T]) Index(name string, extract func(o T) []string) RawIndexer {
+	if _, ok := n.informer.GetIndexer().GetIndexers()[name]; !ok {
+		if err := n.informer.AddIndexers(map[string]cache.IndexFunc{
+			name: func(obj any) ([]string, error) {
+				t := controllers.Extract[T](obj)
+				return extract(t), nil
+			},
+		}); err != nil {
+			// Should only happen on key conflict or on stop
+			log.Warnf("failed to add indexer: %v", err)
+		}
 	}
 	ret := internalIndex{
-		key:     key,
+		key:     name,
 		indexer: n.informer.GetIndexer(),
+		filter:  n.filter,
 	}
 	return ret
 }
@@ -147,6 +153,14 @@ func (n *writeClient[T]) PatchStatus(name, namespace string, pt apitypes.PatchTy
 	return api.Patch(context.Background(), name, pt, data, metav1.PatchOptions{}, "status")
 }
 
+func (n *writeClient[T]) ApplyStatus(name, namespace string, pt apitypes.PatchType, data []byte, fieldManager string) (T, error) {
+	api := kubeclient.GetWriteClient[T](n.client, namespace)
+	return api.Patch(context.Background(), name, pt, data, metav1.PatchOptions{
+		Force:        ptr.Of(true),
+		FieldManager: fieldManager,
+	}, "status")
+}
+
 func (n *writeClient[T]) UpdateStatus(object T) (T, error) {
 	api, ok := kubeclient.GetWriteClient[T](n.client, object.GetNamespace()).(kubetypes.WriteStatusAPI[T])
 	if !ok {
@@ -166,9 +180,25 @@ func (n *informerClient[T]) ShutdownHandlers() {
 	for _, c := range n.registeredHandlers {
 		_ = n.informer.RemoveEventHandler(c.registration)
 	}
+	n.registeredHandlers = nil
 }
 
-func (n *informerClient[T]) AddEventHandler(h cache.ResourceEventHandler) {
+func (n *informerClient[T]) ShutdownHandler(registration cache.ResourceEventHandlerRegistration) {
+	n.handlerMu.Lock()
+	defer n.handlerMu.Unlock()
+	n.registeredHandlers = slices.FilterInPlace(n.registeredHandlers, func(h handlerRegistration) bool {
+		return h.registration != registration
+	})
+	_ = n.informer.RemoveEventHandler(registration)
+}
+
+type neverReady struct{}
+
+func (a neverReady) HasSynced() bool {
+	return false
+}
+
+func (n *informerClient[T]) AddEventHandler(h cache.ResourceEventHandler) cache.ResourceEventHandlerRegistration {
 	fh := cache.FilteringResourceEventHandler{
 		FilterFunc: func(obj interface{}) bool {
 			if n.filter == nil {
@@ -187,9 +217,10 @@ func (n *informerClient[T]) AddEventHandler(h cache.ResourceEventHandler) {
 	reg, err := n.informer.AddEventHandler(fh)
 	if err != nil {
 		// Should only happen if its already stopped. We should exit early.
-		return
+		return neverReady{}
 	}
 	n.registeredHandlers = append(n.registeredHandlers, handlerRegistration{registration: reg, handler: h})
+	return reg
 }
 
 func (n *informerClient[T]) HasSynced() bool {
@@ -205,6 +236,10 @@ func (n *informerClient[T]) HasSynced() bool {
 		}
 	}
 	return true
+}
+
+func (n *informerClient[T]) HasSyncedIgnoringHandlers() bool {
+	return n.informer.HasSynced()
 }
 
 func (n *informerClient[T]) List(namespace string, selector klabels.Selector) []T {
@@ -256,7 +291,7 @@ func New[T controllers.ComparableObject](c kube.Client) Client[T] {
 // Use with caution.
 func NewFiltered[T controllers.ComparableObject](c kube.Client, filter Filter) Client[T] {
 	gvr := types.MustToGVR[T](types.MustGVKFromType[T]())
-	inf := kubeclient.GetInformerFiltered[T](c, ToOpts(c, gvr, filter))
+	inf := kubeclient.GetInformerFiltered[T](c, ToOpts(c, gvr, filter), gvr)
 	return &fullClient[T]{
 		writeClient: writeClient[T]{client: c},
 		Informer:    newInformerClient[T](gvr, inf, filter),
@@ -277,13 +312,13 @@ func NewDelayedInformer[T controllers.ComparableObject](
 ) Informer[T] {
 	watcher := c.CrdWatcher()
 	if watcher == nil {
-		log.Fatalf("NewDelayedInformer called without a CrdWatcher enabled")
+		log.Fatal("NewDelayedInformer called without a CrdWatcher enabled")
 	}
 	delay := newDelayedFilter(gvr, watcher)
 	inf := func() informerfactory.StartableInformer {
 		opts := ToOpts(c, gvr, filter)
 		opts.InformerType = informerType
-		return kubeclient.GetInformerFilteredFromGVR(c, opts, gvr)
+		return kubeclient.GetInformerFiltered[T](c, opts, gvr)
 	}
 	return newDelayedInformer[T](gvr, inf, delay, filter)
 }

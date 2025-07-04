@@ -23,6 +23,7 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	statefulsession "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
 	httpv3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	"github.com/google/go-cmp/cmp"
@@ -30,6 +31,7 @@ import (
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
@@ -395,7 +397,7 @@ func TestBuildConfigInfoMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -437,7 +439,7 @@ func TestAddConfigInfoMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -462,7 +464,7 @@ func TestAddConfigInfoMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -502,7 +504,7 @@ func TestAddConfigInfoMetadata(t *testing.T) {
 							},
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -546,7 +548,7 @@ func TestAddConfigInfoMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -581,7 +583,7 @@ func TestAddSubsetToMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 						},
@@ -595,7 +597,7 @@ func TestAddSubsetToMetadata(t *testing.T) {
 						Fields: map[string]*structpb.Value{
 							"config": {
 								Kind: &structpb.Value_StringValue{
-									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+									StringValue: "/apis/networking.istio.io/v1/namespaces/default/destination-rule/svcA",
 								},
 							},
 							"subset": {
@@ -1120,14 +1122,17 @@ func TestCidrRangeSliceEqual(t *testing.T) {
 }
 
 func TestEndpointMetadata(t *testing.T) {
-	test.SetForTest(t, &features.EndpointTelemetryLabel, true)
 	cases := []struct {
-		name     string
-		metadata *model.EndpointMetadata
-		want     *core.Metadata
+		name                   string
+		enableTelemetryLabel   bool
+		endpointTelemetryLabel bool
+		metadata               *model.EndpointMetadata
+		want                   *core.Metadata
 	}{
 		{
-			name: "all empty",
+			name:                   "all empty",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.DisabledTLSModeLabel,
 				Network:      "",
@@ -1149,7 +1154,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "tls mode",
+			name:                   "tls mode",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "",
@@ -1180,7 +1187,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "network and tls mode",
+			name:                   "network and tls mode",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1211,7 +1220,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "all label",
+			name:                   "all label",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1247,7 +1258,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "miss pod label",
+			name:                   "miss pod label",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1279,7 +1292,9 @@ func TestEndpointMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "miss workload name",
+			name:                   "miss workload name",
+			enableTelemetryLabel:   true,
+			endpointTelemetryLabel: true,
 			metadata: &model.EndpointMetadata{
 				TLSMode:      model.IstioMutualTLSModeLabel,
 				Network:      "network",
@@ -1310,9 +1325,49 @@ func TestEndpointMetadata(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:                   "all empty, telemetry label disabled",
+			enableTelemetryLabel:   false,
+			endpointTelemetryLabel: false,
+			metadata: &model.EndpointMetadata{
+				TLSMode:      model.DisabledTLSModeLabel,
+				Network:      "",
+				WorkloadName: "",
+				ClusterID:    "",
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{},
+			},
+		},
+		{
+			name:                   "tls mode, telemetry label disabled",
+			enableTelemetryLabel:   false,
+			endpointTelemetryLabel: false,
+			metadata: &model.EndpointMetadata{
+				TLSMode:      model.IstioMutualTLSModeLabel,
+				Network:      "",
+				WorkloadName: "",
+				ClusterID:    "",
+			},
+			want: &core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					EnvoyTransportSocketMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							model.TLSModeLabelShortname: {
+								Kind: &structpb.Value_StringValue{
+									StringValue: model.IstioMutualTLSModeLabel,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.EnableTelemetryLabel, tt.enableTelemetryLabel)
+			test.SetForTest(t, &features.EndpointTelemetryLabel, tt.endpointTelemetryLabel)
 			input := &core.Metadata{}
 			AppendLbEndpointMetadata(tt.metadata, input)
 			if !reflect.DeepEqual(input, tt.want) {
@@ -1710,6 +1765,102 @@ func TestMergeSubsetTrafficPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			policy := MergeSubsetTrafficPolicy(tt.original, tt.subset, tt.port)
 			assert.Equal(t, policy, tt.expected)
+		})
+	}
+}
+
+func TestMeshNetworksToEnvoyInternalAddressConfig(t *testing.T) {
+	cases := []struct {
+		name           string
+		networks       *meshconfig.MeshNetworks
+		expectedconfig *hcm.HttpConnectionManager_InternalAddressConfig
+	}{
+		{
+			name:           "nil networks",
+			expectedconfig: nil,
+		},
+		{
+			name:           "empty networks",
+			networks:       &meshconfig.MeshNetworks{},
+			expectedconfig: nil,
+		},
+		{
+			name: "networks populated",
+			networks: &meshconfig.MeshNetworks{
+				Networks: map[string]*meshconfig.Network{
+					"default": {
+						Endpoints: []*meshconfig.Network_NetworkEndpoints{
+							{
+								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
+									FromCidr: "192.168.0.0/16",
+								},
+							},
+							{
+								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
+									FromCidr: "172.16.0.0/12",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedconfig: &hcm.HttpConnectionManager_InternalAddressConfig{
+				CidrRanges: []*core.CidrRange{
+					{
+						AddressPrefix: "172.16.0.0",
+						PrefixLen:     &wrappers.UInt32Value{Value: 12},
+					},
+					{
+						AddressPrefix: "192.168.0.0",
+						PrefixLen:     &wrappers.UInt32Value{Value: 16},
+					},
+				},
+			},
+		},
+		{
+			name: "multi v6",
+			networks: &meshconfig.MeshNetworks{
+				Networks: map[string]*meshconfig.Network{
+					"default": {
+						Endpoints: []*meshconfig.Network_NetworkEndpoints{
+							{
+								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
+									FromCidr: "2001:db8:abcd::/48",
+								},
+							},
+						},
+					},
+					"other": {
+						Endpoints: []*meshconfig.Network_NetworkEndpoints{
+							{
+								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
+									FromCidr: "2001:db8:def0:1234::/56",
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedconfig: &hcm.HttpConnectionManager_InternalAddressConfig{
+				CidrRanges: []*core.CidrRange{
+					{
+						AddressPrefix: "2001:db8:abcd::",
+						PrefixLen:     &wrappers.UInt32Value{Value: 48},
+					},
+					{
+						AddressPrefix: "2001:db8:def0:1234::",
+						PrefixLen:     &wrappers.UInt32Value{Value: 56},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MeshNetworksToEnvoyInternalAddressConfig(tt.networks)
+			if !reflect.DeepEqual(tt.expectedconfig, got) {
+				t.Errorf("unexpected internal address config, expected: %v, got :%v", tt.expectedconfig, got)
+			}
 		})
 	}
 }

@@ -11,7 +11,6 @@ metadata:
   labels:
     gateway.istio.io/managed: istio.io-mesh-controller
     gateway.networking.k8s.io/gateway-name: namespace
-    istio.io/gateway-name: namespace
     topology.istio.io/network: network-1
   name: namespace
   namespace: default
@@ -28,7 +27,6 @@ metadata:
   labels:
     gateway.istio.io/managed: istio.io-mesh-controller
     gateway.networking.k8s.io/gateway-name: namespace
-    istio.io/gateway-name: namespace
     topology.istio.io/network: network-1
   name: namespace
   namespace: default
@@ -52,7 +50,6 @@ spec:
         gateway.istio.io/managed: istio.io-mesh-controller
         gateway.networking.k8s.io/gateway-name: namespace
         istio.io/dataplane-mode: none
-        istio.io/gateway-name: namespace
         service.istio.io/canonical-name: namespace
         service.istio.io/canonical-revision: latest
         sidecar.istio.io/inject: "false"
@@ -132,9 +129,14 @@ spec:
           value: kubernetes://apis/apps/v1/namespaces/default/deployments/namespace
         - name: ISTIO_META_MESH_ID
           value: cluster.local
+        - name: TRUST_DOMAIN
+          value: cluster.local
         image: test/proxyv2:test
         name: istio-proxy
         ports:
+        - containerPort: 15020
+          name: metrics
+          protocol: TCP
         - containerPort: 15021
           name: status-port
           protocol: TCP
@@ -151,13 +153,6 @@ spec:
           periodSeconds: 15
           successThreshold: 1
           timeoutSeconds: 1
-        resources:
-          limits:
-            cpu: "2"
-            memory: 1Gi
-          requests:
-            cpu: 100m
-            memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -229,11 +224,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  annotations: {}
+  annotations:
+    networking.istio.io/traffic-distribution: PreferClose
   labels:
     gateway.istio.io/managed: istio.io-mesh-controller
     gateway.networking.k8s.io/gateway-name: namespace
-    istio.io/gateway-name: namespace
     topology.istio.io/network: network-1
   name: namespace
   namespace: default

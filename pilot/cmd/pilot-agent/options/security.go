@@ -16,6 +16,7 @@ package options
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
@@ -28,32 +29,37 @@ import (
 	"istio.io/istio/security/pkg/nodeagent/cafile"
 )
 
+// Similar with ISTIO_META_, which is used to customize the node metadata - this customizes extra CA header.
+const caHeaderPrefix = "CA_HEADER_"
+
 func NewSecurityOptions(proxyConfig *meshconfig.ProxyConfig, stsPort int, tokenManagerPlugin string) (*security.Options, error) {
 	o := &security.Options{
-		CAEndpoint:                     caEndpointEnv,
-		CAProviderName:                 caProviderEnv,
-		PilotCertProvider:              features.PilotCertProvider,
-		OutputKeyCertToDir:             outputKeyCertToDir,
-		ProvCert:                       provCert,
-		ClusterID:                      clusterIDVar.Get(),
-		FileMountedCerts:               fileMountedCertsEnv,
-		WorkloadNamespace:              PodNamespaceVar.Get(),
-		ServiceAccount:                 serviceAccountVar.Get(),
-		XdsAuthProvider:                xdsAuthProvider.Get(),
-		TrustDomain:                    trustDomainEnv,
-		WorkloadRSAKeySize:             workloadRSAKeySizeEnv,
-		Pkcs8Keys:                      pkcs8KeysEnv,
-		ECCSigAlg:                      eccSigAlgEnv,
-		ECCCurve:                       eccCurvEnv,
-		SecretTTL:                      secretTTLEnv,
-		FileDebounceDuration:           fileDebounceDuration,
-		SecretRotationGracePeriodRatio: secretRotationGracePeriodRatioEnv,
-		STSPort:                        stsPort,
-		CertSigner:                     certSigner.Get(),
-		CARootPath:                     cafile.CACertFilePath,
-		CertChainFilePath:              security.DefaultCertChainFilePath,
-		KeyFilePath:                    security.DefaultKeyFilePath,
-		RootCertFilePath:               security.DefaultRootCertFilePath,
+		CAEndpoint:                           caEndpointEnv,
+		CAProviderName:                       caProviderEnv,
+		PilotCertProvider:                    features.PilotCertProvider,
+		OutputKeyCertToDir:                   outputKeyCertToDir,
+		ProvCert:                             provCert,
+		ClusterID:                            clusterIDVar.Get(),
+		FileMountedCerts:                     fileMountedCertsEnv,
+		WorkloadNamespace:                    PodNamespaceVar.Get(),
+		ServiceAccount:                       serviceAccountVar.Get(),
+		XdsAuthProvider:                      xdsAuthProvider.Get(),
+		TrustDomain:                          trustDomainEnv,
+		WorkloadRSAKeySize:                   workloadRSAKeySizeEnv,
+		Pkcs8Keys:                            pkcs8KeysEnv,
+		ECCSigAlg:                            eccSigAlgEnv,
+		ECCCurve:                             eccCurvEnv,
+		SecretTTL:                            secretTTLEnv,
+		FileDebounceDuration:                 fileDebounceDuration,
+		SecretRotationGracePeriodRatio:       secretRotationGracePeriodRatioEnv,
+		SecretRotationGracePeriodRatioJitter: secretRotationGracePeriodRatioJitterEnv,
+		STSPort:                              stsPort,
+		CertSigner:                           certSigner.Get(),
+		CARootPath:                           cafile.CACertFilePath,
+		CertChainFilePath:                    security.DefaultCertChainFilePath,
+		KeyFilePath:                          security.DefaultKeyFilePath,
+		RootCertFilePath:                     security.DefaultRootCertFilePath,
+		CAHeaders:                            map[string]string{},
 	}
 
 	o, err := SetupSecurityOptions(proxyConfig, o, jwtPolicy.Get(),
@@ -61,6 +67,8 @@ func NewSecurityOptions(proxyConfig *meshconfig.ProxyConfig, stsPort int, tokenM
 	if err != nil {
 		return o, err
 	}
+
+	extractCAHeadersFromEnv(o)
 
 	return o, err
 }
@@ -122,4 +130,20 @@ func SetupSecurityOptions(proxyConfig *meshconfig.ProxyConfig, secOpt *security.
 		return nil, fmt.Errorf("invalid options: PROV_CERT and FILE_MOUNTED_CERTS are mutually exclusive")
 	}
 	return o, nil
+}
+
+// extractCAHeadersFromEnv extracts CA headers from environment variables.
+func extractCAHeadersFromEnv(o *security.Options) {
+	envs := os.Environ()
+	for _, e := range envs {
+		if !strings.HasPrefix(e, caHeaderPrefix) {
+			continue
+		}
+
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		o.CAHeaders[parts[0][len(caHeaderPrefix):]] = parts[1]
+	}
 }

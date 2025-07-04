@@ -38,10 +38,13 @@ import (
 	networkutil "istio.io/istio/pilot/pkg/util/network"
 	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/maps"
 	pm "istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/monitoring"
@@ -93,6 +96,9 @@ func NewEnvironment() *Environment {
 	}
 }
 
+// Watcher is a type alias to keep the embedded type name stable.
+type Watcher = meshwatcher.WatcherCollection
+
 // Environment provides an aggregate environmental API for Pilot
 type Environment struct {
 	// Discovery interface for listing services and instances.
@@ -102,7 +108,7 @@ type Environment struct {
 	ConfigStore
 
 	// Watcher is the watcher for the mesh config (to be merged into the config store)
-	mesh.Watcher
+	Watcher
 
 	// NetworksWatcher (loaded from a config map) provides information about the
 	// set of networks inside a mesh and how to route to endpoints in each
@@ -391,8 +397,6 @@ type Proxy struct {
 
 type WatchedResource = xds.WatchedResource
 
-var istioVersionRegexp = regexp.MustCompile(`^([1-9]+)\.([0-9]+)(\.([0-9]+))?`)
-
 // GetView returns a restricted view of the mesh for this proxy. The view can be
 // restricted by network (via ISTIO_META_REQUESTED_NETWORK_VIEW).
 // If not set, we assume that the proxy wants to see endpoints in any network.
@@ -427,6 +431,33 @@ func (node *Proxy) IsAmbient() bool {
 	return node.IsWaypointProxy() || node.IsZTunnel()
 }
 
+var NodeTypes = [...]NodeType{SidecarProxy, Router, Waypoint, Ztunnel}
+
+// SetSidecarScope identifies the sidecar scope object associated with this
+// proxy and updates the proxy Node. This is a convenience hack so that
+// callers can simply call push.Services(node) while the implementation of
+// push.Services can return the set of services from the proxyNode's
+// sidecar scope or from the push context's set of global services. Similar
+// logic applies to push.VirtualServices and push.DestinationRule. The
+// short cut here is useful only for CDS and parts of RDS generation code.
+//
+// Listener generation code will still use the SidecarScope object directly
+// as it needs the set of services for each listener port.
+func (node *Proxy) SetSidecarScope(ps *PushContext) {
+	sidecarScope := node.SidecarScope
+
+	switch node.Type {
+	case SidecarProxy:
+		node.SidecarScope = ps.getSidecarScope(node, node.Labels)
+	case Router, Waypoint:
+		// Gateways should just have a default scope with egress: */*
+		node.SidecarScope = ps.getSidecarScope(node, nil)
+	}
+	node.PrevSidecarScope = sidecarScope
+}
+
+var istioVersionRegexp = regexp.MustCompile(`^([1-9]+)\.([0-9]+)(\.([0-9]+))?`)
+
 // IstioVersion encodes the Istio version of the proxy. This is a low key way to
 // do semver style comparisons and generate the appropriate envoy config
 type IstioVersion struct {
@@ -436,6 +467,32 @@ type IstioVersion struct {
 }
 
 var MaxIstioVersion = &IstioVersion{Major: 65535, Minor: 65535, Patch: 65535}
+
+// ParseIstioVersion parses a version string and returns IstioVersion struct
+func ParseIstioVersion(ver string) *IstioVersion {
+	// strip the release- prefix if any and extract the version string
+	ver = istioVersionRegexp.FindString(strings.TrimPrefix(ver, "release-"))
+
+	if ver == "" {
+		// return very large values assuming latest version
+		return MaxIstioVersion
+	}
+
+	parts := strings.Split(ver, ".")
+	// we are guaranteed to have at least major and minor based on the regex
+	major, _ := strconv.Atoi(parts[0])
+	minor, _ := strconv.Atoi(parts[1])
+	// Assume very large patch release if not set
+	patch := 65535
+	if len(parts) > 2 {
+		patch, _ = strconv.Atoi(parts[2])
+	}
+	return &IstioVersion{Major: major, Minor: minor, Patch: patch}
+}
+
+func (pversion *IstioVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", pversion.Major, pversion.Minor, pversion.Patch)
+}
 
 // Compare returns -1/0/1 if version is less than, equal or greater than inv
 // To compare only on major, call this function with { X, -1, -1}.
@@ -472,32 +529,7 @@ func compareVersion(ov, nv int) int {
 	return 1
 }
 
-var NodeTypes = [...]NodeType{SidecarProxy, Router, Waypoint, Ztunnel}
-
-// SetSidecarScope identifies the sidecar scope object associated with this
-// proxy and updates the proxy Node. This is a convenience hack so that
-// callers can simply call push.Services(node) while the implementation of
-// push.Services can return the set of services from the proxyNode's
-// sidecar scope or from the push context's set of global services. Similar
-// logic applies to push.VirtualServices and push.DestinationRule. The
-// short cut here is useful only for CDS and parts of RDS generation code.
-//
-// Listener generation code will still use the SidecarScope object directly
-// as it needs the set of services for each listener port.
-func (node *Proxy) SetSidecarScope(ps *PushContext) {
-	sidecarScope := node.SidecarScope
-
-	switch node.Type {
-	case SidecarProxy:
-		node.SidecarScope = ps.getSidecarScope(node, node.Labels)
-	case Router, Waypoint:
-		// Gateways should just have a default scope with egress: */*
-		node.SidecarScope = ps.getSidecarScope(node, nil)
-	}
-	node.PrevSidecarScope = sidecarScope
-}
-
-func (node *Proxy) VersionGreaterAndEqual(inv *IstioVersion) bool {
+func (node *Proxy) VersionGreaterOrEqual(inv *IstioVersion) bool {
 	if inv == nil {
 		return true
 	}
@@ -522,6 +554,17 @@ func (node *Proxy) SetGatewaysForProxy(ps *PushContext) {
 		ContainsAutoPassthroughGateways: prevMergedGateway.ContainsAutoPassthroughGateways,
 		AutoPassthroughSNIHosts:         prevMergedGateway.GetAutoPassthroughGatewaySNIHosts(),
 	}
+}
+
+func (node *Proxy) ShouldUpdateServiceTargets(updates sets.Set[ConfigKey]) bool {
+	// we only care for services which can actually select this proxy
+	for config := range updates {
+		if config.Kind == kind.ServiceEntry || config.Namespace == node.Metadata.Namespace {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (node *Proxy) SetServiceTargets(serviceDiscovery ServiceDiscovery) {
@@ -598,6 +641,12 @@ func (node *Proxy) GetIPMode() IPMode {
 	return node.ipMode
 }
 
+// SetIPMode set node's ip mode
+// Note: Donot use this function directly in most cases, use DiscoverIPMode instead.
+func (node *Proxy) SetIPMode(mode IPMode) {
+	node.ipMode = mode
+}
+
 // ParseMetadata parses the opaque Metadata from an Envoy Node into string key-value pairs.
 // Any non-string values are ignored.
 func ParseMetadata(metadata *structpb.Struct) (*NodeMetadata, error) {
@@ -668,28 +717,6 @@ func ParseServiceNodeWithMetadata(nodeID string, metadata *NodeMetadata) (*Proxy
 	return out, nil
 }
 
-// ParseIstioVersion parses a version string and returns IstioVersion struct
-func ParseIstioVersion(ver string) *IstioVersion {
-	// strip the release- prefix if any and extract the version string
-	ver = istioVersionRegexp.FindString(strings.TrimPrefix(ver, "release-"))
-
-	if ver == "" {
-		// return very large values assuming latest version
-		return MaxIstioVersion
-	}
-
-	parts := strings.Split(ver, ".")
-	// we are guaranteed to have at least major and minor based on the regex
-	major, _ := strconv.Atoi(parts[0])
-	minor, _ := strconv.Atoi(parts[1])
-	// Assume very large patch release if not set
-	patch := 65535
-	if len(parts) > 2 {
-		patch, _ = strconv.Atoi(parts[2])
-	}
-	return &IstioVersion{Major: major, Minor: minor, Patch: patch}
-}
-
 // GetOrDefault returns either the value, or the default if the value is empty. Useful when retrieving node metadata fields.
 func GetOrDefault(s string, def string) string {
 	return pm.GetOrDefault(s, def)
@@ -721,23 +748,6 @@ func GetProxyConfigNamespace(proxy *Proxy) string {
 const (
 	serviceNodeSeparator = "~"
 )
-
-// ParsePort extracts port number from a valid proxy address
-func ParsePort(addr string) int {
-	_, sPort, err := net.SplitHostPort(addr)
-	if sPort == "" {
-		return 0
-	}
-	if err != nil {
-		log.Warn(err)
-	}
-	port, pErr := strconv.Atoi(sPort)
-	if pErr != nil {
-		log.Warn(pErr)
-	}
-
-	return port
-}
 
 // hasValidIPAddresses returns true if the input ips are all valid, otherwise returns false.
 func hasValidIPAddresses(ipAddresses []string) bool {
@@ -923,11 +933,22 @@ func (node *Proxy) WorkloadEntry() (string, bool) {
 	return node.workloadEntryName, node.workloadEntryAutoCreated
 }
 
-// CloneWatchedResources clones the watched resources, both the keys and values are shallow copy.
-func (node *Proxy) CloneWatchedResources() map[string]*WatchedResource {
+// ShallowCloneWatchedResources clones the watched resources, both the keys and values are shallow copy.
+func (node *Proxy) ShallowCloneWatchedResources() map[string]*WatchedResource {
 	node.RLock()
 	defer node.RUnlock()
 	return maps.Clone(node.WatchedResources)
+}
+
+// DeepCloneWatchedResources clones the watched resources
+func (node *Proxy) DeepCloneWatchedResources() map[string]WatchedResource {
+	node.RLock()
+	defer node.RUnlock()
+	m := make(map[string]WatchedResource, len(node.WatchedResources))
+	for k, v := range node.WatchedResources {
+		m[k] = *v
+	}
+	return m
 }
 
 func (node *Proxy) GetWatchedResourceTypes() sets.String {
@@ -975,7 +996,7 @@ func (node *Proxy) Clusters() []string {
 	defer node.RUnlock()
 	wr := node.WatchedResources[v3.EndpointType]
 	if wr != nil {
-		return wr.ResourceNames
+		return wr.ResourceNames.UnsortedList()
 	}
 	return nil
 }
@@ -984,7 +1005,7 @@ func (node *Proxy) NewWatchedResource(typeURL string, names []string) {
 	node.Lock()
 	defer node.Unlock()
 
-	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: names}
+	node.WatchedResources[typeURL] = &WatchedResource{TypeUrl: typeURL, ResourceNames: sets.New(names...)}
 	// For all EDS requests that we have already responded with in the same stream let us
 	// force the response. It is important to respond to those requests for Envoy to finish
 	// warming of those resources(Clusters).
@@ -1041,22 +1062,15 @@ func (node *Proxy) DeleteWatchedResource(typeURL string) {
 	delete(node.WatchedResources, typeURL)
 }
 
-// SupportsEnvoyExtendedJwt indicates that the proxy JWT extension is capable of
-// replacing istio_authn filter.
-func (node *Proxy) SupportsEnvoyExtendedJwt() bool {
-	return node.IstioVersion == nil ||
-		node.IstioVersion.Compare(&IstioVersion{Major: 1, Minor: 21, Patch: -1}) >= 0
-}
-
 type GatewayController interface {
 	ConfigStoreController
 	// Reconcile updates the internal state of the gateway controller for a given input. This should be
 	// called before any List/Get calls if the state has changed
-	Reconcile(ctx *PushContext) error
+	Reconcile(ctx *PushContext)
 	// SecretAllowed determines if a SDS credential is accessible to a given namespace.
 	// For example, for resourceName of `kubernetes-gateway://ns-name/secret-name` and namespace of `ingress-ns`,
 	// this would return true only if there was a policy allowing `ingress-ns` to access Secrets in the `ns-name` namespace.
-	SecretAllowed(resourceName string, namespace string) bool
+	SecretAllowed(ourKind config.GroupVersionKind, resourceName string, namespace string) bool
 }
 
 // OutboundListenerClass is a helper to turn a NodeType for outbound to a ListenerClass.

@@ -28,7 +28,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/proto"
 
 	mesh "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/cmd/pilot-agent/config"
@@ -46,16 +45,12 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/model"
 	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/wasm"
 	"istio.io/istio/security/pkg/nodeagent/cache"
 )
 
 const (
-	// Location of K8S CA root.
-	k8sCAPath = "./var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-	// Location of K8s CA root mounted by istio. This is to avoid issues when service account automount is disabled.
-	k8sCAIstioMountedPath = "./var/run/secrets/istio/kubernetes/ca.crt"
-
 	// CitadelCACertPath is the directory for Citadel CA certificate.
 	// This is mounted from config map 'istio-ca-root-cert'. Part of startup,
 	// this may be replaced with ./etc/certs, if a root-cert.pem is found, to
@@ -158,13 +153,10 @@ type Agent struct {
 // Eventually most non-test settings should graduate to ProxyConfig
 // Please don't add 100 parameters to the NewAgent function (or any other)!
 type AgentOptions struct {
-	// ProxyXDSDebugViaAgent if true will listen on 15004 and forward queries
-	// to XDS istio.io/debug.
-	ProxyXDSDebugViaAgent bool
-	// Port value for the debugging endpoint.
-	ProxyXDSDebugViaAgentPort int
 	// DNSCapture indicates if the XDS proxy has dns capture enabled or not
 	DNSCapture bool
+	// Enables DNS server at Gateways.
+	DNSAtGateway bool
 	// DNSAddr is the DNS capture address
 	DNSAddr string
 	// DNSForwardParallel indicates whether the agent should send parallel DNS queries to all upstream nameservers.
@@ -229,7 +221,7 @@ type AgentOptions struct {
 	WASMOptions wasm.Options
 
 	// Enable metadata discovery bootstrap extension
-	MetadataDiscovery bool
+	MetadataDiscovery *bool
 
 	SDSFactory func(options *security.Options, workloadSecretCache security.SecretManager, pkpConf *mesh.PrivateKeyProvider) SDSService
 
@@ -238,6 +230,8 @@ type AgentOptions struct {
 	// by Istio's default SDS server, the socket file must be present.
 	// Note that the path is not configurable by design - only the socket file name.
 	WorkloadIdentitySocketFile string
+
+	EnvoySkipDeprecatedLogs bool
 }
 
 // NewAgent hosts the functionality for local SDS and XDS. This consists of the local SDS server and
@@ -287,12 +281,15 @@ func (a *Agent) generateNodeMetadata() (*model.Node, error) {
 		ProxyConfig:                 a.proxyConfig,
 		PilotSubjectAltName:         pilotSAN,
 		CredentialSocketExists:      credentialSocketExists,
+		CustomCredentialsFileExists: a.secOpts.ServeOnlyFiles,
 		OutlierLogPath:              a.envoyOpts.OutlierLogPath,
 		EnvoyPrometheusPort:         a.cfg.EnvoyPrometheusPort,
 		EnvoyStatusPort:             a.cfg.EnvoyStatusPort,
 		ExitOnZeroActiveConnections: a.cfg.ExitOnZeroActiveConnections,
 		XDSRootCert:                 a.cfg.XDSRootCerts,
 		MetadataDiscovery:           a.cfg.MetadataDiscovery,
+		EnvoySkipDeprecatedLogs:     a.cfg.EnvoySkipDeprecatedLogs,
+		WorkloadIdentitySocketFile:  a.cfg.WorkloadIdentitySocketFile,
 	})
 }
 
@@ -329,6 +326,7 @@ func (a *Agent) initializeEnvoyAgent(_ context.Context) error {
 	a.envoyOpts.AdminPort = a.proxyConfig.ProxyAdminPort
 	a.envoyOpts.DrainDuration = a.proxyConfig.DrainDuration
 	a.envoyOpts.Concurrency = a.proxyConfig.Concurrency.GetValue()
+	a.envoyOpts.SkipDeprecatedLogs = a.cfg.EnvoySkipDeprecatedLogs
 
 	// Checking only uid should be sufficient - but tests also run as root and
 	// will break due to permission errors if we start envoy as 1337.
@@ -348,6 +346,10 @@ func (a *Agent) initializeEnvoyAgent(_ context.Context) error {
 	return nil
 }
 
+func (a *Agent) SkipDrain() {
+	a.envoyAgent.DisableDraining()
+}
+
 // Run is a non-blocking call which returns either an error or a function to await for completion.
 func (a *Agent) Run(ctx context.Context) (func(), error) {
 	var err error
@@ -357,9 +359,10 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 
 	// There are a couple of things we have to do here
 	//
-	// 1. Use a custom SDS workload socket if one is found+healthy at the configured path
-	// 3. Error out if a custom SDS socket path is configured but no socket is found there.
-	// 4. Do NOT error out, but just start and use the default Istio SDS server, if no socket
+	// 1. Use a custom SDS workload socket if one is found+healthy at the configured path.
+	//      If we do find one, we will still bind a local SDS server, but it will be used only to serve file certificates.
+	// 2. Error out if a custom SDS socket path is configured but no socket is found there.
+	// 3. Do NOT error out, but just start and use the default Istio SDS server, if no socket
 	// is found AND no custom SDS socket path is configured.
 	//
 	//
@@ -384,29 +387,22 @@ func (a *Agent) Run(ctx context.Context) (func(), error) {
 		return nil, fmt.Errorf("failed to check SDS socket: %v", err)
 	}
 	if socketExists {
-		log.Infof("Existing workload SDS socket found at %s. Default Istio SDS Server won't be started", configuredAgentSocketPath)
-	} else {
+		log.Infof("Existing workload SDS socket found at %s. Default Istio SDS Server will only serve files", configuredAgentSocketPath)
+		a.secOpts.ServeOnlyFiles = true
+	} else if !isIstioSDS {
 		// If we are configured to use something other than the default Istio SDS server and we can't find a socket at that path, error out.
-		if !isIstioSDS {
-			return nil, fmt.Errorf("agent configured for non-default SDS socket path: %s but no socket found", configuredAgentSocketPath)
-		}
+		return nil, fmt.Errorf("agent configured for non-default SDS socket path: %s but no socket found", configuredAgentSocketPath)
+	}
 
-		// otherwise we are not configured to listen to something else, so just start the Istio SDS server and use it.
-		log.Info("Starting default Istio SDS Server")
-		err = a.initSdsServer()
-		if err != nil {
-			return nil, fmt.Errorf("failed to start default Istio SDS server: %v", err)
-		}
+	// otherwise we are not configured to listen to something else, so just start the Istio SDS server and use it.
+	log.Info("Starting default Istio SDS Server")
+	err = a.initSdsServer()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start default Istio SDS server: %v", err)
 	}
 	a.xdsProxy, err = initXdsProxy(a)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start xds proxy: %v", err)
-	}
-	if a.cfg.ProxyXDSDebugViaAgent {
-		err = a.xdsProxy.initDebugInterface(a.cfg.ProxyXDSDebugViaAgentPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start istio tap server: %v", err)
-		}
 	}
 
 	if a.cfg.GRPCBootstrapPath != "" {
@@ -459,7 +455,10 @@ func (a *Agent) initSdsServer() error {
 		a.secOpts.FileMountedCerts = true
 	}
 
-	a.secretCache, err = a.newSecretManager()
+	// If proxy is using file mounted certs, we do not have to connect to CA.
+	// It can also be explicitly disabled, used when we have an external SDS server for mTLS certs, but still need the file manager.
+	createCaClient := !a.secOpts.FileMountedCerts && !a.secOpts.ServeOnlyFiles
+	a.secretCache, err = a.newSecretManager(createCaClient)
 	if err != nil {
 		return fmt.Errorf("failed to start workload secret manager %v", err)
 	}
@@ -541,8 +540,7 @@ func (a *Agent) startFileWatcher(ctx context.Context, filePath string, handler f
 }
 
 func (a *Agent) initLocalDNSServer() (err error) {
-	// we don't need dns server on gateways
-	if a.cfg.DNSCapture && a.cfg.ProxyType == model.SidecarProxy {
+	if a.isDNSServerEnabled() {
 		if a.localDNSServer, err = dnsClient.NewLocalDNSServer(a.cfg.ProxyNamespace, a.cfg.ProxyDomain, a.cfg.DNSAddr,
 			a.cfg.DNSForwardParallel); err != nil {
 			return err
@@ -581,8 +579,7 @@ func (a *Agent) generateGRPCBootstrap() error {
 
 // Check is used in to readiness check of agent to ensure DNSServer is ready.
 func (a *Agent) Check() (err error) {
-	// we dont need dns server on gateways
-	if a.cfg.DNSCapture && a.cfg.ProxyType == model.SidecarProxy {
+	if a.isDNSServerEnabled() {
 		if !a.localDNSServer.IsReady() {
 			return errors.New("istio DNS capture is turned ON and DNS lookup table is not ready yet")
 		}
@@ -590,11 +587,18 @@ func (a *Agent) Check() (err error) {
 	return nil
 }
 
+func (a *Agent) isDNSServerEnabled() bool {
+	// Enable DNS capture if the proxy is a sidecar and the feature is enabled.
+	// At Gateways, we generally do not need DNS capture. But in some cases, we may want to use DNS proxy
+	// if we want Envoy to resolve multi-cluster DNS queries.
+	return (a.cfg.DNSCapture && a.cfg.ProxyType == model.SidecarProxy) || a.cfg.DNSAtGateway
+}
+
 // GetDNSTable builds DNS table used in debugging interface.
 func (a *Agent) GetDNSTable() *dnsProto.NameTable {
 	if a.localDNSServer != nil && a.localDNSServer.NameTable() != nil {
 		nt := a.localDNSServer.NameTable()
-		nt = proto.Clone(nt).(*dnsProto.NameTable)
+		nt = protomarshal.Clone(nt)
 		a.localDNSServer.BuildAlternateHosts(nt, func(althosts map[string]struct{}, ipv4 []netip.Addr, ipv6 []netip.Addr, _ []string) {
 			for host := range althosts {
 				if _, exists := nt.Table[host]; !exists {
@@ -653,13 +657,6 @@ func (a *Agent) FindRootCAForXDS() (string, error) {
 		// not connecting to CA_ADDR because this mode uses external
 		// agent (Secret refresh, etc)
 		return security.DefaultRootCertFilePath, nil
-	} else if a.secOpts.PilotCertProvider == constants.CertProviderKubernetes {
-		// Using K8S - this is likely incorrect, may work by accident (https://github.com/istio/istio/issues/22161)
-		if fileExists(k8sCAIstioMountedPath) {
-			rootCAPath = k8sCAIstioMountedPath
-		} else {
-			rootCAPath = k8sCAPath
-		}
 	} else if a.secOpts.ProvCert != "" {
 		// This was never completely correct - PROV_CERT are only intended for auth with CA_ADDR,
 		// and should not be involved in determining the root CA.
@@ -766,14 +763,6 @@ func (a *Agent) FindRootCAForCA() (string, error) {
 		return "", nil
 	} else if a.cfg.CARootCerts != "" {
 		rootCAPath = a.cfg.CARootCerts
-	} else if a.secOpts.PilotCertProvider == constants.CertProviderKubernetes {
-		// Using K8S - this is likely incorrect, may work by accident.
-		// API is GA.
-		if fileExists(k8sCAIstioMountedPath) {
-			rootCAPath = k8sCAIstioMountedPath
-		} else {
-			rootCAPath = k8sCAPath
-		}
 	} else if a.secOpts.PilotCertProvider == constants.CertProviderCustom {
 		rootCAPath = security.DefaultRootCertFilePath // ./etc/certs/root-cert.pem
 	} else if a.secOpts.ProvCert != "" {
@@ -814,9 +803,8 @@ func getKeyCertInner(certPath string) (string, string) {
 }
 
 // newSecretManager creates the SecretManager for workload secrets
-func (a *Agent) newSecretManager() (*cache.SecretManagerClient, error) {
-	// If proxy is using file mounted certs, we do not have to connect to CA.
-	if a.secOpts.FileMountedCerts {
+func (a *Agent) newSecretManager(createCaClient bool) (*cache.SecretManagerClient, error) {
+	if !createCaClient {
 		log.Info("Workload is using file mounted certificates. Skipping connecting to CA")
 		return cache.NewSecretManagerClient(nil, a.secOpts)
 	}

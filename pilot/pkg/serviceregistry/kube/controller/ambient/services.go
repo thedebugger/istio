@@ -16,40 +16,149 @@
 package ambient
 
 import (
+	"fmt"
+	"net/netip"
+	"strings"
+
 	v1 "k8s.io/api/core/v1"
 
 	"istio.io/api/networking/v1alpha3"
-	networkingclient "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networkingclient "istio.io/client-go/pkg/apis/networking/v1"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/serviceentry"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
-	"istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
+	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient/multicluster"
+	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
-	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/config/schema/kubetypes"
+	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/network"
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/workloadapi"
 )
 
 func (a *index) ServicesCollection(
+	clusterID cluster.ID,
 	services krt.Collection[*v1.Service],
 	serviceEntries krt.Collection[*networkingclient.ServiceEntry],
 	waypoints krt.Collection[Waypoint],
 	namespaces krt.Collection[*v1.Namespace],
+	opts krt.OptionsBuilder,
 ) krt.Collection[model.ServiceInfo] {
-	ServicesInfo := krt.NewCollection(services, a.serviceServiceBuilder(waypoints, namespaces), krt.WithName("ServicesInfo"))
-	ServiceEntriesInfo := krt.NewManyCollection(serviceEntries, a.serviceEntryServiceBuilder(waypoints, namespaces), krt.WithName("ServiceEntriesInfo"))
-	WorkloadServices := krt.JoinCollection([]krt.Collection[model.ServiceInfo]{ServicesInfo, ServiceEntriesInfo}, krt.WithName("WorkloadServices"))
+	ServicesInfo := krt.NewCollection(services, a.serviceServiceBuilder(waypoints, namespaces),
+		append(
+			opts.WithName("ServicesInfo"),
+			krt.WithMetadata(krt.Metadata{
+				multicluster.ClusterKRTMetadataKey: clusterID,
+			}),
+		)...)
+	ServiceEntriesInfo := krt.NewManyCollection(serviceEntries, a.serviceEntryServiceBuilder(waypoints, namespaces),
+		append(
+			opts.WithName("ServiceEntriesInfo"),
+			krt.WithMetadata(krt.Metadata{
+				multicluster.ClusterKRTMetadataKey: clusterID,
+			}),
+		)...)
+	WorkloadServices := krt.JoinCollection(
+		[]krt.Collection[model.ServiceInfo]{ServicesInfo, ServiceEntriesInfo},
+		append(opts.WithName("WorkloadService"), krt.WithMetadata(
+			krt.Metadata{
+				multicluster.ClusterKRTMetadataKey: clusterID,
+			},
+		))...)
 	return WorkloadServices
 }
 
-func (a *index) serviceServiceBuilder(
+func GlobalMergedWorkloadServicesCollection(
+	localCluster *multicluster.Cluster,
+	localServiceInfos krt.Collection[model.ServiceInfo],
+	localWaypoints krt.Collection[Waypoint],
+	clusters krt.Collection[*multicluster.Cluster],
+	localServiceEntries krt.Collection[*networkingclient.ServiceEntry],
+	globalServices krt.Collection[krt.Collection[*v1.Service]],
+	servicesByCluster krt.Index[cluster.ID, krt.Collection[*v1.Service]],
+	globalWaypoints krt.Collection[krt.Collection[Waypoint]],
+	waypointsByCluster krt.Index[cluster.ID, krt.Collection[Waypoint]],
+	globalNamespaces krt.Collection[krt.Collection[*v1.Namespace]],
+	namespacesByCluster krt.Index[cluster.ID, krt.Collection[*v1.Namespace]],
+	globalNetworks networkCollections,
+	domainSuffix string,
+	opts krt.OptionsBuilder,
+) krt.Collection[krt.Collection[config.ObjectWithCluster[model.ServiceInfo]]] {
+	// This will contain the serviceinfos derived from Services AND ServiceEntries
+	LocalServiceInfosWithCluster := krt.MapCollection(
+		localServiceInfos,
+		wrapObjectWithCluster[model.ServiceInfo](localCluster.ID),
+		opts.WithName("LocalServiceInfosWithCluster")...)
+
+	// This will contain the serviceinfos derived from ServiceEntries only
+	return nestedCollectionFromLocalAndRemote(
+		LocalServiceInfosWithCluster,
+		clusters,
+		func(ctx krt.HandlerContext, cluster *multicluster.Cluster) *krt.Collection[config.ObjectWithCluster[model.ServiceInfo]] {
+			services := cluster.Services()
+			waypointsPtr := krt.FetchOne(ctx, globalWaypoints, krt.FilterIndex(waypointsByCluster, cluster.ID))
+			if waypointsPtr == nil {
+				log.Warnf("Cluster %s does not have waypoints assigned, skipping", cluster.ID)
+				return nil
+			}
+			waypoints := *waypointsPtr
+			namespaces := cluster.Namespaces()
+			// We can't have duplicate collections (otherwise FetchOne will panic) so use
+			// sync.Once to ensure we only create the collection once and return that same value
+			servicesInfo := krt.NewCollection(services, serviceServiceBuilder(waypoints, namespaces, domainSuffix, func(ctx krt.HandlerContext) network.ID {
+				nwPtr := krt.FetchOne(ctx, globalNetworks.RemoteSystemNamespaceNetworks, krt.FilterIndex(globalNetworks.SystemNamespaceNetworkByCluster, cluster.ID))
+				if nwPtr == nil {
+					log.Warnf("Cluster %s does not have network assigned yet, skipping", cluster.ID)
+					ctx.DiscardResult()
+					return ""
+				}
+				nw := *nwPtr
+				return network.ID(ptr.OrEmpty(nw.Get()))
+			}), opts.With(
+				append(
+					opts.WithName(fmt.Sprintf("ServiceServiceInfos[%s]", cluster.ID)),
+					krt.WithMetadata(krt.Metadata{
+						multicluster.ClusterKRTMetadataKey: cluster.ID,
+					}),
+				)...,
+			)...)
+
+			servicesInfoWithCluster := krt.MapCollection(
+				servicesInfo,
+				func(o model.ServiceInfo) config.ObjectWithCluster[model.ServiceInfo] {
+					return config.ObjectWithCluster[model.ServiceInfo]{ClusterID: cluster.ID, Object: &o}
+				},
+				opts.WithName(fmt.Sprintf("ServiceServiceInfosWithCluster[%s]", cluster.ID))...,
+			)
+			return ptr.Of(servicesInfoWithCluster)
+		},
+		"ServiceInfosWithCluster",
+		opts,
+	)
+}
+
+func serviceServiceBuilder(
 	waypoints krt.Collection[Waypoint],
 	namespaces krt.Collection[*v1.Namespace],
+	domainSuffix string,
+	networkGetter func(ctx krt.HandlerContext) network.ID,
 ) krt.TransformationSingle[*v1.Service, model.ServiceInfo] {
 	return func(ctx krt.HandlerContext, s *v1.Service) *model.ServiceInfo {
+		if s.Spec.Type == v1.ServiceTypeExternalName {
+			// ExternalName services are not implemented by ambient (but will still work).
+			// The DNS requests will forward to the upstream DNS server, then Ztunnel can handle the request based on the target
+			// hostname.
+			// In theory we could add support for native 'DNS alias' into Ztunnel's DNS proxy. This would give the same behavior
+			// but let the DNS proxy handle it instead of forwarding upstream. However, at this time we do not do so.
+			return nil
+		}
 		portNames := map[int32]model.ServicePortName{}
 		for _, p := range s.Spec.Ports {
 			portNames[p.Port] = model.ServicePortName{
@@ -57,19 +166,44 @@ func (a *index) serviceServiceBuilder(
 				TargetPortName: p.TargetPort.StrVal,
 			}
 		}
-		waypointKey := ""
-		waypoint := fetchWaypointForService(ctx, waypoints, namespaces, s.ObjectMeta)
+		waypointStatus := model.WaypointBindingStatus{}
+		waypoint, wperr := fetchWaypointForService(ctx, waypoints, namespaces, s.ObjectMeta)
 		if waypoint != nil {
-			waypointKey = waypoint.ResourceName()
+			waypointStatus.ResourceName = waypoint.ResourceName()
+
+			// TODO: add this label to the istio api labels so we have constants to use
+			if val, ok := s.Labels["istio.io/ingress-use-waypoint"]; ok {
+				waypointStatus.IngressLabelPresent = true
+				waypointStatus.IngressUseWaypoint = strings.EqualFold(val, "true")
+			}
 		}
-		a.networkUpdateTrigger.MarkDependant(ctx) // Mark we depend on out of band a.Network
-		return &model.ServiceInfo{
-			Service:       a.constructService(s, waypoint),
+		waypointStatus.Error = wperr
+
+		svc := constructService(ctx, s, waypoint, domainSuffix, networkGetter)
+		return precomputeServicePtr(&model.ServiceInfo{
+			Service:       svc,
 			PortNames:     portNames,
 			LabelSelector: model.NewSelector(s.Spec.Selector),
-			Source:        kind.Service,
-			Waypoint:      waypointKey,
-		}
+			Source:        MakeSource(s),
+			Waypoint:      waypointStatus,
+		})
+	}
+}
+
+func (a *index) serviceServiceBuilder(
+	waypoints krt.Collection[Waypoint],
+	namespaces krt.Collection[*v1.Namespace],
+) krt.TransformationSingle[*v1.Service, model.ServiceInfo] {
+	return serviceServiceBuilder(waypoints, namespaces, a.DomainSuffix, func(ctx krt.HandlerContext) network.ID {
+		return a.Network(ctx)
+	})
+}
+
+// MakeSource is a helper to turn an Object into a model.TypedObject.
+func MakeSource(o controllers.Object) model.TypedObject {
+	return model.TypedObject{
+		NamespacedName: config.NamespacedName(o),
+		Kind:           gvk.MustToKind(kubetypes.GvkFromObject(o)),
 	}
 }
 
@@ -78,13 +212,20 @@ func (a *index) serviceEntryServiceBuilder(
 	namespaces krt.Collection[*v1.Namespace],
 ) krt.TransformationMulti[*networkingclient.ServiceEntry, model.ServiceInfo] {
 	return func(ctx krt.HandlerContext, s *networkingclient.ServiceEntry) []model.ServiceInfo {
-		waypoint := fetchWaypointForService(ctx, waypoints, namespaces, s.ObjectMeta)
-		a.networkUpdateTrigger.MarkDependant(ctx) // Mark we depend on out of band a.Network
-		return a.serviceEntriesInfo(s, waypoint)
+		waypoint, waypointError := fetchWaypointForService(ctx, waypoints, namespaces, s.ObjectMeta)
+		return serviceEntriesInfo(ctx, s, waypoint, waypointError, func(ctx krt.HandlerContext) network.ID {
+			return a.Network(ctx)
+		})
 	}
 }
 
-func (a *index) serviceEntriesInfo(s *networkingclient.ServiceEntry, w *Waypoint) []model.ServiceInfo {
+func serviceEntriesInfo(
+	ctx krt.HandlerContext,
+	s *networkingclient.ServiceEntry,
+	w *Waypoint,
+	wperr *model.StatusMessage,
+	networkGetter func(ctx krt.HandlerContext) network.ID,
+) []model.ServiceInfo {
 	sel := model.NewSelector(s.Spec.GetWorkloadSelector().GetLabels())
 	portNames := map[int32]model.ServicePortName{}
 	for _, p := range s.Spec.Ports {
@@ -92,33 +233,45 @@ func (a *index) serviceEntriesInfo(s *networkingclient.ServiceEntry, w *Waypoint
 			PortName: p.Name,
 		}
 	}
-	waypointKey := ""
+	waypoint := model.WaypointBindingStatus{}
 	if w != nil {
-		waypointKey = w.ResourceName()
+		waypoint.ResourceName = w.ResourceName()
+		if val, ok := s.Labels["istio.io/ingress-use-waypoint"]; ok {
+			waypoint.IngressLabelPresent = true
+			waypoint.IngressUseWaypoint = strings.EqualFold(val, "true")
+		}
 	}
-	return slices.Map(a.constructServiceEntries(s, w), func(e *workloadapi.Service) model.ServiceInfo {
-		return model.ServiceInfo{
+	if wperr != nil {
+		waypoint.Error = wperr
+	}
+	return slices.Map(constructServiceEntries(ctx, s, w, networkGetter), func(e *workloadapi.Service) model.ServiceInfo {
+		return precomputeService(model.ServiceInfo{
 			Service:       e,
 			PortNames:     portNames,
 			LabelSelector: sel,
-			Source:        kind.ServiceEntry,
-			Waypoint:      waypointKey,
-		}
+			Source:        MakeSource(s),
+			Waypoint:      waypoint,
+		})
 	})
 }
 
-func (a *index) constructServiceEntries(svc *networkingclient.ServiceEntry, w *Waypoint) []*workloadapi.Service {
-	var autoassignedAddresses []*workloadapi.NetworkAddress
-	addresses, err := slices.MapErr(svc.Spec.Addresses, a.toNetworkAddressFromCidr)
+func constructServiceEntries(
+	ctx krt.HandlerContext,
+	svc *networkingclient.ServiceEntry,
+	w *Waypoint,
+	networkGetter func(ctx krt.HandlerContext) network.ID,
+) []*workloadapi.Service {
+	var autoassignedHostAddresses map[string][]netip.Addr
+	addresses, err := slices.MapErr(svc.Spec.Addresses, func(e string) (*workloadapi.NetworkAddress, error) {
+		return toNetworkAddressFromCidr(e, networkGetter(ctx))
+	})
 	if err != nil {
 		// TODO: perhaps we should support CIDR in the future?
 		return nil
 	}
 	// if this se has autoallocation we can se autoallocated IP, otherwise it will remain an empty slice
 	if serviceentry.ShouldV2AutoAllocateIP(svc) {
-		for _, ipaddr := range serviceentry.GetV2AddressesFromServiceEntry(svc) {
-			autoassignedAddresses = append(autoassignedAddresses, a.toNetworkAddressFromIP(ipaddr))
-		}
+		autoassignedHostAddresses = serviceentry.GetHostAddressesFromServiceEntry(svc)
 	}
 	ports := make([]*workloadapi.Port, 0, len(svc.Spec.Ports))
 	for _, p := range svc.Spec.Ports {
@@ -132,35 +285,50 @@ func (a *index) constructServiceEntries(svc *networkingclient.ServiceEntry, w *W
 		})
 	}
 
-	// handle svc waypoint scenario
-	var waypointAddress *workloadapi.GatewayAddress
-	if w != nil {
-		waypointAddress = a.getWaypointAddress(w)
+	var lb *workloadapi.LoadBalancing
+
+	trafficDistribution := model.GetTrafficDistribution(nil, svc.Annotations)
+	switch trafficDistribution {
+	case model.TrafficDistributionPreferSameZone:
+		lb = preferSameZoneLoadBalancer
+	case model.TrafficDistributionPreferSameNode:
+		lb = preferSameNodeLoadBalancer
 	}
 
 	// TODO this is only checking one controller - we may be missing service vips for instances in another cluster
 	res := make([]*workloadapi.Service, 0, len(svc.Spec.Hosts))
 	for _, h := range svc.Spec.Hosts {
-		// if we have no user-provided addresses and h is not wildcarded and we have a supported resolution
-		// we can try to use autoassigned addresses
-		a := addresses
-		if len(a) == 0 && !host.Name(h).IsWildCarded() && svc.Spec.Resolution != v1alpha3.ServiceEntry_NONE {
-			a = autoassignedAddresses
+		// if we have no user-provided hostsAddresses and h is not wildcarded and we have hostsAddresses supported resolution
+		// we can try to use autoassigned hostsAddresses
+		hostsAddresses := addresses
+		if len(hostsAddresses) == 0 && !host.Name(h).IsWildCarded() && svc.Spec.Resolution != v1alpha3.ServiceEntry_NONE {
+			if hostsAddrs, ok := autoassignedHostAddresses[h]; ok {
+				hostsAddresses = slices.Map(hostsAddrs, func(e netip.Addr) *workloadapi.NetworkAddress {
+					return toNetworkAddressFromIP(e, networkGetter(ctx))
+				})
+			}
 		}
 		res = append(res, &workloadapi.Service{
 			Name:            svc.Name,
 			Namespace:       svc.Namespace,
 			Hostname:        h,
-			Addresses:       a,
+			Addresses:       hostsAddresses,
 			Ports:           ports,
-			Waypoint:        waypointAddress,
+			Waypoint:        w.GetAddress(),
 			SubjectAltNames: svc.Spec.SubjectAltNames,
+			LoadBalancing:   lb,
 		})
 	}
 	return res
 }
 
-func (a *index) constructService(svc *v1.Service, w *Waypoint) *workloadapi.Service {
+func constructService(
+	ctx krt.HandlerContext,
+	svc *v1.Service,
+	w *Waypoint,
+	domainSuffix string,
+	networkGetter func(krt.HandlerContext) network.ID,
+) *workloadapi.Service {
 	ports := make([]*workloadapi.Port, 0, len(svc.Spec.Ports))
 	for _, p := range svc.Spec.Ports {
 		ports = append(ports, &workloadapi.Port{
@@ -169,43 +337,17 @@ func (a *index) constructService(svc *v1.Service, w *Waypoint) *workloadapi.Serv
 		})
 	}
 
-	addresses, err := slices.MapErr(getVIPs(svc), a.toNetworkAddress)
+	addresses, err := slices.MapErr(getVIPs(svc), func(e string) (*workloadapi.NetworkAddress, error) {
+		return toNetworkAddress(ctx, e, networkGetter)
+	})
 	if err != nil {
 		log.Warnf("fail to parse service %v: %v", config.NamespacedName(svc), err)
 		return nil
 	}
-	// handle svc waypoint scenario
-	var waypointAddress *workloadapi.GatewayAddress
-	if w != nil {
-		waypointAddress = a.getWaypointAddress(w)
-	}
 
 	var lb *workloadapi.LoadBalancing
-	if svc.Spec.TrafficDistribution != nil && *svc.Spec.TrafficDistribution == v1.ServiceTrafficDistributionPreferClose {
-		lb = &workloadapi.LoadBalancing{
-			// Prefer endpoints in close zones, but allow spilling over to further endpoints where required.
-			RoutingPreference: []workloadapi.LoadBalancing_Scope{
-				workloadapi.LoadBalancing_NETWORK,
-				workloadapi.LoadBalancing_REGION,
-				workloadapi.LoadBalancing_ZONE,
-				workloadapi.LoadBalancing_SUBZONE,
-			},
-			Mode: workloadapi.LoadBalancing_FAILOVER,
-		}
-	}
-	if svc.Labels[constants.ManagedGatewayLabel] == constants.ManagedGatewayMeshControllerLabel {
-		// This is waypoint. Enable locality routing
-		lb = &workloadapi.LoadBalancing{
-			// Prefer endpoints in close zones, but allow spilling over to further endpoints where required.
-			RoutingPreference: []workloadapi.LoadBalancing_Scope{
-				workloadapi.LoadBalancing_NETWORK,
-				workloadapi.LoadBalancing_REGION,
-				workloadapi.LoadBalancing_ZONE,
-				workloadapi.LoadBalancing_SUBZONE,
-			},
-			Mode: workloadapi.LoadBalancing_FAILOVER,
-		}
-	}
+
+	// First, use internal traffic policy if set.
 	if itp := svc.Spec.InternalTrafficPolicy; itp != nil && *itp == v1.ServiceInternalTrafficPolicyLocal {
 		lb = &workloadapi.LoadBalancing{
 			// Only allow endpoints on the same node.
@@ -214,7 +356,24 @@ func (a *index) constructService(svc *v1.Service, w *Waypoint) *workloadapi.Serv
 			},
 			Mode: workloadapi.LoadBalancing_STRICT,
 		}
+	} else {
+		// Check traffic distribution.
+		trafficDistribution := model.GetTrafficDistribution(svc.Spec.TrafficDistribution, svc.Annotations)
+		switch trafficDistribution {
+		case model.TrafficDistributionPreferSameZone:
+			lb = preferSameZoneLoadBalancer
+		case model.TrafficDistributionPreferSameNode:
+			lb = preferSameNodeLoadBalancer
+		}
 	}
+
+	if svc.Spec.PublishNotReadyAddresses {
+		if lb == nil {
+			lb = &workloadapi.LoadBalancing{}
+		}
+		lb.HealthPolicy = workloadapi.LoadBalancing_ALLOW_ALL
+	}
+
 	ipFamily := workloadapi.IPFamilies_AUTOMATIC
 	if len(svc.Spec.IPFamilies) == 2 {
 		ipFamily = workloadapi.IPFamilies_DUAL
@@ -226,17 +385,40 @@ func (a *index) constructService(svc *v1.Service, w *Waypoint) *workloadapi.Serv
 			ipFamily = workloadapi.IPFamilies_IPV6_ONLY
 		}
 	}
-	// TODO this is only checking one controller - we may be missing service vips for instances in another cluster
+	// This is only checking one cluster - we'll merge later in the nested join to make sure
+	// we get service VIPs from other clusters
 	return &workloadapi.Service{
 		Name:          svc.Name,
 		Namespace:     svc.Namespace,
-		Hostname:      string(kube.ServiceHostname(svc.Name, svc.Namespace, a.DomainSuffix)),
+		Hostname:      string(kube.ServiceHostname(svc.Name, svc.Namespace, domainSuffix)),
 		Addresses:     addresses,
 		Ports:         ports,
-		Waypoint:      waypointAddress,
+		Waypoint:      w.GetAddress(),
 		LoadBalancing: lb,
 		IpFamilies:    ipFamily,
 	}
+}
+
+var preferSameZoneLoadBalancer = &workloadapi.LoadBalancing{
+	// Prefer endpoints in close zones, but allow spilling over to further endpoints where required.
+	RoutingPreference: []workloadapi.LoadBalancing_Scope{
+		workloadapi.LoadBalancing_NETWORK,
+		workloadapi.LoadBalancing_REGION,
+		workloadapi.LoadBalancing_ZONE,
+	},
+	Mode: workloadapi.LoadBalancing_FAILOVER,
+}
+
+var preferSameNodeLoadBalancer = &workloadapi.LoadBalancing{
+	// Prefer endpoints in close zones, but allow spilling over to further endpoints where required.
+	RoutingPreference: []workloadapi.LoadBalancing_Scope{
+		workloadapi.LoadBalancing_NETWORK,
+		workloadapi.LoadBalancing_REGION,
+		workloadapi.LoadBalancing_ZONE,
+		workloadapi.LoadBalancing_SUBZONE,
+		workloadapi.LoadBalancing_NODE,
+	},
+	Mode: workloadapi.LoadBalancing_FAILOVER,
 }
 
 func getVIPs(svc *v1.Service) []string {
@@ -251,4 +433,18 @@ func getVIPs(svc *v1.Service) []string {
 		}
 	}
 	return res
+}
+
+func precomputeServicePtr(w *model.ServiceInfo) *model.ServiceInfo {
+	return ptr.Of(precomputeService(*w))
+}
+
+func precomputeService(w model.ServiceInfo) model.ServiceInfo {
+	addr := serviceToAddress(w.Service)
+	w.MarshaledAddress = protoconv.MessageToAny(addr)
+	w.AsAddress = model.AddressInfo{
+		Address:   addr,
+		Marshaled: w.MarshaledAddress,
+	}
+	return w
 }

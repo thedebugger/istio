@@ -21,27 +21,31 @@ import (
 	"net/netip"
 	"strings"
 
-	"gomodules.xyz/jsonpatch/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	klabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	apiv1alpha3 "istio.io/api/networking/v1alpha3"
-	networkingv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
-	autoallocate "istio.io/istio/pilot/pkg/serviceregistry/serviceentry"
+	networkingv1 "istio.io/client-go/pkg/apis/networking/v1"
+	autoallocate "istio.io/istio/pilot/pkg/networking/serviceentry"
 	"istio.io/istio/pkg/config"
+	cfghost "istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/schema/gvr"
 	kubelib "istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
+	"istio.io/istio/pkg/kube/kubetypes"
 	istiolog "istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
 )
 
 var log = istiolog.RegisterScope("ip-autoallocate", "IP autoallocate controller")
 
 type IPAllocator struct {
-	serviceEntryClient kclient.Client[*networkingv1alpha3.ServiceEntry]
-	index              kclient.Index[netip.Addr, *networkingv1alpha3.ServiceEntry]
+	serviceEntryClient kclient.Informer[*networkingv1.ServiceEntry]
+	serviceEntryWriter kclient.Writer[*networkingv1.ServiceEntry]
+	index              kclient.Index[netip.Addr, *networkingv1.ServiceEntry]
 	stopChan           <-chan struct{}
 	queue              controllers.Queue
 
@@ -97,9 +101,12 @@ const (
 )
 
 func NewIPAllocator(stop <-chan struct{}, c kubelib.Client) *IPAllocator {
-	client := kclient.New[*networkingv1alpha3.ServiceEntry](c)
-	index := kclient.CreateIndex[netip.Addr, *networkingv1alpha3.ServiceEntry](client, func(serviceentry *networkingv1alpha3.ServiceEntry) []netip.Addr {
-		addresses := autoallocate.GetV2AddressesFromServiceEntry(serviceentry)
+	client := kclient.NewDelayedInformer[*networkingv1.ServiceEntry](c, gvr.ServiceEntry, kubetypes.StandardInformer, kclient.Filter{
+		ObjectFilter: c.ObjectFilter(),
+	})
+	writer := kclient.NewWriteClient[*networkingv1.ServiceEntry](c)
+	index := kclient.CreateIndex[netip.Addr, *networkingv1.ServiceEntry](client, "address", func(serviceentry *networkingv1.ServiceEntry) []netip.Addr {
+		addresses := autoallocate.GetAddressesFromServiceEntry(serviceentry)
 		for _, addr := range serviceentry.Spec.Addresses {
 			a, err := netip.ParseAddr(addr)
 			if err != nil {
@@ -111,6 +118,7 @@ func NewIPAllocator(stop <-chan struct{}, c kubelib.Client) *IPAllocator {
 	})
 	allocator := &IPAllocator{
 		serviceEntryClient: client,
+		serviceEntryWriter: writer,
 		index:              index,
 		stopChan:           stop,
 		// MustParsePrefix is OK because these are const. If we allow user configuration we must not use this function.
@@ -143,7 +151,7 @@ func (c *IPAllocator) populateControllerDatastructures() {
 		count++
 		owner := config.NamespacedName(serviceentry)
 		c.checkInSpecAddresses(serviceentry)
-		c.markUsedOrQueueConflict(autoallocate.GetV2AddressesFromServiceEntry(serviceentry), owner)
+		c.markUsedOrQueueConflict(autoallocate.GetAddressesFromServiceEntry(serviceentry), owner)
 	}
 
 	log.Debugf("discovered %v during warming", count)
@@ -161,9 +169,11 @@ func (c *IPAllocator) reconcile(a any) error {
 }
 
 func (c *IPAllocator) reconcileServiceEntry(se types.NamespacedName) error {
-	log.Debugf("reconciling ServiceEntry %s/%s", se.Namespace, se.Name)
+	log := log.WithLabels("service entry", se)
+	log.Debugf("reconciling")
 	serviceentry := c.serviceEntryClient.Get(se.Name, se.Namespace)
 	if serviceentry == nil {
+		log.Debugf("not found, no action required")
 		// probably a delete so we should remove ips from our addresses most likely
 		// TODO: we never actually remove IP right now, likely this should be done a little more slowly anyway to prevent reuse if we are too fast
 		return nil
@@ -174,28 +184,39 @@ func (c *IPAllocator) reconcileServiceEntry(se types.NamespacedName) error {
 	if !autoallocate.ShouldV2AutoAllocateIP(serviceentry) {
 		// we may have an address in our range so we should check and record it
 		c.checkInSpecAddresses(serviceentry)
+		log.Debugf("allocation not required")
 		return nil
 	}
 
-	patch, err := c.statusPatchForAddresses(serviceentry, false)
+	replaceAddresses, addStatusAndAddresses, err := c.statusPatchForAddresses(serviceentry, false)
 	if err != nil {
 		return err
 	}
 
-	if patch == nil {
+	if replaceAddresses == nil {
+		log.Debugf("no change needed")
 		return nil // nothing to patch
 	}
 
-	_, err = c.serviceEntryClient.PatchStatus(se.Name, se.Namespace, types.JSONPatchType, patch)
+	// this patch may fail if there is no status which exists
+	_, err = c.serviceEntryWriter.PatchStatus(se.Name, se.Namespace, types.JSONPatchType, replaceAddresses)
 	if err != nil {
-		return err
+		// try this patch which tests that status doesn't exist, adds status and then add addresses all in 1 operation
+		_, err2 := c.serviceEntryWriter.PatchStatus(se.Name, se.Namespace, types.JSONPatchType, addStatusAndAddresses)
+		if err2 != nil {
+			log.Errorf("second patch also rejected %v, patch: %s", err2.Error(), addStatusAndAddresses)
+			// if this also didn't work there is perhaps a real issue and perhaps a requeue will resolve
+			return err
+		}
+		return nil
 	}
 
+	log.Debugf("patched successfully")
 	return nil
 }
 
 func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
-	var serviceentries, autoConflicts, userConflicts []*networkingv1alpha3.ServiceEntry
+	var serviceentries, autoConflicts, userConflicts []*networkingv1.ServiceEntry
 
 	for _, conflictingAddress := range conflict.getAddresses() {
 		serviceentries = append(serviceentries, c.index.Lookup(conflictingAddress)...)
@@ -212,7 +233,7 @@ func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
 		}
 	}
 
-	slices.SortFunc(autoConflicts, func(a, b *networkingv1alpha3.ServiceEntry) int {
+	slices.SortFunc(autoConflicts, func(a, b *networkingv1.ServiceEntry) int {
 		return a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
 	})
 
@@ -233,7 +254,9 @@ func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
 			continue
 		}
 		log.Warnf("reassigned %s/%s due to IP Address conflict", resolveMe.Namespace, resolveMe.Name)
-		patch, err := c.statusPatchForAddresses(resolveMe, true)
+		// we are patching from the slice of ServiceEntry where the conflicting address was found in status.addresses
+		// this means we should already have a status and never need to use the patch that initializes the status
+		patch, _, err := c.statusPatchForAddresses(resolveMe, true)
 		if err != nil {
 			errs = errors.Join(errs, err)
 		}
@@ -242,7 +265,7 @@ func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
 			errs = errors.Join(errs, fmt.Errorf("this should not occur but patch was empty on a forced reassignment"))
 		}
 
-		_, err = c.serviceEntryClient.PatchStatus(resolveMe.Name, resolveMe.Namespace, types.JSONPatchType, patch)
+		_, err = c.serviceEntryWriter.PatchStatus(resolveMe.Name, resolveMe.Namespace, types.JSONPatchType, patch)
 		if err != nil {
 			errs = errors.Join(errs, err)
 		}
@@ -251,11 +274,11 @@ func (c *IPAllocator) resolveConflict(conflict conflictDetectedEvent) error {
 	return errs
 }
 
-func allAddresses(se *networkingv1alpha3.ServiceEntry) ([]netip.Addr, []netip.Addr) {
+func allAddresses(se *networkingv1.ServiceEntry) ([]netip.Addr, []netip.Addr) {
 	if se == nil {
 		return nil, nil
 	}
-	autoAssigned := autoallocate.GetV2AddressesFromServiceEntry(se)
+	autoAssigned := autoallocate.GetAddressesFromServiceEntry(se)
 	userAssigned := []netip.Addr{}
 
 	for _, a := range se.Spec.Addresses {
@@ -304,34 +327,100 @@ func (c *IPAllocator) markUsedOrQueueConflict(maybeMappedAddrs []netip.Addr, own
 	}
 }
 
-func (c *IPAllocator) statusPatchForAddresses(se *networkingv1alpha3.ServiceEntry, forcedReassign bool) ([]byte, error) {
+type jsonPatch struct {
+	Operation string      `json:"op"`
+	Path      string      `json:"path"`
+	Value     interface{} `json:"value"`
+}
+
+// filter out any wildcarded hosts
+func removeWildCarded(h string) bool {
+	return !cfghost.Name(h).IsWildCarded()
+}
+
+func (c *IPAllocator) statusPatchForAddresses(se *networkingv1.ServiceEntry, forcedReassign bool) ([]byte, []byte, error) {
 	if se == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	existingAddresses := autoallocate.GetV2AddressesFromServiceEntry(se)
-	if len(existingAddresses) > 0 && !forcedReassign {
+	existingHostAddresses := autoallocate.GetHostAddressesFromServiceEntry(se)
+	hostsWithAddresses := sets.New[string]()
+	hostsInSpec := sets.New[string]()
+
+	for _, host := range slices.Filter(se.Spec.Hosts, removeWildCarded) {
+		hostsInSpec.Insert(host)
+	}
+	existingAddresses := []netip.Addr{}
+
+	// collect existing addresses and the hosts which already have assigned addresses
+	for host, addresses := range existingHostAddresses {
 		// this is likely a noop, but just to be safe we should check and potentially resolve conflict
-		c.markUsedOrQueueConflict(existingAddresses, config.NamespacedName(se))
-		return nil, nil // nothing to patch
-	}
-	assignedAddresses := []apiv1alpha3.ServiceEntryAddress{}
-	for _, a := range c.nextAddresses(config.NamespacedName(se)) {
-		assignedAddresses = append(assignedAddresses, apiv1alpha3.ServiceEntryAddress{Value: a.String()})
+		existingAddresses = append(existingAddresses, addresses...)
+		hostsWithAddresses.Insert(host)
 	}
 
-	addressUpdate := []jsonpatch.Operation{
+	// if we are being forced to reassign we already know there is a conflict
+	if !forcedReassign {
+		// if we're not being forced to reassign then we should ensure any addresses found are marked for use and queue up any conflicts found
+		c.markUsedOrQueueConflict(existingAddresses, config.NamespacedName(se))
+	}
+
+	// nothing to patch
+	if hostsInSpec.Equals(hostsWithAddresses) && !forcedReassign {
+		return nil, nil, nil
+	}
+
+	assignedHosts := sets.New[string]()
+
+	// construct the assigned addresses datastructure to patch
+	assignedAddresses := []apiv1alpha3.ServiceEntryAddress{}
+	for _, host := range slices.Filter(se.Spec.Hosts, removeWildCarded) {
+		if assignedHosts.InsertContains(host) {
+			continue
+		}
+		assignedIPs := []netip.Addr{}
+		if aa, ok := existingHostAddresses[host]; ok && !forcedReassign {
+			// we already assigned this host, do not re-assign
+			assignedIPs = append(assignedIPs, aa...)
+		} else {
+			assignedIPs = append(assignedIPs, c.nextAddresses(config.NamespacedName(se))...)
+		}
+
+		for _, a := range assignedIPs {
+			assignedAddresses = append(assignedAddresses, apiv1alpha3.ServiceEntryAddress{Value: a.String(), Host: host})
+		}
+	}
+
+	replaceAddresses, err := json.Marshal([]jsonPatch{
 		{
 			Operation: "replace",
 			Path:      "/status/addresses",
 			Value:     assignedAddresses,
 		},
-	}
+	})
 
-	return json.Marshal(addressUpdate)
+	addStatusAndAddresses, err2 := json.Marshal([]jsonPatch{
+		{
+			Operation: "test",
+			Path:      "/status",
+			Value:     nil, // we want to test that status is nil before we try to modiy it with this
+		},
+		{
+			Operation: "add",
+			Path:      "/status",
+			Value:     apiv1alpha3.ServiceEntryStatus{},
+		},
+		{
+			Operation: "add",
+			Path:      "/status/addresses",
+			Value:     assignedAddresses,
+		},
+	})
+
+	return replaceAddresses, addStatusAndAddresses, errors.Join(err, err2)
 }
 
-func (c *IPAllocator) checkInSpecAddresses(serviceentry *networkingv1alpha3.ServiceEntry) {
+func (c *IPAllocator) checkInSpecAddresses(serviceentry *networkingv1.ServiceEntry) {
 	addrs := []netip.Addr{}
 	for _, addr := range serviceentry.Spec.Addresses {
 		a, err := netip.ParseAddr(addr)

@@ -32,20 +32,27 @@ import (
 )
 
 func TestSingleton(t *testing.T) {
-	c := kube.NewFakeClient()
-	ConfigMaps := krt.NewInformer[*corev1.ConfigMap](c)
 	stop := test.NewStop(t)
+	opts := testOptions(t)
+	c := kube.NewFakeClient()
+	ConfigMaps := krt.NewInformer[*corev1.ConfigMap](c, opts.WithName("ConfigMaps")...)
 	c.RunAndWait(stop)
 	cmt := clienttest.NewWriter[*corev1.ConfigMap](t, c)
+	meta := krt.Metadata{
+		"app": "foo",
+	}
 	ConfigMapNames := krt.NewSingleton[string](
 		func(ctx krt.HandlerContext) *string {
 			cms := krt.Fetch(ctx, ConfigMaps)
 			return ptr.Of(slices.Join(",", slices.Map(cms, func(c *corev1.ConfigMap) string {
 				return config.NamespacedName(c).String()
 			})...))
-		},
+		}, opts.With(
+			krt.WithName("ConfigMapNames"),
+			krt.WithMetadata(meta),
+		)...,
 	)
-	ConfigMapNames.AsCollection().Synced().WaitUntilSynced(stop)
+	ConfigMapNames.AsCollection().WaitUntilSynced(stop)
 	tt := assert.NewTracker[string](t)
 	ConfigMapNames.Register(TrackerHandler[string](tt))
 	tt.WaitOrdered("add/")
@@ -60,11 +67,12 @@ func TestSingleton(t *testing.T) {
 	})
 	tt.WaitUnordered("delete/", "add/ns/a")
 	assert.Equal(t, *ConfigMapNames.Get(), "ns/a")
+	assert.Equal(t, ConfigMapNames.AsCollection().Metadata(), meta)
 }
 
 func TestNewStatic(t *testing.T) {
 	tt := assert.NewTracker[string](t)
-	s := krt.NewStatic[string](nil)
+	s := krt.NewStatic[string](nil, true)
 	s.Register(TrackerHandler[string](tt))
 
 	assert.Equal(t, s.Get(), nil)
@@ -86,6 +94,23 @@ func TestNewStatic(t *testing.T) {
 	tt.WaitOrdered("update/bar2")
 }
 
+func TestStaticMetadata(t *testing.T) {
+	tt := assert.NewTracker[string](t)
+	meta := krt.Metadata{
+		"app": "foo",
+	}
+	s := krt.NewStatic[string](nil, true, krt.WithMetadata(meta))
+	s.Register(TrackerHandler[string](tt))
+
+	assert.Equal(t, s.Get(), nil)
+
+	s.Set(ptr.Of("foo"))
+	assert.Equal(t, s.Get(), ptr.Of("foo"))
+	tt.WaitOrdered("add/foo")
+
+	assert.Equal(t, s.AsCollection().Metadata(), meta)
+}
+
 // TrackerHandler returns an object handler that records each event
 func TrackerHandler[T any](tracker *assert.Tracker[string]) func(krt.Event[T]) {
 	return func(o krt.Event[T]) {
@@ -93,8 +118,8 @@ func TrackerHandler[T any](tracker *assert.Tracker[string]) func(krt.Event[T]) {
 	}
 }
 
-func BatchedTrackerHandler[T any](tracker *assert.Tracker[string]) func([]krt.Event[T], bool) {
-	return func(o []krt.Event[T], initialSync bool) {
+func BatchedTrackerHandler[T any](tracker *assert.Tracker[string]) func([]krt.Event[T]) {
+	return func(o []krt.Event[T]) {
 		tracker.Record(slices.Join(",", slices.Map(o, func(o krt.Event[T]) string {
 			return fmt.Sprintf("%v/%v", o.Event, krt.GetKey(o.Latest()))
 		})...))

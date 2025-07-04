@@ -375,6 +375,42 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 				RequireClientCertificate: proto.BoolFalse,
 			},
 		},
+		{ // Multiple credential names and subject alternative names are specified, generate SDS configs for
+			// key/cert and static validation context config.
+			name: "multiple credential names subject alternative name no key no cert tls SIMPLE",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:            networking.ServerTLSSettings_SIMPLE,
+					CredentialNames: []string{"ingress-sds-resource-name", "ingress-sds-resource-name2"},
+					SubjectAltNames: []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name:      "kubernetes://ingress-sds-resource-name",
+							SdsConfig: model.SDSAdsConfig,
+						},
+						{
+							Name:      "kubernetes://ingress-sds-resource-name2",
+							SdsConfig: model.SDSAdsConfig,
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_ValidationContext{
+						ValidationContext: &auth.CertificateValidationContext{
+							MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
 		{
 			name: "no credential name key and cert tls SIMPLE",
 			server: &networking.Server{
@@ -418,6 +454,76 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
+			name: "no credential name multiple certificates with SIMPLE mode",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode: networking.ServerTLSSettings_SIMPLE,
+					TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+						{
+							ServerCertificate: "server-cert.crt",
+							PrivateKey:        "private-key.key",
+						},
+						{
+							ServerCertificate: "server-cert2.crt",
+							PrivateKey:        "private-key2.key",
+						},
+					},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "file-cert:server-cert2.crt~private-key2.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
+		{
 			name: "no credential name key and cert tls MUTUAL",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
@@ -437,6 +543,102 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
 						{
 							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "file-root:ca-cert.crt",
+								SdsConfig: &core.ConfigSource{
+									ResourceApiVersion: core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
+			name: "no credential name multiple certificates tls MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:           networking.ServerTLSSettings_MUTUAL,
+					CaCertificates: "ca-cert.crt",
+					TlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+						{
+							ServerCertificate: "server-cert.crt",
+							PrivateKey:        "private-key.key",
+						},
+						{
+							ServerCertificate: "server-cert2.crt",
+							PrivateKey:        "private-key2.key",
+						},
+					},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name: "file-cert:server-cert2.crt~private-key2.key",
 							SdsConfig: &core.ConfigSource{
 								ResourceApiVersion: core.ApiVersion_V3,
 								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
@@ -2156,7 +2358,7 @@ func TestGatewayHTTPRouteConfig(t *testing.T) {
 			Selector: map[string]string{"istio": "ingressgateway"},
 			Servers: []*networking.Server{
 				{
-					Hosts: []string{"example.org"},
+					Hosts: []string{"Example.org"},
 					Port:  &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
 					Tls:   &networking.ServerTLSSettings{HttpsRedirect: true},
 				},
@@ -3721,7 +3923,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
 				{
 					NetworkFilters: []string{
-						xdsfilters.TCPListenerMx.GetName(),
+						xdsfilters.MxFilterName,
 						wellknown.TCPProxy,
 					},
 					HTTPFilters: []string{},
@@ -3814,7 +4016,7 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					{
 						TotalMatch: true, // there must be only 1 `istio_authn` network filter
 						NetworkFilters: []string{
-							xdsfilters.TCPListenerMx.GetName(),
+							xdsfilters.MxFilterName,
 							wellknown.TCPProxy,
 						},
 						HTTPFilters: []string{},
@@ -4051,10 +4253,10 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.RoleBasedAccessControl,
 							wellknown.ExternalAuthorization,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-authn",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-authz",
 							wellknown.RoleBasedAccessControl,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-stats",
 							xds.StatsFilterName,
 							wellknown.TCPProxy,
 						},
@@ -4157,9 +4359,9 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					{
 						TotalMatch: true,
 						NetworkFilters: []string{
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-authz",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-network-stats",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-network-authn",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-network-authz",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-network-stats",
 							wellknown.HTTPConnectionManager,
 						},
 						HTTPFilters: []string{
@@ -4167,10 +4369,10 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 							// Ext auth makes 2 filters
 							wellknown.HTTPRoleBasedAccessControl,
 							wellknown.HTTPExternalAuthorization,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authn",
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-authz",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-authn",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-authz",
 							wellknown.HTTPRoleBasedAccessControl,
-							"extenstions.istio.io/wasmplugin/istio-system.wasm-stats",
+							"extensions.istio.io/wasmplugin/istio-system.wasm-stats",
 							wellknown.HTTPGRPCStats,
 							xdsfilters.Alpn.Name,
 							xdsfilters.Fault.Name,
@@ -4408,11 +4610,6 @@ func TestGatewayHCMInternalAddressConfig(t *testing.T) {
 			expectedconfig: nil,
 		},
 		{
-			name:           "empty networks",
-			networks:       &meshconfig.MeshNetworks{},
-			expectedconfig: nil,
-		},
-		{
 			name: "networks populated",
 			networks: &meshconfig.MeshNetworks{
 				Networks: map[string]*meshconfig.Network{
@@ -4421,11 +4618,6 @@ func TestGatewayHCMInternalAddressConfig(t *testing.T) {
 							{
 								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
 									FromCidr: "192.168.0.0/16",
-								},
-							},
-							{
-								Ne: &meshconfig.Network_NetworkEndpoints_FromCidr{
-									FromCidr: "172.16.0.0/12",
 								},
 							},
 						},
@@ -4438,10 +4630,6 @@ func TestGatewayHCMInternalAddressConfig(t *testing.T) {
 						AddressPrefix: "192.168.0.0",
 						PrefixLen:     &wrappers.UInt32Value{Value: 16},
 					},
-					{
-						AddressPrefix: "172.16.0.0",
-						PrefixLen:     &wrappers.UInt32Value{Value: 12},
-					},
 				},
 			},
 		},
@@ -4452,6 +4640,60 @@ func TestGatewayHCMInternalAddressConfig(t *testing.T) {
 			httpConnManager := buildGatewayConnectionManager(&meshconfig.ProxyConfig{}, proxy, false, push)
 			if !reflect.DeepEqual(tt.expectedconfig, httpConnManager.InternalAddressConfig) {
 				t.Errorf("unexpected internal address config, expected: %v, got :%v", tt.expectedconfig, httpConnManager.InternalAddressConfig)
+			}
+		})
+	}
+}
+
+func TestListenerTransportSocketConnectTimeoutForGateway(t *testing.T) {
+	cases := []struct {
+		name            string
+		expectedTimeout int64
+		configs         []config.Config
+	}{
+		{
+			name:            "should set timeout",
+			expectedTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout).GetSeconds(),
+			configs: []config.Config{
+				{
+					Meta: config.Meta{Name: "http-server", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port: &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cg := NewConfigGenTest(t, TestOptions{
+				Configs:    tt.configs,
+				MeshConfig: mesh.DefaultMeshConfig(),
+			})
+			cg.PushContext().ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*pilot_model.Service{
+				"example.local": {
+					"foo": &pilot_model.Service{
+						Hostname: "example.local",
+					},
+				},
+			}
+			proxy := cg.SetupProxy(&proxyGateway)
+			metadata := proxyGatewayMetadata
+			metadata.ProxyConfig = &pilot_model.NodeMetaProxyConfig{
+				GatewayTopology: &meshconfig.Topology{ProxyProtocol: &meshconfig.Topology_ProxyProtocolConfiguration{}},
+			}
+			proxy.Metadata = &metadata
+
+			lb := NewListenerBuilder(proxy, cg.PushContext())
+			builder := cg.ConfigGen.buildGatewayListeners(lb)
+			fc := builder.gatewayListeners[0].FilterChains[0]
+			if fc.TransportSocketConnectTimeout == nil || fc.TransportSocketConnectTimeout.Seconds != tt.expectedTimeout {
+				t.Errorf("expected transport socket connect timeout to be %v on gateway listern's filter chain %v, got %v",
+					tt.expectedTimeout, fc.Name, fc.TransportSocketConnectTimeout)
 			}
 		})
 	}

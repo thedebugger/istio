@@ -63,7 +63,6 @@ func TestValidateExtensionProviderService(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateExtensionProviderService(tt.service)
 			valid := err == nil
@@ -503,6 +502,16 @@ func TestValidateExtensionProviderTracingOpentelemetry(t *testing.T) {
 			name: "missing port",
 			provider: &meshconfig.MeshConfig_ExtensionProvider_OpenTelemetryTracingProvider{
 				Service: "collector.namespace.svc",
+			},
+			valid: false,
+		},
+		{
+			name: "set both grpc and http",
+			provider: &meshconfig.MeshConfig_ExtensionProvider_OpenTelemetryTracingProvider{
+				Service: "collector.namespace.svc",
+				Port:    4317,
+				Grpc:    &meshconfig.MeshConfig_ExtensionProvider_GrpcService{},
+				Http:    &meshconfig.MeshConfig_ExtensionProvider_HttpService{},
 			},
 			valid: false,
 		},

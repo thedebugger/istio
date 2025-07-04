@@ -29,6 +29,8 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/kube"
 	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/util/sets"
 )
 
 var (
@@ -169,7 +171,7 @@ func TestServiceConversion(t *testing.T) {
 
 	service := ConvertService(localSvc, domainSuffix, clusterID, &meshconfig.MeshConfig{TrustDomain: domainSuffix})
 	if service == nil {
-		t.Fatalf("could not convert service")
+		t.Fatal("could not convert service")
 	}
 
 	if service.CreationTime != tnow {
@@ -212,7 +214,7 @@ func TestServiceConversion(t *testing.T) {
 
 	sa := service.ServiceAccounts
 	if sa == nil || len(sa) != 4 {
-		t.Fatalf("number of service accounts is incorrect")
+		t.Fatal("number of service accounts is incorrect")
 	}
 	expected := []string{
 		saC, saD,
@@ -255,12 +257,67 @@ func TestServiceConversionWithEmptyServiceAccountsAnnotation(t *testing.T) {
 
 	service := ConvertService(localSvc, domainSuffix, clusterID, nil)
 	if service == nil {
-		t.Fatalf("could not convert service")
+		t.Fatal("could not convert service")
 	}
 
 	sa := service.ServiceAccounts
 	if len(sa) != 0 {
 		t.Fatalf("number of service accounts is incorrect: %d, expected 0", len(sa))
+	}
+}
+
+func TestServiceConversionWithExportToAnnotation(t *testing.T) {
+	serviceName := "service1"
+	namespace := "default"
+
+	ip := "10.0.0.1"
+
+	localSvc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        serviceName,
+			Namespace:   namespace,
+			Annotations: map[string]string{},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: ip,
+			Ports: []corev1.ServicePort{
+				{
+					Name:     "http",
+					Port:     8080,
+					Protocol: corev1.ProtocolTCP,
+				},
+				{
+					Name:     "https",
+					Protocol: corev1.ProtocolTCP,
+					Port:     443,
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		Annotation string
+		Want       sets.Set[visibility.Instance]
+	}{
+		{"", sets.Set[visibility.Instance]{}},
+		{".", sets.New(visibility.Private)},
+		{"*", sets.New(visibility.Public)},
+		{"~", sets.New(visibility.None)},
+		{"ns", sets.New(visibility.Instance("ns"))},
+		{"ns1,ns2", sets.New(visibility.Instance("ns1"), visibility.Instance("ns2"))},
+		{"ns1, ns2", sets.New(visibility.Instance("ns1"), visibility.Instance("ns2"))},
+		{"ns1 ,ns2", sets.New(visibility.Instance("ns1"), visibility.Instance("ns2"))},
+	}
+	for _, test := range tests {
+		localSvc.Annotations[annotation.NetworkingExportTo.Name] = test.Annotation
+		service := ConvertService(localSvc, domainSuffix, clusterID, nil)
+		if service == nil {
+			t.Fatal("could not convert service")
+		}
+
+		if !service.Attributes.ExportTo.Equals(test.Want) {
+			t.Errorf("incorrect exportTo conversion: got = %v, but want = %v", service.Attributes.ExportTo, test.Want)
+		}
 	}
 }
 
@@ -288,7 +345,7 @@ func TestExternalServiceConversion(t *testing.T) {
 
 	service := ConvertService(extSvc, domainSuffix, clusterID, nil)
 	if service == nil {
-		t.Fatalf("could not convert external service")
+		t.Fatal("could not convert external service")
 	}
 
 	if len(service.Ports) != len(extSvc.Spec.Ports) {
@@ -338,7 +395,7 @@ func TestExternalClusterLocalServiceConversion(t *testing.T) {
 
 	service := ConvertService(extSvc, domainSuffix, clusterID, nil)
 	if service == nil {
-		t.Fatalf("could not convert external service")
+		t.Fatal("could not convert external service")
 	}
 
 	if len(service.Ports) != len(extSvc.Spec.Ports) {
@@ -399,12 +456,12 @@ func TestLBServiceConversion(t *testing.T) {
 
 	service := ConvertService(extSvc, domainSuffix, clusterID, nil)
 	if service == nil {
-		t.Fatalf("could not convert external service")
+		t.Fatal("could not convert external service")
 	}
 
 	gotAddresses := service.Attributes.ClusterExternalAddresses.GetAddressesFor(clusterID)
 	if len(gotAddresses) == 0 {
-		t.Fatalf("no load balancer addresses found")
+		t.Fatal("no load balancer addresses found")
 	}
 
 	for i, addr := range addresses {
@@ -445,7 +502,7 @@ func TestInternalTrafficPolicyServiceConversion(t *testing.T) {
 
 	service := ConvertService(svc, domainSuffix, clusterID, nil)
 	if service == nil {
-		t.Fatalf("could not convert service")
+		t.Fatal("could not convert service")
 	}
 
 	if !service.Attributes.NodeLocal {

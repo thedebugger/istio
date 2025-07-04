@@ -23,18 +23,16 @@
     },
     {
       "ambient_enabled": false,
-      "cni_event_address": "/tmp/cnieventfoo",
+      "cni_agent_run_dir": "/tmp",
       "dns": {},
+      "enablement_selectors": [],
+      "exclude_namespaces": [
+        "istio-system"
+      ],
       "ipam": {},
-      "kubernetes": {
-        "exclude_namespaces": [
-          "istio-system"
-        ],
-        "kubeconfig": "/etc/cni/net.d/ZZZ-istio-cni-kubeconfig"
-      },
-      "log_uds_address": "",
       "name": "istio-cni",
       "plugin_log_level": "debug",
+      "pod_namespace": "",
       "type": "istio-cni"
     }
   ]

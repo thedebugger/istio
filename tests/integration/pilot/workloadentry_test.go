@@ -42,7 +42,7 @@ func TestWorkloadEntryGateway(t *testing.T) {
 		RequiresMinClusters(2).
 		Run(func(t framework.TestContext) {
 			crd.DeployGatewayAPIOrSkip(t)
-			i := istio.GetOrFail(t, t)
+			i := istio.GetOrFail(t)
 			type gwAddr struct {
 				ip   string
 				port int
@@ -86,7 +86,7 @@ spec:
 			// a serviceentry that only includes cluster-local endpoints (avoid automatic cross-cluster discovery)
 			seTmpl := `
 ---
-apiVersion: networking.istio.io/v1beta1
+apiVersion: networking.istio.io/v1
 kind: ServiceEntry
 metadata:
   name: serviceentry.mesh.global
@@ -109,7 +109,7 @@ spec:
 `
 
 			exposeServices := `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
   name: cross-network-gateway
@@ -141,7 +141,7 @@ spec:
 			}
 
 			weTmpl := `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: WorkloadEntry
 metadata:
   name: se-cross-network-{{.testName}}
@@ -186,7 +186,6 @@ spec:
 			}
 
 			for _, tc := range testCases {
-				tc := tc
 				t.NewSubTest(tc.name).Run(func(t framework.TestContext) {
 					for network, networkClusters := range t.Clusters().ByNetwork() {
 						weClusters := t.Clusters().Configs(networkClusters...)
@@ -203,7 +202,6 @@ spec:
 					}
 
 					for _, src := range apps.A.Instances() {
-						src := src
 						// TODO possibly can run parallel
 						t.NewSubTestf("from %s", src.Clusters().Default().Name()).Run(func(t framework.TestContext) {
 							src.CallOrFail(t, echo.CallOptions{

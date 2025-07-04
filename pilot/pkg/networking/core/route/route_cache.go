@@ -15,7 +15,6 @@
 package route
 
 import (
-	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
@@ -86,23 +85,6 @@ func (r *Cache) Cacheable() bool {
 	return true
 }
 
-func extractNamespaceForKubernetesService(hostname string) (string, error) {
-	ih := strings.Index(hostname, ".svc.")
-	if ih < 0 {
-		return "", fmt.Errorf("hostname is a not a Kubernetes name, missing .svc: %v", hostname)
-	}
-	nsI := strings.Index(hostname, ".")
-	if nsI+1 >= len(hostname) || nsI+1 > ih {
-		// Invalid domain
-		return "", fmt.Errorf("hostname is a not a Kubernetes name, missing namespace: %v", hostname)
-	}
-	ns := hostname[nsI+1 : ih]
-	if len(ns) == 0 {
-		return "", fmt.Errorf("namespace not found")
-	}
-	return ns, nil
-}
-
 func (r *Cache) DependentConfigs() []model.ConfigHash {
 	size := len(r.Services) + len(r.VirtualServices) + len(r.DelegateVirtualServices) + len(r.EnvoyFilterKeys)
 	for _, mergedDR := range r.DestinationRules {
@@ -120,9 +102,11 @@ func (r *Cache) DependentConfigs() []model.ConfigHash {
 		}
 	}
 	for _, vs := range r.VirtualServices {
-		for _, cfg := range model.VirtualServiceDependencies(vs) {
-			configs = append(configs, cfg.HashCode())
-		}
+		configs = append(configs, model.ConfigKey{
+			Kind:      kind.VirtualService,
+			Namespace: vs.Namespace,
+			Name:      vs.Name,
+		}.HashCode())
 	}
 	// add delegate virtual services to dependent configs
 	// so that we can clear the rds cache when delegate virtual services are updated
@@ -134,8 +118,8 @@ func (r *Cache) DependentConfigs() []model.ConfigHash {
 	}
 
 	for _, efKey := range r.EnvoyFilterKeys {
-		items := strings.Split(efKey, "/")
-		configs = append(configs, model.ConfigKey{Kind: kind.EnvoyFilter, Name: items[1], Namespace: items[0]}.HashCode())
+		ns, name, _ := strings.Cut(efKey, "/")
+		configs = append(configs, model.ConfigKey{Kind: kind.EnvoyFilter, Name: name, Namespace: ns}.HashCode())
 	}
 	return configs
 }
@@ -165,18 +149,20 @@ func (r *Cache) Key() any {
 		h.Write(Slash)
 		h.WriteString(svc.Attributes.Namespace)
 		h.Write(Separator)
+		for _, alias := range svc.Attributes.Aliases {
+			h.WriteString(string(alias.Hostname))
+			h.Write(Slash)
+			h.WriteString(alias.Namespace)
+			h.Write(Separator)
+		}
 	}
 	h.Write(Separator)
 
 	for _, vs := range r.VirtualServices {
-		for _, cfg := range model.VirtualServiceDependencies(vs) {
-			h.WriteString(cfg.Kind.String())
-			h.Write(Slash)
-			h.WriteString(cfg.Name)
-			h.Write(Slash)
-			h.WriteString(cfg.Namespace)
-			h.Write(Separator)
-		}
+		h.Write([]byte(vs.Name))
+		h.Write(Slash)
+		h.Write([]byte(vs.Namespace))
+		h.Write(Separator)
 	}
 	h.Write(Separator)
 

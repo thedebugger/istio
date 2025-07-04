@@ -27,18 +27,19 @@ import (
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/proto/merge"
 	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/util/sets"
 )
 
 func ApplyRouteConfigurationPatches(
 	patchContext networking.EnvoyFilter_PatchContext,
 	proxy *model.Proxy,
-	efw *model.EnvoyFilterWrapper,
+	efw *model.MergedEnvoyFilterWrapper,
 	routeConfiguration *route.RouteConfiguration,
 ) (out *route.RouteConfiguration) {
 	defer runtime.HandleCrash(runtime.LogPanic, func(any) {
 		IncrementEnvoyFilterErrorMetric(Route)
-		log.Errorf("route patch %s/%s caused panic, so the patches did not take effect", efw.Namespace, efw.Name)
+		log.Errorf("route patch caused panic, so the patches did not take effect")
 	})
 	// In case the patches cause panic, use the route generated before to reduce the influence.
 	out = routeConfiguration
@@ -271,43 +272,42 @@ func routeConfigurationMatch(patchContext networking.EnvoyFilter_PatchContext, r
 	// we match on the port number and virtual host for sidecars
 	// we match on port number, server port name, gateway name, plus virtual host for gateways
 	if patchContext != networking.EnvoyFilter_GATEWAY {
-		listenerPort := 0
-		if strings.HasPrefix(rc.Name, string(model.TrafficDirectionInbound)) {
-			_, _, _, listenerPort = model.ParseSubsetKey(rc.Name)
-		} else {
-			listenerPort, _ = strconv.Atoi(rc.Name)
-		}
-
-		// FIXME: Ports on a route can be 0. the API only takes uint32 for ports
-		// We should either make that field in API as a wrapper type or switch to int
-		if rMatch.PortNumber != 0 && int(rMatch.PortNumber) != listenerPort {
-			return false
-		}
-
 		if rMatch.Name != "" && rMatch.Name != rc.Name {
 			return false
 		}
-
+		// FIXME: Ports on a route can be 0. the API only takes uint32 for ports
+		// We should either make that field in API as a wrapper type or switch to int
+		if rMatch.PortNumber != 0 && int(rMatch.PortNumber) != getListenerPortFromName(rc.Name) {
+			return false
+		}
 		return true
 	}
 
 	// This is a gateway. Get all the fields in the gateway's RDS route name
-	routePortNumber, portName, gateway := model.ParseGatewayRDSRouteName(rc.Name)
-	if rMatch.PortNumber != 0 && !anyPortMatches(portMap, routePortNumber, int(rMatch.PortNumber)) {
+	if rMatch.Name != "" && rMatch.Name != rc.Name {
 		return false
 	}
+	routePortNumber, portName, gateway := model.ParseGatewayRDSRouteName(rc.Name)
 	if rMatch.PortName != "" && rMatch.PortName != portName {
 		return false
 	}
 	if rMatch.Gateway != "" && rMatch.Gateway != gateway {
 		return false
 	}
-
-	if rMatch.Name != "" && rMatch.Name != rc.Name {
+	if rMatch.PortNumber != 0 && !anyPortMatches(portMap, routePortNumber, int(rMatch.PortNumber)) {
 		return false
 	}
-
 	return true
+}
+
+func getListenerPortFromName(name string) int {
+	listenerPort := 0
+	if strings.HasPrefix(name, string(model.TrafficDirectionInbound)) {
+		_, _, _, listenerPort = model.ParseSubsetKey(name)
+	} else {
+		listenerPort, _ = strconv.Atoi(name)
+	}
+	return listenerPort
 }
 
 func anyPortMatches(m model.GatewayPortMap, number int, matchNumber int) bool {
@@ -340,8 +340,10 @@ func virtualHostMatch(vh *route.VirtualHost, rp *model.EnvoyFilterConfigPatchWra
 		// we do not have a virtual host to match.
 		return false
 	}
-	// check if virtual host names match
-	return match.Name == "" || match.Name == vh.Name
+
+	// check if virtual host name and a domain name matches
+	return (match.Name == "" || match.Name == vh.Name) &&
+		(match.DomainName == "" || slices.Contains(vh.Domains, match.DomainName))
 }
 
 func routeMatch(httpRoute *route.Route, rp *model.EnvoyFilterConfigPatchWrapper) bool {
@@ -387,5 +389,5 @@ func routeMatch(httpRoute *route.Route, rp *model.EnvoyFilterConfigPatchWrapper)
 }
 
 func cloneVhostRouteByRouteIndex(virtualHost *route.VirtualHost, routeIndex int) {
-	virtualHost.Routes[routeIndex] = proto.Clone(virtualHost.Routes[routeIndex]).(*route.Route)
+	virtualHost.Routes[routeIndex] = protomarshal.Clone(virtualHost.Routes[routeIndex])
 }

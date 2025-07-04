@@ -21,11 +21,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayx "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	"istio.io/api/annotation"
 	"istio.io/api/label"
 	meshconfig "istio.io/api/mesh/v1alpha1"
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	"istio.io/istio/pkg/cluster"
@@ -53,11 +53,7 @@ func ConvertService(svc corev1.Service, domainSuffix string, clusterID cluster.I
 
 	if svc.Spec.Type == corev1.ServiceTypeExternalName && svc.Spec.ExternalName != "" {
 		externalName = svc.Spec.ExternalName
-		if features.EnableExternalNameAlias {
-			resolution = model.Alias
-		} else {
-			resolution = model.DNSLB
-		}
+		resolution = model.Alias
 	}
 	if svc.Spec.InternalTrafficPolicy != nil && *svc.Spec.InternalTrafficPolicy == corev1.ServiceInternalTrafficPolicyLocal {
 		nodeLocal = true
@@ -91,6 +87,7 @@ func ConvertService(svc corev1.Service, domainSuffix string, clusterID cluster.I
 		namespaces := strings.Split(svc.Annotations[annotation.NetworkingExportTo.Name], ",")
 		exportTo = sets.NewWithLength[visibility.Instance](len(namespaces))
 		for _, ns := range namespaces {
+			ns = strings.TrimSpace(ns)
 			exportTo.Insert(visibility.Instance(ns))
 		}
 	}
@@ -158,7 +155,9 @@ func ConvertService(svc corev1.Service, domainSuffix string, clusterID cluster.I
 
 	istioService.Attributes.Type = string(svc.Spec.Type)
 	istioService.Attributes.ExternalName = externalName
+	istioService.Attributes.TrafficDistribution = model.GetTrafficDistribution(svc.Spec.TrafficDistribution, svc.Annotations)
 	istioService.Attributes.NodeLocal = nodeLocal
+	istioService.Attributes.PublishNotReadyAddresses = svc.Spec.PublishNotReadyAddresses
 	if len(svc.Spec.ExternalIPs) > 0 {
 		if istioService.Attributes.ClusterExternalAddresses == nil {
 			istioService.Attributes.ClusterExternalAddresses = &model.AddressMap{}
@@ -167,30 +166,6 @@ func ConvertService(svc corev1.Service, domainSuffix string, clusterID cluster.I
 	}
 
 	return istioService
-}
-
-func ExternalNameEndpoints(svc *model.Service) []*model.IstioEndpoint {
-	if svc.Attributes.ExternalName == "" {
-		return nil
-	}
-	out := make([]*model.IstioEndpoint, 0, len(svc.Ports))
-
-	discoverabilityPolicy := model.AlwaysDiscoverable
-	if features.EnableMCSServiceDiscovery {
-		// MCS spec does not allow export of external name services.
-		// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-multicluster/1645-multi-cluster-services-api#exporting-services.
-		discoverabilityPolicy = model.DiscoverableFromSameCluster
-	}
-	for _, portEntry := range svc.Ports {
-		out = append(out, &model.IstioEndpoint{
-			Address:               svc.Attributes.ExternalName,
-			EndpointPort:          uint32(portEntry.Port),
-			ServicePortName:       portEntry.Name,
-			Labels:                svc.Attributes.Labels,
-			DiscoverabilityPolicy: discoverabilityPolicy,
-		})
-	}
-	return out
 }
 
 // ServiceHostname produces FQDN for a k8s service
@@ -252,6 +227,29 @@ func hasListenerMode(l v1beta1.Listener, mode string) bool {
 	return l.TLS != nil && l.TLS.Options != nil && string(l.TLS.Options[constants.ListenerModeOption]) == mode
 }
 
+func IsAutoPassthroughSet(gwLabels map[string]string, l gatewayx.ListenerEntry) bool {
+	if l.TLS == nil {
+		return false
+	}
+	if hasListenerModeSet(l, constants.ListenerModeAutoPassthrough) {
+		return true
+	}
+	_, networkSet := gwLabels[label.TopologyNetwork.Name]
+	if !networkSet {
+		return false
+	}
+	expectedPort := "15443"
+	if port, f := gwLabels[label.NetworkingGatewayPort.Name]; f {
+		expectedPort = port
+	}
+	return fmt.Sprint(l.Port) == expectedPort
+}
+
+func hasListenerModeSet(l gatewayx.ListenerEntry, mode string) bool {
+	// TODO if we add a hybrid mode for detecting HBONE/passthrough, also check that here
+	return l.TLS != nil && l.TLS.Options != nil && string(l.TLS.Options[constants.ListenerModeOption]) == mode
+}
+
 func GatewaySA(gw *v1beta1.Gateway) string {
-	return model.GetOrDefault(gw.GetAnnotations()["gateway.istio.io/service-account"], fmt.Sprintf("%s-%s", gw.Name, gw.Spec.GatewayClassName))
+	return model.GetOrDefault(gw.GetAnnotations()[annotation.GatewayServiceAccount.Name], fmt.Sprintf("%s-%s", gw.Name, gw.Spec.GatewayClassName))
 }

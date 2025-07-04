@@ -26,20 +26,22 @@ type Config struct {
 
 // InstallConfig struct defines the Istio CNI installation options
 type InstallConfig struct {
-	// Location of the CNI config files in the host's filesystem
-	CNINetDir string
 	// Location of the CNI config files in the container's filesystem (mount location of the CNINetDir)
 	MountedCNINetDir string
+	// Location of the node agent writable path on the node (used for sockets, etc)
+	CNIAgentRunDir string
 	// Name of the CNI config file
 	CNIConfName string
 	// Whether to install CNI plugin as a chained or standalone
 	ChainedCNIPlugin bool
+	// Name of the Istio owned CNI config file
+	IstioOwnedCNIConfigFilename string
+	// Whether an Istio owned CNI config is enabled
+	IstioOwnedCNIConfig bool
 
 	// Logging level for the CNI plugin
 	// Since it runs out-of-process, it has to be separately configured
 	PluginLogLevel string
-	// Name of the kubeconfig file used by the CNI plugin
-	KubeconfigFilename string
 	// The file mode to set when creating the kubeconfig file
 	KubeconfigMode int
 	// CA file for kubeconfig
@@ -49,6 +51,9 @@ type InstallConfig struct {
 
 	// Comma-separated list of K8S namespaces that CNI should ignore
 	ExcludeNamespaces string
+
+	// Singular namespace that the istio CNI node agent resides in
+	PodNamespace string
 
 	// KUBERNETES_SERVICE_PROTOCOL
 	K8sServiceProtocol string
@@ -70,23 +75,26 @@ type InstallConfig struct {
 	// The HTTP port for monitoring
 	MonitoringPort int
 
-	// The UDS server address that CNI plugin will send log to.
-	LogUDSAddress string
-
-	// The watch server socket address that CNI plugin will forward CNI events to.
-	CNIEventAddress string
-
 	// The ztunnel server socket address that the ztunnel will connect to.
 	ZtunnelUDSAddress string
 
 	// Whether ambient is enabled
 	AmbientEnabled bool
 
+	// The labelSelector to enable ambient for specific pods or namespaces
+	AmbientEnablementSelector string
+
 	// Whether ambient DNS capture is enabled
 	AmbientDNSCapture bool
 
 	// Whether ipv6 is enabled for ambient capture
 	AmbientIPv6 bool
+
+	// Feature flag to disable safe upgrade. Will be removed in future releases.
+	AmbientDisableSafeUpgrade bool
+
+	// Whether reconciliation of iptables at post startup is enabled for Ambient workloads
+	AmbientReconcilePodRulesOnStartup bool
 }
 
 // RepairConfig struct defines the Istio CNI race repair configuration
@@ -124,18 +132,20 @@ type RepairConfig struct {
 
 func (c InstallConfig) String() string {
 	var b strings.Builder
-	b.WriteString("CNINetDir: " + c.CNINetDir + "\n")
 	b.WriteString("MountedCNINetDir: " + c.MountedCNINetDir + "\n")
 	b.WriteString("CNIConfName: " + c.CNIConfName + "\n")
 	b.WriteString("ChainedCNIPlugin: " + fmt.Sprint(c.ChainedCNIPlugin) + "\n")
+	b.WriteString("CNIAgentRunDir: " + fmt.Sprint(c.CNIAgentRunDir) + "\n")
+	b.WriteString("IstioOwnedCNIConfigFilename: " + c.IstioOwnedCNIConfigFilename + "\n")
+	b.WriteString("IstioOwnedCNIConfig: " + fmt.Sprint(c.IstioOwnedCNIConfig) + "\n")
 
 	b.WriteString("PluginLogLevel: " + c.PluginLogLevel + "\n")
-	b.WriteString("KubeconfigFilename: " + c.KubeconfigFilename + "\n")
 	b.WriteString("KubeconfigMode: " + fmt.Sprintf("%#o", c.KubeconfigMode) + "\n")
 	b.WriteString("KubeCAFile: " + c.KubeCAFile + "\n")
 	b.WriteString("SkipTLSVerify: " + fmt.Sprint(c.SkipTLSVerify) + "\n")
 
 	b.WriteString("ExcludeNamespaces: " + fmt.Sprint(c.ExcludeNamespaces) + "\n")
+	b.WriteString("PodNamespace: " + fmt.Sprint(c.PodNamespace) + "\n")
 	b.WriteString("K8sServiceProtocol: " + c.K8sServiceProtocol + "\n")
 	b.WriteString("K8sServiceHost: " + c.K8sServiceHost + "\n")
 	b.WriteString("K8sServicePort: " + fmt.Sprint(c.K8sServicePort) + "\n")
@@ -145,14 +155,14 @@ func (c InstallConfig) String() string {
 	b.WriteString("CNIBinTargetDirs: " + strings.Join(c.CNIBinTargetDirs, ",") + "\n")
 
 	b.WriteString("MonitoringPort: " + fmt.Sprint(c.MonitoringPort) + "\n")
-	b.WriteString("LogUDSAddress: " + fmt.Sprint(c.LogUDSAddress) + "\n")
-	b.WriteString("CNIEventAddress: " + fmt.Sprint(c.CNIEventAddress) + "\n")
 	b.WriteString("ZtunnelUDSAddress: " + fmt.Sprint(c.ZtunnelUDSAddress) + "\n")
 
 	b.WriteString("AmbientEnabled: " + fmt.Sprint(c.AmbientEnabled) + "\n")
+	b.WriteString("AmbientEnablementSelector: " + c.AmbientEnablementSelector + "\n")
 	b.WriteString("AmbientDNSCapture: " + fmt.Sprint(c.AmbientDNSCapture) + "\n")
 	b.WriteString("AmbientIPv6: " + fmt.Sprint(c.AmbientIPv6) + "\n")
-
+	b.WriteString("AmbientDisableSafeUpgrade: " + fmt.Sprint(c.AmbientDisableSafeUpgrade) + "\n")
+	b.WriteString("AmbientReconcilePodRulesOnStartup: " + fmt.Sprint(c.AmbientReconcilePodRulesOnStartup) + "\n")
 	return b.String()
 }
 

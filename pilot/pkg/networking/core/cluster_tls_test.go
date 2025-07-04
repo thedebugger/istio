@@ -22,10 +22,12 @@ import (
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	internalupstream "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/internal_upstream/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
+	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
@@ -34,8 +36,11 @@ import (
 	"istio.io/istio/pilot/pkg/networking/util"
 	authn_model "istio.io/istio/pilot/pkg/security/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pilot/test/xdstest"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/assert"
+	"istio.io/istio/pkg/wellknown"
 )
 
 func TestApplyUpstreamTLSSettings(t *testing.T) {
@@ -270,6 +275,152 @@ func TestApplyUpstreamTLSSettings(t *testing.T) {
 	}
 }
 
+func TestApplyUpstreamTLSSettingsHBONE(t *testing.T) {
+	test.SetForTest(t, &features.EnableHBONESend, true)
+	istioMutualTLSSettings := &networking.ClientTLSSettings{
+		Mode:            networking.ClientTLSSettings_ISTIO_MUTUAL,
+		SubjectAltNames: []string{"custom.foo.com"},
+		Sni:             "custom.foo.com",
+	}
+	simpleTLSSettingsWithCerts := &networking.ClientTLSSettings{
+		Mode:            networking.ClientTLSSettings_SIMPLE,
+		CaCertificates:  "root-cert.pem",
+		SubjectAltNames: []string{"custom.foo.com"},
+		Sni:             "custom.foo.com",
+	}
+	type transportSocket struct {
+		Name  string
+		Inner string
+	}
+	type transportSocketMatch struct {
+		Name   string
+		Socket transportSocket
+	}
+	waypoint := &model.Proxy{
+		Type:         model.Waypoint,
+		Metadata:     &model.NodeMetadata{},
+		IstioVersion: &model.IstioVersion{Major: 1, Minor: 5},
+	}
+	sidecar := &model.Proxy{
+		Type:         model.SidecarProxy,
+		Metadata:     &model.NodeMetadata{},
+		IstioVersion: &model.IstioVersion{Major: 1, Minor: 5},
+	}
+
+	const internalUpstream = "envoy.transport_sockets.internal_upstream"
+	tests := []struct {
+		name    string
+		mtlsCtx mtlsContextType
+		tls     *networking.ClientTLSSettings
+		proxy   *model.Proxy
+		matches []transportSocketMatch
+		socket  transportSocket
+
+		validateTLSContext func(t *testing.T, ctx *tls.UpstreamTlsContext)
+	}{
+		{
+			name:    "waypoint: auto mTLS and HBONE",
+			mtlsCtx: autoDetected,
+			proxy:   waypoint,
+			tls:     istioMutualTLSSettings,
+			matches: []transportSocketMatch{
+				{
+					Name:   "hbone",
+					Socket: transportSocket{Name: internalUpstream, Inner: wellknown.TransportSocketRawBuffer},
+				},
+				{
+					Name:   "tlsMode-istio",
+					Socket: transportSocket{Name: wellknown.TransportSocketTLS},
+				},
+				{
+					Name:   "tlsMode-disabled",
+					Socket: transportSocket{Name: wellknown.TransportSocketRawBuffer},
+				},
+			},
+		},
+		{
+			name:    "sidecar: auto mTLS and HBONE",
+			mtlsCtx: autoDetected,
+			proxy:   sidecar,
+			tls:     istioMutualTLSSettings,
+			matches: []transportSocketMatch{
+				{
+					Name:   "hbone",
+					Socket: transportSocket{Name: internalUpstream, Inner: wellknown.TransportSocketRawBuffer},
+				},
+				{
+					Name:   "tlsMode-istio",
+					Socket: transportSocket{Name: wellknown.TransportSocketTLS},
+				},
+				{
+					Name:   "tlsMode-disabled",
+					Socket: transportSocket{Name: wellknown.TransportSocketRawBuffer},
+				},
+			},
+		},
+		{
+			name:  "sidecar: explicit TLS and HBONE",
+			proxy: sidecar,
+			tls:   simpleTLSSettingsWithCerts,
+			matches: []transportSocketMatch{
+				{
+					// HBONE over TLS
+					Name:   "hbone",
+					Socket: transportSocket{Name: internalUpstream, Inner: wellknown.TransportSocketTLS},
+				},
+				{
+					// Just TLS
+					Name:   "user",
+					Socket: transportSocket{Name: wellknown.TransportSocketTLS},
+				},
+			},
+		},
+	}
+
+	push := model.NewPushContext()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := NewClusterBuilder(tt.proxy, &model.PushRequest{Push: push}, model.DisabledCache{})
+			cb.sendHbone = true
+			opts := &buildClusterOpts{
+				mutable: newClusterWrapper(&cluster.Cluster{
+					ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
+				}),
+				mesh: push.Mesh,
+			}
+			cb.applyUpstreamTLSSettings(opts, tt.tls, tt.mtlsCtx)
+
+			translateSock := func(e *core.TransportSocket) transportSocket {
+				inner := ""
+				if e.Name == internalUpstream {
+					us := xdstest.UnmarshalAny[internalupstream.InternalUpstreamTransport](t, e.GetTypedConfig())
+					inner = (us).TransportSocket.Name
+				}
+				return transportSocket{Name: e.Name, Inner: inner}
+			}
+
+			if len(tt.matches) > 0 {
+				gotMatches := slices.Map(opts.mutable.cluster.TransportSocketMatches, func(e *cluster.Cluster_TransportSocketMatch) transportSocketMatch {
+					return transportSocketMatch{
+						Name:   e.Name,
+						Socket: translateSock(e.TransportSocket),
+					}
+				})
+				assert.Equal(t, tt.matches, gotMatches)
+			} else {
+				assert.Equal(t, 0, len(opts.mutable.cluster.TransportSocketMatches), "expected no matches")
+			}
+			if tt.socket != (transportSocket{}) {
+				assert.Equal(t, tt.socket, translateSock(opts.mutable.cluster.TransportSocket))
+			} else {
+				assert.Equal(t, true, opts.mutable.cluster.TransportSocket == nil, "expected no transport socket")
+			}
+			t.Log(xdstest.Dump(t, opts.mutable.cluster.TransportSocket))
+			t.Log(xdstest.DumpList(t, opts.mutable.cluster.TransportSocketMatches))
+		})
+	}
+}
+
 type expectedResult struct {
 	tlsContext *tls.UpstreamTlsContext
 	err        error
@@ -277,6 +428,31 @@ type expectedResult struct {
 
 // TestBuildUpstreamClusterTLSContext tests the buildUpstreamClusterTLSContext function
 func TestBuildUpstreamClusterTLSContext(t *testing.T) {
+	systemRoot := &tls.CommonTlsContext_CombinedValidationContext{
+		CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
+			DefaultValidationContext: &tls.CertificateValidationContext{MatchSubjectAltNames: util.StringToExactMatch([]string{"SAN"})},
+			ValidationContextSdsSecretConfig: &tls.SdsSecretConfig{
+				Name: "file-root:system",
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
+							GrpcServices: []*core.GrpcService{
+								{
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: "sds-grpc"},
+									},
+								},
+							},
+						},
+					},
+					ResourceApiVersion: core.ApiVersion_V3,
+				},
+			},
+		},
+	}
 	clientCert := "/path/to/cert"
 	rootCert := "path/to/cacert"
 	clientKey := "/path/to/key"
@@ -284,14 +460,12 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 	credentialName := "some-fake-credential"
 
 	testCases := []struct {
-		name                     string
-		opts                     *buildClusterOpts
-		tls                      *networking.ClientTLSSettings
-		h2                       bool
-		router                   bool
-		result                   expectedResult
-		enableAutoSni            bool
-		enableVerifyCertAtClient bool
+		name   string
+		opts   *buildClusterOpts
+		tls    *networking.ClientTLSSettings
+		h2     bool
+		router bool
+		result expectedResult
 	}{
 		{
 			name: "tls mode disabled",
@@ -472,6 +646,32 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
 							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
 						},
+						ValidationContextType: systemRoot,
+					},
+					Sni: "some-sni.com",
+				},
+				err: nil,
+			},
+		},
+		{
+			name: "tls mode SIMPLE, with no certs specified in tls insecure",
+			opts: &buildClusterOpts{
+				mutable: newTestCluster(),
+			},
+			tls: &networking.ClientTLSSettings{
+				Mode:               networking.ClientTLSSettings_SIMPLE,
+				SubjectAltNames:    []string{"SAN"},
+				Sni:                "some-sni.com",
+				InsecureSkipVerify: wrappers.Bool(true),
+			},
+			result: expectedResult{
+				tlsContext: &tls.UpstreamTlsContext{
+					CommonTlsContext: &tls.CommonTlsContext{
+						TlsParams: &tls.TlsParameters{
+							// if not specified, envoy use TLSv1_2 as default for client.
+							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
+							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
+						},
 						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
 					},
 					Sni: "some-sni.com",
@@ -496,12 +696,11 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
 							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
 						},
-						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
+						ValidationContextType: systemRoot,
 					},
 				},
 				err: nil,
 			},
-			enableAutoSni: true,
 		},
 		{
 			name: "tls mode SIMPLE, with AutoSni enabled and sni specified in tls",
@@ -521,13 +720,12 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
 							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
 						},
-						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
+						ValidationContextType: systemRoot,
 					},
 					Sni: "some-sni.com",
 				},
 				err: nil,
 			},
-			enableAutoSni: true,
 		},
 		{
 			name: "tls mode SIMPLE, with VerifyCert and AutoSni enabled with SubjectAltNames set",
@@ -547,14 +745,12 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
 							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
 						},
-						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
+						ValidationContextType: systemRoot,
 					},
 					Sni: "some-sni.com",
 				},
 				err: nil,
 			},
-			enableAutoSni:            true,
-			enableVerifyCertAtClient: true,
 		},
 		{
 			name: "tls mode SIMPLE, with VerifyCert and AutoSni enabled without SubjectAltNames set",
@@ -573,14 +769,36 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 							TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
 							TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
 						},
-						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
+						ValidationContextType: &tls.CommonTlsContext_CombinedValidationContext{
+							CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
+								DefaultValidationContext: &tls.CertificateValidationContext{},
+								ValidationContextSdsSecretConfig: &tls.SdsSecretConfig{
+									Name: "file-root:system",
+									SdsConfig: &core.ConfigSource{
+										ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+											ApiConfigSource: &core.ApiConfigSource{
+												ApiType:                   core.ApiConfigSource_GRPC,
+												SetNodeOnFirstMessageOnly: true,
+												TransportApiVersion:       core.ApiVersion_V3,
+												GrpcServices: []*core.GrpcService{
+													{
+														TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+															EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: "sds-grpc"},
+														},
+													},
+												},
+											},
+										},
+										ResourceApiVersion: core.ApiVersion_V3,
+									},
+								},
+							},
+						},
 					},
 					Sni: "some-sni.com",
 				},
 				err: nil,
 			},
-			enableAutoSni:            true,
-			enableVerifyCertAtClient: true,
 		},
 		{
 			name: "tls mode SIMPLE, with certs specified in tls",
@@ -915,7 +1133,7 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 								},
 							},
 						},
-						ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
+						ValidationContextType: systemRoot,
 					},
 					Sni: "some-sni.com",
 				},
@@ -1519,8 +1737,6 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableAutoSni, tc.enableAutoSni)
-			test.SetForTest(t, &features.VerifyCertAtClient, tc.enableVerifyCertAtClient)
 			var proxy *model.Proxy
 			if tc.router {
 				proxy = newGatewayProxy()
@@ -1537,11 +1753,11 @@ func TestBuildUpstreamClusterTLSContext(t *testing.T) {
 			} else if diff := cmp.Diff(tc.result.tlsContext, ret, protocmp.Transform()); diff != "" {
 				t.Errorf("got diff: `%v", diff)
 			}
-			if tc.enableAutoSni {
+			if tc.result.tlsContext != nil {
 				if len(tc.tls.Sni) == 0 {
 					assert.Equal(t, tc.opts.mutable.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSni, true)
 				}
-				if tc.enableVerifyCertAtClient && len(tc.tls.Sni) == 0 && len(tc.tls.SubjectAltNames) == 0 {
+				if len(tc.tls.Sni) == 0 && len(tc.tls.SubjectAltNames) == 0 {
 					assert.Equal(t, tc.opts.mutable.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSanValidation, true)
 				}
 			}
@@ -1708,6 +1924,30 @@ func TestBuildAutoMtlsSettings(t *testing.T) {
 				PrivateKey:        "/custom/key.pem",
 				ClientCertificate: "/custom/chain.pem",
 				CaCertificates:    "/custom/root.pem",
+			},
+			userSupplied,
+		},
+		{
+			"Metadata certs with Mesh Exteranl",
+			&networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				PrivateKey:        "/custom/external/key.pem",
+				ClientCertificate: "/custom/external/chain.pem",
+				CaCertificates:    "/custom/external/root.pem",
+			},
+			[]string{"custom.foo.com"},
+			"custom.foo.com",
+			&model.Proxy{Metadata: &model.NodeMetadata{
+				TLSClientCertChain: "/custom/meta/chain.pem",
+				TLSClientKey:       "/custom/meta/key.pem",
+				TLSClientRootCert:  "/custom/meta/root.pem",
+			}},
+			false, true, model.MTLSUnknown,
+			&networking.ClientTLSSettings{
+				Mode:              networking.ClientTLSSettings_MUTUAL,
+				PrivateKey:        "/custom/external/key.pem",
+				ClientCertificate: "/custom/external/chain.pem",
+				CaCertificates:    "/custom/external/root.pem",
 			},
 			userSupplied,
 		},

@@ -8,10 +8,10 @@ data:
       []
     template: |
       rewriteAppHTTPProbe: {{ valueOrDefault .Values.sidecarInjectorWebhook.rewriteAppHTTPProbe false }}
-      {{- if or (not .Values.pilot.cni.enabled) (not .Values.istio_cni.enabled) .Values.global.proxy.enableCoreDump }}
+      {{- if not .Values.pilot.cni.enabled .Values.global.proxy.enableCoreDump }}
       initContainers:
       {{ if ne (annotation .ObjectMeta `sidecar.istio.io/interceptionMode` .ProxyConfig.InterceptionMode) `NONE` }}
-      {{- if not (or .Values.pilot.cni.enabled .Values.istio_cni.enabled) }}
+      {{- if not .Values.pilot.cni.enabled }}
       - name: istio-init
       {{- if contains "/" .Values.global.proxy_init.image }}
         image: "{{ .Values.global.proxy_init.image }}"
@@ -47,6 +47,10 @@ data:
         {{ if (isset .ObjectMeta.Annotations `traffic.sidecar.istio.io/kubevirtInterfaces`) -}}
         - "-k"
         - "{{ index .ObjectMeta.Annotations `traffic.sidecar.istio.io/kubevirtInterfaces` }}"
+        {{ end -}}
+        {{ if (isset .ObjectMeta.Annotations `istio.io/reroute-virtual-interfaces`) -}}
+        - "-k"
+        - "{{ index .ObjectMeta.Annotations `istio.io/reroute-virtual-interfaces` }}"
         {{ end -}}
         imagePullPolicy: "{{ valueOrDefault .Values.global.imagePullPolicy `Always` }}"
       {{- if .Values.global.proxy_init.resources }}

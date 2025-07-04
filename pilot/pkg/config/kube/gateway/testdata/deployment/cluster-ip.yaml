@@ -13,7 +13,6 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-name: default
     istio.io/dataplane-mode: none
-    istio.io/gateway-name: default
   name: default-istio
   namespace: default
   ownerReferences:
@@ -31,7 +30,6 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-name: default
     istio.io/dataplane-mode: none
-    istio.io/gateway-name: default
   name: default
   namespace: default
   ownerReferences:
@@ -52,9 +50,9 @@ spec:
         prometheus.io/port: "15020"
         prometheus.io/scrape: "true"
       labels:
+        gateway.istio.io/managed: istio.io-gateway-controller
         gateway.networking.k8s.io/gateway-name: default
         istio.io/dataplane-mode: none
-        istio.io/gateway-name: default
         service.istio.io/canonical-name: default
         service.istio.io/canonical-revision: latest
         sidecar.istio.io/inject: "false"
@@ -134,6 +132,9 @@ spec:
         image: test/proxyv2:test
         name: istio-proxy
         ports:
+        - containerPort: 15020
+          name: metrics
+          protocol: TCP
         - containerPort: 15021
           name: status-port
           protocol: TCP
@@ -228,7 +229,6 @@ metadata:
     gateway.istio.io/managed: istio.io-gateway-controller
     gateway.networking.k8s.io/gateway-name: default
     istio.io/dataplane-mode: none
-    istio.io/gateway-name: default
   name: default
   namespace: default
   ownerReferences:
@@ -237,6 +237,7 @@ metadata:
     name: default
     uid: null
 spec:
+  ipFamilyPolicy: PreferDualStack
   ports:
   - appProtocol: tcp
     name: status-port

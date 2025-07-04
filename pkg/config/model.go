@@ -35,8 +35,13 @@ import (
 
 	"istio.io/api/label"
 	"istio.io/istio/pilot/pkg/util/protoconv"
+	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/ptr"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/gogoprotomarshal"
 	"istio.io/istio/pkg/util/protomarshal"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // Meta is metadata attached to each configuration unit.
@@ -106,6 +111,20 @@ type Config struct {
 	Status Status
 }
 
+type ObjectWithCluster[T any] struct {
+	ClusterID cluster.ID
+	Object    *T
+}
+
+// We can't refer to krt directly without causing an import cycle, but this function
+// implements an interface that allows the krt helper to know how to get the object key
+func (o ObjectWithCluster[T]) GetObjectKeyable() any {
+	if o.Object == nil {
+		return nil
+	}
+	return *o.Object
+}
+
 func LabelsInRevision(lbls map[string]string, rev string) bool {
 	configEnv, f := lbls[label.IoIstioRev.Name]
 	if !f {
@@ -119,6 +138,15 @@ func LabelsInRevision(lbls map[string]string, rev string) bool {
 	}
 	// Otherwise, only return true if revisions equal
 	return configEnv == rev
+}
+
+func LabelsInRevisionOrTags(lbls map[string]string, rev string, tags sets.Set[string]) bool {
+	if LabelsInRevision(lbls, rev) {
+		return true
+	}
+	configEnv := lbls[label.IoIstioRev.Name]
+	// Otherwise, only return true if revisions equal
+	return tags.Contains(configEnv)
 }
 
 func ObjectInRevision(o *Config, rev string) bool {
@@ -293,7 +321,7 @@ func DeepCopy(s any) any {
 	// but also not used by Istio at all.
 	if _, ok := s.(protoreflect.ProtoMessage); ok {
 		if pb, ok := s.(proto.Message); ok {
-			return proto.Clone(pb)
+			return protomarshal.Clone(pb)
 		}
 	}
 
@@ -315,6 +343,82 @@ func DeepCopy(s any) any {
 	}
 	data = reflect.ValueOf(data).Elem().Interface()
 	return data
+}
+
+func (c *Config) Equals(other *Config) bool {
+	am, bm := c.Meta, other.Meta
+	if am.GroupVersionKind != bm.GroupVersionKind {
+		return false
+	}
+	if am.UID != bm.UID {
+		return false
+	}
+	if am.Name != bm.Name {
+		return false
+	}
+	if am.Namespace != bm.Namespace {
+		return false
+	}
+	if am.Domain != bm.Domain {
+		return false
+	}
+	if !maps.Equal(am.Labels, bm.Labels) {
+		return false
+	}
+	if !maps.Equal(am.Annotations, bm.Annotations) {
+		return false
+	}
+	if am.ResourceVersion != bm.ResourceVersion {
+		return false
+	}
+	if am.CreationTimestamp != bm.CreationTimestamp {
+		return false
+	}
+	if !slices.EqualFunc(am.OwnerReferences, bm.OwnerReferences, func(a metav1.OwnerReference, b metav1.OwnerReference) bool {
+		if a.APIVersion != b.APIVersion {
+			return false
+		}
+		if a.Kind != b.Kind {
+			return false
+		}
+		if a.Name != b.Name {
+			return false
+		}
+		if a.UID != b.UID {
+			return false
+		}
+		if !ptr.Equal(a.Controller, b.Controller) {
+			return false
+		}
+		if !ptr.Equal(a.BlockOwnerDeletion, b.BlockOwnerDeletion) {
+			return false
+		}
+		return true
+	}) {
+		return false
+	}
+	if am.Generation != bm.Generation {
+		return false
+	}
+
+	if !equals(c.Spec, other.Spec) {
+		return false
+	}
+	if !equals(c.Status, other.Status) {
+		return false
+	}
+	return true
+}
+
+func equals(a any, b any) bool {
+	if _, ok := a.(protoreflect.ProtoMessage); ok {
+		if pb, ok := a.(proto.Message); ok {
+			return proto.Equal(pb, b.(proto.Message))
+		}
+	}
+	// We do NOT do gogo here. The reason is Kubernetes has hacked up almost-gogo types that do not allow Equals() calls
+
+	return reflect.DeepEqual(a, b)
 }
 
 type Status any
@@ -345,21 +449,16 @@ func (meta *Meta) ToObjectMeta() metav1.ObjectMeta {
 	}
 }
 
+func (meta Meta) DeepCopy() Meta {
+	nm := meta
+	nm.Labels = maps.Clone(meta.Labels)
+	nm.Annotations = maps.Clone(meta.Annotations)
+	return nm
+}
+
 func (c Config) DeepCopy() Config {
 	var clone Config
-	clone.Meta = c.Meta
-	if c.Labels != nil {
-		clone.Labels = make(map[string]string, len(c.Labels))
-		for k, v := range c.Labels {
-			clone.Labels[k] = v
-		}
-	}
-	if c.Annotations != nil {
-		clone.Annotations = make(map[string]string, len(c.Annotations))
-		for k, v := range c.Annotations {
-			clone.Annotations[k] = v
-		}
-	}
+	clone.Meta = c.Meta.DeepCopy()
 	clone.Spec = DeepCopy(c.Spec)
 	if c.Status != nil {
 		clone.Status = DeepCopy(c.Status)

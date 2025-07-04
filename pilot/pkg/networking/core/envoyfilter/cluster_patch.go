@@ -31,11 +31,11 @@ import (
 )
 
 // ApplyClusterMerge processes the MERGE operation and merges the supplied configuration to the matched clusters.
-func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.EnvoyFilterWrapper,
+func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.MergedEnvoyFilterWrapper,
 	c *cluster.Cluster, hosts []host.Name,
 ) (out *cluster.Cluster) {
 	defer runtime.HandleCrash(runtime.LogPanic, func(any) {
-		log.Errorf("clusters patch %s/%s caused panic, so the patches did not take effect", efw.Namespace, efw.Name)
+		log.Errorf("clusters patch caused panic, so the patches did not take effect")
 		IncrementEnvoyFilterErrorMetric(Cluster)
 	})
 	// In case the patches cause panic, use the clusters generated before to reduce the influence.
@@ -45,6 +45,12 @@ func ApplyClusterMerge(pctx networking.EnvoyFilter_PatchContext, efw *model.Envo
 	}
 	for _, cp := range efw.Patches[networking.EnvoyFilter_CLUSTER] {
 		applied := false
+		// For removed patches, skip the merge if the patch matches.
+		if cp.Operation == networking.EnvoyFilter_Patch_REMOVE &&
+			commonConditionMatch(pctx, cp) &&
+			clusterMatch(c, cp, hosts) {
+			return nil
+		}
 		if cp.Operation != networking.EnvoyFilter_Patch_MERGE {
 			IncrementEnvoyFilterMetric(cp.Key(), Cluster, applied)
 			continue
@@ -120,24 +126,8 @@ func mergeTransportSocketCluster(c *cluster.Cluster, cp *model.EnvoyFilterConfig
 	return true, nil
 }
 
-// ShouldKeepCluster checks if there is a REMOVE patch on the cluster, returns false if there is one so that it is removed.
-func ShouldKeepCluster(pctx networking.EnvoyFilter_PatchContext, efw *model.EnvoyFilterWrapper, c *cluster.Cluster, hosts []host.Name) bool {
-	if efw == nil {
-		return true
-	}
-	for _, cp := range efw.Patches[networking.EnvoyFilter_CLUSTER] {
-		if cp.Operation != networking.EnvoyFilter_Patch_REMOVE {
-			continue
-		}
-		if commonConditionMatch(pctx, cp) && clusterMatch(c, cp, hosts) {
-			return false
-		}
-	}
-	return true
-}
-
 // InsertedClusters collects all clusters that are added via ADD operation and match the patch context.
-func InsertedClusters(pctx networking.EnvoyFilter_PatchContext, efw *model.EnvoyFilterWrapper) []*cluster.Cluster {
+func InsertedClusters(pctx networking.EnvoyFilter_PatchContext, efw *model.MergedEnvoyFilterWrapper) []*cluster.Cluster {
 	if efw == nil {
 		return nil
 	}

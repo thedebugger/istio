@@ -17,6 +17,7 @@ package krt
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,23 +25,62 @@ import (
 	acmetav1 "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/tools/cache"
 
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/ptr"
 )
 
+type ObjectDecorator interface {
+	GetObjectKeyable() any
+}
+
+func getTypedKey[O any](a O) Key[O] {
+	return Key[O](GetKey(a))
+}
+
 // GetKey returns the key for the provided object.
 // If there is none, this will panic.
-func GetKey[O any](a O) Key[O] {
-	if k, ok := tryGetKey[O](a); ok {
-		return k
+func GetKey[O any](a O) string {
+	as, ok := any(a).(string)
+	if ok {
+		return as
 	}
-
-	// Kubernetes types are pointers, which means our types would be double pointers
-	// Allow flattening
-	ao, ok := any(&a).(controllers.Object)
+	ao, ok := any(a).(controllers.Object)
 	if ok {
 		k, _ := cache.MetaNamespaceKeyFunc(ao)
-		return Key[O](k)
+		return k
+	}
+	ac, ok := any(a).(config.Config)
+	if ok {
+		return keyFunc(ac.Name, ac.Namespace)
+	}
+	acp, ok := any(a).(*config.Config)
+	if ok {
+		return keyFunc(acp.Name, acp.Namespace)
+	}
+	arn, ok := any(a).(ResourceNamer)
+	if ok {
+		return arn.ResourceName()
+	}
+	auid, ok := any(a).(uidable)
+	if ok {
+		return strconv.FormatUint(uint64(auid.uid()), 10)
+	}
+
+	akclient, ok := any(a).(kube.Client)
+	if ok {
+		return string(akclient.ClusterID())
+	}
+
+	aobjDecorator, ok := any(a).(ObjectDecorator)
+	if ok {
+		return GetKey(aobjDecorator.GetObjectKeyable())
+	}
+
+	ack := GetApplyConfigKey(a)
+	if ack != nil {
+		return *ack
 	}
 	panic(fmt.Sprintf("Cannot get Key, got %T", a))
 }
@@ -70,7 +110,7 @@ func (n Named) GetNamespace() string {
 
 // GetApplyConfigKey returns the key for the ApplyConfig.
 // If there is none, this will return nil.
-func GetApplyConfigKey[O any](a O) *Key[O] {
+func GetApplyConfigKey[O any](a O) *string {
 	// Reflection is expensive; short circuit here
 	if !strings.HasSuffix(ptr.TypeName[O](), "ApplyConfiguration") {
 		return nil
@@ -90,9 +130,9 @@ func GetApplyConfigKey[O any](a O) *Key[O] {
 	}
 	meta := specField.Interface().(*acmetav1.ObjectMetaApplyConfiguration)
 	if meta.Namespace != nil && len(*meta.Namespace) > 0 {
-		return ptr.Of(Key[O](*meta.Namespace + "/" + *meta.Name))
+		return ptr.Of(*meta.Namespace + "/" + *meta.Name)
 	}
-	return ptr.Of(Key[O](*meta.Name))
+	return meta.Name
 }
 
 // keyFunc is the internal API key function that returns "namespace"/"name" or

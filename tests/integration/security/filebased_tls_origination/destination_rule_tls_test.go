@@ -36,7 +36,7 @@ func TestDestinationRuleTls(t *testing.T) {
 
 			// Setup our destination rule, enforcing TLS to "server". These certs will be created/mounted below.
 			t.ConfigIstio().YAML(ns.Name(), `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: db-mtls
@@ -53,7 +53,6 @@ spec:
 `).ApplyOrFail(t)
 
 			for _, portName := range []string{"grpc", "http", "tcp"} {
-				portName := portName
 				t.NewSubTest(portName).Run(func(t framework.TestContext) {
 					opts := echo.CallOptions{
 						To:    server,

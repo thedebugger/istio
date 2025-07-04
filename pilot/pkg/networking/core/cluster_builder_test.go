@@ -15,8 +15,8 @@
 package core
 
 import (
-	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -27,8 +27,10 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	cares "github.com/envoyproxy/go-control-plane/envoy/extensions/network/dns_resolver/cares/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	http "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
+	xdstype "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -284,7 +286,7 @@ func TestApplyDestinationRule(t *testing.T) {
 				},
 			},
 			meshConfig: &meshconfig.MeshConfig{
-				OutboundClusterStatName: "%SERVICE%_%SUBSET_NAME%_%SERVICE_PORT_NAME%_%SERVICE_PORT%;",
+				OutboundClusterStatName: "%SERVICE%_%SUBSET_NAME%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
 				InboundTrafficPolicy:    &meshconfig.MeshConfig_InboundTrafficPolicy{},
 				EnableAutoMtls: &wrappers.BoolValue{
 					Value: false,
@@ -784,6 +786,103 @@ func TestApplyDestinationRule(t *testing.T) {
 				EdsClusterConfig:     &cluster.Cluster_EdsClusterConfig{ServiceName: "outbound|8080|v1|foo.default.svc.cluster.local"},
 			}},
 		},
+		{
+			name:        "destination rule with empty retry budget",
+			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
+			clusterMode: DefaultClusterMode,
+			service:     service,
+			port:        servicePort[0],
+			proxyView:   model.ProxyViewAll,
+			destRule: &networking.DestinationRule{
+				Host: "foo.default.svc.cluster.local",
+				Subsets: []*networking.Subset{
+					{
+						Name:   "foobar",
+						Labels: map[string]string{"foo": "bar"},
+						TrafficPolicy: &networking.TrafficPolicy{
+							ConnectionPool: &networking.ConnectionPoolSettings{
+								Http: &networking.ConnectionPoolSettings_HTTPSettings{
+									MaxRetries: 10,
+								},
+							},
+							RetryBudget: &networking.TrafficPolicy_RetryBudget{},
+						},
+					},
+				},
+			},
+			expectedSubsetClusters: []*cluster.Cluster{
+				{
+					Name:                 "outbound|8080|foobar|foo.default.svc.cluster.local",
+					ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
+					EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+						ServiceName: "outbound|8080|foobar|foo.default.svc.cluster.local",
+					},
+					CircuitBreakers: &cluster.CircuitBreakers{
+						Thresholds: []*cluster.CircuitBreakers_Thresholds{
+							{
+								MaxRetries: &wrappers.UInt32Value{
+									Value: 10,
+								},
+								RetryBudget: &cluster.CircuitBreakers_Thresholds_RetryBudget{
+									BudgetPercent:       &xdstype.Percent{Value: 0.2},
+									MinRetryConcurrency: &wrappers.UInt32Value{Value: 3},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:        "destination rule with retry budget",
+			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
+			clusterMode: DefaultClusterMode,
+			service:     service,
+			port:        servicePort[0],
+			proxyView:   model.ProxyViewAll,
+			destRule: &networking.DestinationRule{
+				Host: "foo.default.svc.cluster.local",
+				Subsets: []*networking.Subset{
+					{
+						Name:   "foobar",
+						Labels: map[string]string{"foo": "bar"},
+						TrafficPolicy: &networking.TrafficPolicy{
+							ConnectionPool: &networking.ConnectionPoolSettings{
+								Http: &networking.ConnectionPoolSettings_HTTPSettings{
+									MaxRetries: 10,
+								},
+							},
+							RetryBudget: &networking.TrafficPolicy_RetryBudget{
+								Percent:             wrappers.Double(0.3),
+								MinRetryConcurrency: uint32(4),
+							},
+						},
+					},
+				},
+			},
+			expectedSubsetClusters: []*cluster.Cluster{
+				{
+					Name:                 "outbound|8080|foobar|foo.default.svc.cluster.local",
+					ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
+					EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+						ServiceName: "outbound|8080|foobar|foo.default.svc.cluster.local",
+					},
+					CircuitBreakers: &cluster.CircuitBreakers{
+						Thresholds: []*cluster.CircuitBreakers_Thresholds{
+							{
+								MaxRetries: &wrappers.UInt32Value{
+									Value: 10,
+								},
+								RetryBudget: &cluster.CircuitBreakers_Thresholds_RetryBudget{
+									BudgetPercent:       &xdstype.Percent{Value: 0.3},
+									MinRetryConcurrency: &wrappers.UInt32Value{Value: 4},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range cases {
@@ -794,7 +893,22 @@ func TestApplyDestinationRule(t *testing.T) {
 					ServicePort: tt.port,
 					Endpoint: &model.IstioEndpoint{
 						ServicePortName: tt.port.Name,
-						Address:         "192.168.1.1",
+						Addresses:       []string{"192.168.1.1"},
+						EndpointPort:    10001,
+						Locality: model.Locality{
+							ClusterID: "",
+							Label:     "region1/zone1/subzone1",
+						},
+						Labels:  tt.service.Attributes.Labels,
+						TLSMode: model.IstioMutualTLSModeLabel,
+					},
+				},
+				{
+					Service:     tt.service,
+					ServicePort: tt.port,
+					Endpoint: &model.IstioEndpoint{
+						ServicePortName: tt.port.Name,
+						Addresses:       []string{"192.168.1.2", "2001:1::2"},
 						EndpointPort:    10001,
 						Locality: model.Locality{
 							ClusterID: "",
@@ -1259,6 +1373,86 @@ func TestBuildDefaultCluster(t *testing.T) {
 	}
 }
 
+func TestClusterDnsConfig(t *testing.T) {
+	servicePort := &model.Port{
+		Name:     "default",
+		Port:     8080,
+		Protocol: protocol.HTTP,
+	}
+
+	endpoints := []*endpoint.LocalityLbEndpoints{
+		{
+			Locality: &core.Locality{
+				Region:  "region1",
+				Zone:    "zone1",
+				SubZone: "subzone1",
+			},
+			LbEndpoints: []*endpoint.LbEndpoint{},
+			LoadBalancingWeight: &wrappers.UInt32Value{
+				Value: 1,
+			},
+			Priority: 0,
+		},
+	}
+
+	cases := []struct {
+		name          string
+		udpMaxQueries uint32
+		dnsJitter     time.Duration
+		proxy         *model.Proxy
+	}{
+		{
+			name:          "Dual stack proxy",
+			udpMaxQueries: 99,
+			dnsJitter:     0 * time.Millisecond,
+			proxy:         &dualStackProxy,
+		},
+		{
+			name:          "IPv4 proxy",
+			udpMaxQueries: 0,
+			dnsJitter:     1 * time.Millisecond,
+			proxy:         getProxy(),
+		},
+		{
+			name:          "IPv6 proxy",
+			udpMaxQueries: 1,
+			dnsJitter:     5 * time.Millisecond,
+			proxy:         getIPv6Proxy(),
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			test.SetForTest(t, &features.PilotDNSCaresUDPMaxQueries, tt.udpMaxQueries)
+			test.SetForTest(t, &features.PilotDNSJitterDurationEnv, tt.dnsJitter)
+			mesh := testMesh()
+			cg := NewConfigGenTest(t, TestOptions{MeshConfig: mesh})
+			cb := NewClusterBuilder(cg.SetupProxy(tt.proxy), &model.PushRequest{Push: cg.PushContext()}, nil)
+			service := &model.Service{
+				Ports: model.PortList{
+					servicePort,
+				},
+				Hostname:     "host",
+				MeshExternal: false,
+				Attributes:   model.ServiceAttributes{Name: "svc", Namespace: "default"},
+			}
+			defaultCluster := cb.buildCluster("my-cluster", cluster.Cluster_STRICT_DNS, endpoints, model.TrafficDirectionOutbound, servicePort, service, nil, "")
+			c := defaultCluster.build()
+
+			dnsConfig := new(cares.CaresDnsResolverConfig)
+			if err := c.TypedDnsResolverConfig.TypedConfig.UnmarshalTo(dnsConfig); err != nil {
+				t.Errorf("Unexpected TypedDnsResolverConfig type, expected cares dns resolver, got: %v", c.TypedDnsResolverConfig.TypedConfig.TypeUrl)
+			}
+			if dnsConfig.UdpMaxQueries.Value != tt.udpMaxQueries {
+				t.Errorf("Unexpected UdpMaxQueries, expected : %v, got: %v", tt.udpMaxQueries, dnsConfig.UdpMaxQueries.Value)
+			}
+			//nolint:staticcheck // DnsJitter is deprecated
+			if c.DnsJitter.AsDuration() != tt.dnsJitter {
+				t.Errorf("Unexpected dnsJitter, expected : %v, got: %v", tt.dnsJitter, c.DnsJitter.AsDuration())
+			}
+		})
+	}
+}
+
 func TestClusterDnsLookupFamily(t *testing.T) {
 	servicePort := &model.Port{
 		Name:     "default",
@@ -1353,15 +1547,17 @@ func TestClusterDnsLookupFamily(t *testing.T) {
 				Attributes:   model.ServiceAttributes{Name: "svc", Namespace: "default"},
 			}
 			defaultCluster := cb.buildCluster(tt.clusterName, tt.discovery, endpoints, model.TrafficDirectionOutbound, servicePort, service, nil, "")
+			c := defaultCluster.build()
 
-			if defaultCluster.build().DnsLookupFamily != tt.expectedFamily {
-				t.Errorf("Unexpected DnsLookupFamily, got: %v, want: %v", defaultCluster.build().DnsLookupFamily, tt.expectedFamily)
+			if c.DnsLookupFamily != tt.expectedFamily {
+				t.Errorf("Unexpected DnsLookupFamily, got: %v, want: %v", c.DnsLookupFamily, tt.expectedFamily)
 			}
 		})
 	}
 }
 
 func TestBuildLocalityLbEndpoints(t *testing.T) {
+	test.SetForTest(t, &features.EnableDualStack, true)
 	proxy := &model.Proxy{
 		Metadata: &model.NodeMetadata{
 			ClusterID:            "cluster-1",
@@ -1412,7 +1608,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.1",
+						Addresses:    []string{"192.168.1.1"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-1",
 						Namespace:    "namespace-1",
@@ -1428,7 +1624,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.2",
+						Addresses:    []string{"192.168.1.2", "2001:1::2"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-2",
 						Namespace:    "namespace-2",
@@ -1444,7 +1640,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.3",
+						Addresses:    []string{"192.168.1.3"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-3",
 						Namespace:    "namespace-3",
@@ -1460,7 +1656,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.4",
+						Addresses:    []string{"192.168.1.4"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-1",
 						Namespace:    "namespace-1",
@@ -1517,6 +1713,20 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 											},
 										},
 									},
+									AdditionalAddresses: []*endpoint.Endpoint_AdditionalAddress{
+										{
+											Address: &core.Address{
+												Address: &core.Address_SocketAddress{
+													SocketAddress: &core.SocketAddress{
+														Address: "2001:1::2",
+														PortSpecifier: &core.SocketAddress_PortValue{
+															PortValue: 10001,
+														},
+													},
+												},
+											},
+										},
+									},
 								},
 							},
 							Metadata: buildMetadata("nw-1", "", "workload-2", "namespace-2", "cluster-2", map[string]string{}),
@@ -1568,7 +1778,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.1",
+						Addresses:    []string{"192.168.1.1"},
 						EndpointPort: 10001,
 						Locality: model.Locality{
 							ClusterID: "cluster-1",
@@ -1581,7 +1791,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.2",
+						Addresses:    []string{"192.168.1.2"},
 						EndpointPort: 10001,
 						Locality: model.Locality{
 							ClusterID: "cluster-2",
@@ -1635,7 +1845,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.1",
+						Addresses:    []string{"192.168.1.1"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-1",
 						Namespace:    "namespace-1",
@@ -1655,7 +1865,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.2",
+						Addresses:    []string{"192.168.1.2"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-2",
 						Namespace:    "namespace-2",
@@ -1675,7 +1885,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.3",
+						Addresses:    []string{"192.168.1.3"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-3",
 						Namespace:    "namespace-3",
@@ -1695,7 +1905,7 @@ func TestBuildLocalityLbEndpoints(t *testing.T) {
 					Service:     service,
 					ServicePort: servicePort,
 					Endpoint: &model.IstioEndpoint{
-						Address:      "192.168.1.4",
+						Addresses:    []string{"192.168.1.4"},
 						EndpointPort: 10001,
 						WorkloadName: "workload-1",
 						Namespace:    "namespace-1",
@@ -1800,7 +2010,7 @@ func drWithLabels(lbls labels.Instance) *model.ConsolidatedDestRule {
 				Labels: lbls,
 			}},
 		},
-	})
+	}, nil)
 }
 
 func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
@@ -1849,7 +2059,7 @@ func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
 			Service:     service,
 			ServicePort: servicePort,
 			Endpoint: &model.IstioEndpoint{
-				Address:      "192.168.1.1",
+				Addresses:    []string{"192.168.1.1"},
 				EndpointPort: 10001,
 				WorkloadName: "workload-1",
 				Namespace:    "namespace-1",
@@ -1869,7 +2079,7 @@ func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
 			Service:     service,
 			ServicePort: servicePort,
 			Endpoint: &model.IstioEndpoint{
-				Address:      "192.168.1.2",
+				Addresses:    []string{"192.168.1.2"},
 				EndpointPort: 10001,
 				WorkloadName: "workload-2",
 				Namespace:    "namespace-2",
@@ -1889,7 +2099,7 @@ func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
 			Service:     service,
 			ServicePort: servicePort,
 			Endpoint: &model.IstioEndpoint{
-				Address:      "192.168.1.3",
+				Addresses:    []string{"192.168.1.3"},
 				EndpointPort: 10001,
 				WorkloadName: "workload-3",
 				Namespace:    "namespace-3",
@@ -1909,7 +2119,7 @@ func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
 			Service:     service,
 			ServicePort: servicePort,
 			Endpoint: &model.IstioEndpoint{
-				Address:      "192.168.1.4",
+				Addresses:    []string{"192.168.1.4"},
 				EndpointPort: 10001,
 				WorkloadName: "workload-1",
 				Namespace:    "namespace-1",
@@ -1951,6 +2161,229 @@ func TestConcurrentBuildLocalityLbEndpoints(t *testing.T) {
 										Address: "192.168.1.1",
 										PortSpecifier: &core.SocketAddress_PortValue{
 											PortValue: 10001,
+										},
+									},
+								},
+							},
+						},
+					},
+					Metadata: buildMetadata("nw-0", "", "workload-1", "test-ns", "cluster-1", updatedLbls),
+					LoadBalancingWeight: &wrappers.UInt32Value{
+						Value: 30,
+					},
+				},
+			},
+		},
+	}
+
+	sortEndpoints := func(endpoints []*endpoint.LocalityLbEndpoints) {
+		sort.SliceStable(endpoints, func(i, j int) bool {
+			if strings.Compare(endpoints[i].Locality.Region, endpoints[j].Locality.Region) < 0 {
+				return true
+			}
+			if strings.Compare(endpoints[i].Locality.Zone, endpoints[j].Locality.Zone) < 0 {
+				return true
+			}
+			return strings.Compare(endpoints[i].Locality.SubZone, endpoints[j].Locality.SubZone) < 0
+		})
+	}
+
+	cg := NewConfigGenTest(t, TestOptions{
+		MeshConfig: testMesh(),
+		Services:   []*model.Service{service},
+		Instances:  instances,
+	})
+
+	cb := NewClusterBuilder(cg.SetupProxy(proxy), &model.PushRequest{Push: cg.PushContext()}, nil)
+	wg := sync.WaitGroup{}
+	wg.Add(5)
+	var actual []*endpoint.LocalityLbEndpoints
+	mu := sync.Mutex{}
+	for i := 0; i < 5; i++ {
+		go func() {
+			eb := endpoints.NewCDSEndpointBuilder(
+				proxy, cb.req.Push,
+				"outbound|8080|v1|foo.com",
+				model.TrafficDirectionOutbound, "v1", "foo.com", 8080,
+				service, dr,
+			)
+			eps := eb.FromServiceEndpoints()
+			mu.Lock()
+			actual = eps
+			mu.Unlock()
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	sortEndpoints(actual)
+	if v := cmp.Diff(expected, actual, protocmp.Transform()); v != "" {
+		t.Fatalf("Expected (-) != actual (+):\n%s", v)
+	}
+}
+
+func TestConcurrentBuildLocalityLbEndpointsWithMulAddrs(t *testing.T) {
+	test.SetForTest(t, &features.CanonicalServiceForMeshExternalServiceEntry, true)
+	test.SetForTest(t, &features.EnableDualStack, true)
+	proxy := &model.Proxy{
+		Metadata: &model.NodeMetadata{
+			ClusterID:            "cluster-1",
+			RequestedNetworkView: []string{"nw-0", "nw-1"},
+		},
+	}
+	servicePort := &model.Port{
+		Name:     "default",
+		Port:     8080,
+		Protocol: protocol.HTTP,
+	}
+	service := &model.Service{
+		Hostname: host.Name("*.example.org"),
+		Ports:    model.PortList{servicePort},
+		Attributes: model.ServiceAttributes{
+			Name:      "TestService",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"service.istio.io/canonical-name": "example-service"},
+		},
+		MeshExternal: true,
+		Resolution:   model.DNSLB,
+	}
+	dr := drWithLabels(labels.Instance{"version": "v1"})
+
+	buildMetadata := func(networkID network.ID, tlsMode, workloadname, namespace string,
+		clusterID istiocluster.ID, lbls labels.Instance,
+	) *core.Metadata {
+		newmeta := &core.Metadata{}
+		util.AppendLbEndpointMetadata(&model.EndpointMetadata{
+			Network:      networkID,
+			TLSMode:      tlsMode,
+			WorkloadName: workloadname,
+			Namespace:    namespace,
+			ClusterID:    clusterID,
+			Labels:       lbls,
+		}, newmeta)
+		return newmeta
+	}
+
+	instances := []*model.ServiceInstance{
+		{
+			Service:     service,
+			ServicePort: servicePort,
+			Endpoint: &model.IstioEndpoint{
+				Addresses:    []string{"192.168.1.1", "2001:1::1"},
+				EndpointPort: 10001,
+				WorkloadName: "workload-1",
+				Namespace:    "namespace-1",
+				Labels: map[string]string{
+					"version": "v1",
+					"app":     "example",
+				},
+				Locality: model.Locality{
+					ClusterID: "cluster-1",
+					Label:     "region1/zone1/subzone1",
+				},
+				LbWeight: 30,
+				Network:  "nw-0",
+			},
+		},
+		{
+			Service:     service,
+			ServicePort: servicePort,
+			Endpoint: &model.IstioEndpoint{
+				Addresses:    []string{"192.168.1.2"},
+				EndpointPort: 10001,
+				WorkloadName: "workload-2",
+				Namespace:    "namespace-2",
+				Labels: map[string]string{
+					"version": "v2",
+					"app":     "example",
+				},
+				Locality: model.Locality{
+					ClusterID: "cluster-2",
+					Label:     "region1/zone1/subzone1",
+				},
+				LbWeight: 30,
+				Network:  "nw-1",
+			},
+		},
+		{
+			Service:     service,
+			ServicePort: servicePort,
+			Endpoint: &model.IstioEndpoint{
+				Addresses:    []string{"192.168.1.3"},
+				EndpointPort: 10001,
+				WorkloadName: "workload-3",
+				Namespace:    "namespace-3",
+				Labels: map[string]string{
+					"version": "v3",
+					"app":     "example",
+				},
+				Locality: model.Locality{
+					ClusterID: "cluster-3",
+					Label:     "region2/zone1/subzone1",
+				},
+				LbWeight: 40,
+				Network:  "",
+			},
+		},
+		{
+			Service:     service,
+			ServicePort: servicePort,
+			Endpoint: &model.IstioEndpoint{
+				Addresses:    []string{"192.168.1.4"},
+				EndpointPort: 10001,
+				WorkloadName: "workload-1",
+				Namespace:    "namespace-1",
+				Labels: map[string]string{
+					"version": "v4",
+					"app":     "example",
+				},
+				Locality: model.Locality{
+					ClusterID: "cluster-1",
+					Label:     "region1/zone1/subzone1",
+				},
+				LbWeight: 30,
+				Network:  "filtered-out",
+			},
+		},
+	}
+
+	updatedLbls := labels.Instance{
+		"app":                                "example",
+		model.IstioCanonicalServiceLabelName: "example-service",
+	}
+	expected := []*endpoint.LocalityLbEndpoints{
+		{
+			Locality: &core.Locality{
+				Region:  "region1",
+				Zone:    "zone1",
+				SubZone: "subzone1",
+			},
+			LoadBalancingWeight: &wrappers.UInt32Value{
+				Value: 30,
+			},
+			LbEndpoints: []*endpoint.LbEndpoint{
+				{
+					HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+						Endpoint: &endpoint.Endpoint{
+							Address: &core.Address{
+								Address: &core.Address_SocketAddress{
+									SocketAddress: &core.SocketAddress{
+										Address: "192.168.1.1",
+										PortSpecifier: &core.SocketAddress_PortValue{
+											PortValue: 10001,
+										},
+									},
+								},
+							},
+							AdditionalAddresses: []*endpoint.Endpoint_AdditionalAddress{
+								{
+									Address: &core.Address{
+										Address: &core.Address_SocketAddress{
+											SocketAddress: &core.SocketAddress{
+												Address: "2001:1::1",
+												PortSpecifier: &core.SocketAddress_PortValue{
+													PortValue: 10001,
+												},
+											},
 										},
 									},
 								},
@@ -2181,6 +2614,18 @@ func TestShouldH2Upgrade(t *testing.T) {
 			upgrade: false,
 		},
 		{
+			name:        "mesh upgrade - dr useClientProtocol",
+			clusterName: "bar",
+			port:        &model.Port{Protocol: protocol.HTTP},
+			mesh:        &meshconfig.MeshConfig{H2UpgradePolicy: meshconfig.MeshConfig_UPGRADE},
+			connectionPool: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					UseClientProtocol: true,
+				},
+			},
+			upgrade: false,
+		},
+		{
 			name:        "non-http",
 			clusterName: "bar",
 			port:        &model.Port{Protocol: protocol.Unsupported},
@@ -2229,11 +2674,11 @@ func TestIsHttp2Cluster(t *testing.T) {
 		},
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			isHttp2Cluster := isHttp2Cluster(test.cluster) // revive:disable-line
-			if isHttp2Cluster != test.isHttp2Cluster {
-				t.Errorf("got: %t, want: %t", isHttp2Cluster, test.isHttp2Cluster)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isHttp2Cluster := isHttp2Cluster(tt.cluster) // revive:disable-line
+			if isHttp2Cluster != tt.isHttp2Cluster {
+				t.Errorf("got: %t, want: %t", isHttp2Cluster, tt.isHttp2Cluster)
 			}
 		})
 	}
@@ -2270,10 +2715,9 @@ func TestApplyDestinationRuleOSCACert(t *testing.T) {
 		proxyView                 model.ProxyView
 		destRule                  *networking.DestinationRule
 		expectedCaCertificateName string
-		enableVerifyCertAtClient  bool
 	}{
 		{
-			name:        "VerifyCertAtClient set and destination rule with empty string CaCertificates",
+			name:        "destination rule with empty string CaCertificates",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -2295,10 +2739,9 @@ func TestApplyDestinationRuleOSCACert(t *testing.T) {
 				},
 			},
 			expectedCaCertificateName: "system",
-			enableVerifyCertAtClient:  true,
 		},
 		{
-			name:        "VerifyCertAtClient set and destination rule with CaCertificates",
+			name:        "destination rule with CaCertificates",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -2320,10 +2763,9 @@ func TestApplyDestinationRuleOSCACert(t *testing.T) {
 				},
 			},
 			expectedCaCertificateName: "root-cert.pem",
-			enableVerifyCertAtClient:  true,
 		},
 		{
-			name:        "VerifyCertAtClient set and destination rule without CaCertificates",
+			name:        "destination rule without CaCertificates",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -2344,63 +2786,11 @@ func TestApplyDestinationRuleOSCACert(t *testing.T) {
 				},
 			},
 			expectedCaCertificateName: "system",
-			enableVerifyCertAtClient:  true,
-		},
-		{
-			name:        "VerifyCertAtClient false and destination rule without CaCertificates",
-			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
-			clusterMode: DefaultClusterMode,
-			service:     service,
-			port:        servicePort[0],
-			proxyView:   model.ProxyViewAll,
-			destRule: &networking.DestinationRule{
-				Host: "foo.default.svc.cluster.local",
-				TrafficPolicy: &networking.TrafficPolicy{
-					ConnectionPool: &networking.ConnectionPoolSettings{
-						Http: &networking.ConnectionPoolSettings_HTTPSettings{
-							MaxRetries:        10,
-							UseClientProtocol: true,
-						},
-					},
-					Tls: &networking.ClientTLSSettings{
-						Mode: networking.ClientTLSSettings_SIMPLE,
-					},
-				},
-			},
-			expectedCaCertificateName: "",
-			enableVerifyCertAtClient:  false,
-		},
-		{
-			name:        "VerifyCertAtClient false and destination rule with CaCertificates",
-			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
-			clusterMode: DefaultClusterMode,
-			service:     service,
-			port:        servicePort[0],
-			proxyView:   model.ProxyViewAll,
-			destRule: &networking.DestinationRule{
-				Host: "foo.default.svc.cluster.local",
-				TrafficPolicy: &networking.TrafficPolicy{
-					ConnectionPool: &networking.ConnectionPoolSettings{
-						Http: &networking.ConnectionPoolSettings_HTTPSettings{
-							MaxRetries:        10,
-							UseClientProtocol: true,
-						},
-					},
-					Tls: &networking.ClientTLSSettings{
-						CaCertificates: "root-cert.pem",
-						Mode:           networking.ClientTLSSettings_SIMPLE,
-					},
-				},
-			},
-			expectedCaCertificateName: "root-cert.pem",
-			enableVerifyCertAtClient:  false,
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			test.SetForTest(t, &features.VerifyCertAtClient, tt.enableVerifyCertAtClient)
-
 			var cfg *config.Config
 			if tt.destRule != nil {
 				cfg = &config.Config{
@@ -2416,34 +2806,9 @@ func TestApplyDestinationRuleOSCACert(t *testing.T) {
 				ConfigPointers: []*config.Config{cfg},
 				Services:       []*model.Service{tt.service},
 			})
-			proxy := cg.SetupProxy(nil)
-			cb := NewClusterBuilder(proxy, &model.PushRequest{Push: cg.PushContext()}, nil)
-
-			tt.cluster.CommonLbConfig = &cluster.Cluster_CommonLbConfig{}
-
-			ec := newClusterWrapper(tt.cluster)
-			destRule := proxy.SidecarScope.DestinationRule(model.TrafficDirectionOutbound, proxy, tt.service.Hostname)
-
-			eb := endpoints.NewCDSEndpointBuilder(proxy, cb.req.Push, tt.cluster.Name,
-				model.TrafficDirectionOutbound, "", service.Hostname, tt.port.Port,
-				service, destRule)
-
-			// ACT
-			_ = cb.applyDestinationRule(ec, tt.clusterMode, tt.service, tt.port, eb, destRule.GetRule(), nil)
-
-			byteArray, err := config.ToJSON(destRule.GetRule().Spec)
-			if err != nil {
-				t.Errorf("Could not parse destination rule: %v", err)
-			}
-			dr := &networking.DestinationRule{}
-			err = json.Unmarshal(byteArray, dr)
-			if err != nil {
-				t.Errorf("Could not unmarshal destination rule: %v", err)
-			}
-			ca := dr.TrafficPolicy.Tls.CaCertificates
-			if ca != tt.expectedCaCertificateName {
-				t.Errorf("%v: got unexpected caCertitifcates field. Expected (%v), received (%v)", tt.name, tt.expectedCaCertificateName, ca)
-			}
+			cl := xdstest.ExtractCluster("outbound|8080||foo.default.svc.cluster.local", cg.Clusters(cg.SetupProxy(nil)))
+			_, ca, _ := strings.Cut(xdstest.ExtractClusterSecretResources(t, cl)[0], "file-root:")
+			assert.Equal(t, ca, tt.expectedCaCertificateName)
 		})
 	}
 }
@@ -2502,7 +2867,7 @@ func TestApplyTCPKeepalive(t *testing.T) {
 				cluster: &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			}
 
-			cb.applyConnectionPool(tt.mesh, mc, tt.connectionPool)
+			cb.applyConnectionPool(tt.mesh, mc, tt.connectionPool, nil)
 
 			if !reflect.DeepEqual(tt.wantConnOpts, mc.cluster.UpstreamConnectionOptions) {
 				t.Errorf("unexpected tcp keepalive settings, want %v, got %v", tt.wantConnOpts,
@@ -2514,11 +2879,13 @@ func TestApplyTCPKeepalive(t *testing.T) {
 
 func TestApplyConnectionPool(t *testing.T) {
 	cases := []struct {
-		name                string
-		cluster             *cluster.Cluster
-		httpProtocolOptions *http.HttpProtocolOptions
-		connectionPool      *networking.ConnectionPoolSettings
-		expectedHTTPPOpt    *http.HttpProtocolOptions
+		name                    string
+		cluster                 *cluster.Cluster
+		httpProtocolOptions     *http.HttpProtocolOptions
+		connectionPool          *networking.ConnectionPoolSettings
+		retryBudget             *networking.TrafficPolicy_RetryBudget
+		expectedHTTPPOpt        *http.HttpProtocolOptions
+		expectedCircuitBreakers *cluster.CircuitBreakers
 	}{
 		{
 			name:    "only update IdleTimeout",
@@ -2546,6 +2913,9 @@ func TestApplyConnectionPool(t *testing.T) {
 					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 10},
 				},
 			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{getDefaultCircuitBreakerThresholds()},
+			},
 		},
 		{
 			name:    "set TCP idle timeout",
@@ -2572,6 +2942,9 @@ func TestApplyConnectionPool(t *testing.T) {
 					},
 					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 10},
 				},
+			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{getDefaultCircuitBreakerThresholds()},
 			},
 		},
 		{
@@ -2602,6 +2975,9 @@ func TestApplyConnectionPool(t *testing.T) {
 					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 10},
 				},
 			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{getDefaultCircuitBreakerThresholds()},
+			},
 		},
 		{
 			name:    "only update MaxRequestsPerConnection ",
@@ -2626,6 +3002,9 @@ func TestApplyConnectionPool(t *testing.T) {
 					},
 					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 22},
 				},
+			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{getDefaultCircuitBreakerThresholds()},
 			},
 		},
 		{
@@ -2663,6 +3042,94 @@ func TestApplyConnectionPool(t *testing.T) {
 					},
 				},
 			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{getDefaultCircuitBreakerThresholds()},
+			},
+		},
+		{
+			name:    "default retry budget",
+			cluster: &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
+			httpProtocolOptions: &http.HttpProtocolOptions{
+				CommonHttpProtocolOptions: &core.HttpProtocolOptions{
+					IdleTimeout: &durationpb.Duration{
+						Seconds: 10,
+					},
+					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 10},
+				},
+			},
+			connectionPool: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					MaxRequestsPerConnection: 22,
+				},
+			},
+			retryBudget: &networking.TrafficPolicy_RetryBudget{},
+			expectedHTTPPOpt: &http.HttpProtocolOptions{
+				CommonHttpProtocolOptions: &core.HttpProtocolOptions{
+					IdleTimeout: &durationpb.Duration{
+						Seconds: 10,
+					},
+					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 22},
+				},
+			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{
+					{
+						MaxRetries:         &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxConnections:     &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
+						TrackRemaining:     true,
+						RetryBudget: &cluster.CircuitBreakers_Thresholds_RetryBudget{
+							BudgetPercent:       &xdstype.Percent{Value: 0.2},
+							MinRetryConcurrency: &wrappers.UInt32Value{Value: 3},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:    "retry budget",
+			cluster: &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
+			httpProtocolOptions: &http.HttpProtocolOptions{
+				CommonHttpProtocolOptions: &core.HttpProtocolOptions{
+					IdleTimeout: &durationpb.Duration{
+						Seconds: 10,
+					},
+					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 10},
+				},
+			},
+			connectionPool: &networking.ConnectionPoolSettings{
+				Http: &networking.ConnectionPoolSettings_HTTPSettings{
+					MaxRequestsPerConnection: 22,
+				},
+			},
+			retryBudget: &networking.TrafficPolicy_RetryBudget{
+				Percent:             wrappers.Double(0.3),
+				MinRetryConcurrency: uint32(4),
+			},
+			expectedHTTPPOpt: &http.HttpProtocolOptions{
+				CommonHttpProtocolOptions: &core.HttpProtocolOptions{
+					IdleTimeout: &durationpb.Duration{
+						Seconds: 10,
+					},
+					MaxRequestsPerConnection: &wrappers.UInt32Value{Value: 22},
+				},
+			},
+			expectedCircuitBreakers: &cluster.CircuitBreakers{
+				Thresholds: []*cluster.CircuitBreakers_Thresholds{
+					{
+						MaxRetries:         &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxRequests:        &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxConnections:     &wrappers.UInt32Value{Value: math.MaxUint32},
+						MaxPendingRequests: &wrappers.UInt32Value{Value: math.MaxUint32},
+						TrackRemaining:     true,
+						RetryBudget: &cluster.CircuitBreakers_Thresholds_RetryBudget{
+							BudgetPercent:       &xdstype.Percent{Value: 0.3},
+							MinRetryConcurrency: &wrappers.UInt32Value{Value: 4},
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -2680,7 +3147,7 @@ func TestApplyConnectionPool(t *testing.T) {
 				mesh:    cb.req.Push.Mesh,
 				mutable: mc,
 			}
-			cb.applyConnectionPool(opts.mesh, opts.mutable, tt.connectionPool)
+			cb.applyConnectionPool(opts.mesh, opts.mutable, tt.connectionPool, tt.retryBudget)
 			// assert httpProtocolOptions
 			assert.Equal(t, opts.mutable.httpProtocolOptions.CommonHttpProtocolOptions.IdleTimeout,
 				tt.expectedHTTPPOpt.CommonHttpProtocolOptions.IdleTimeout)
@@ -2688,6 +3155,7 @@ func TestApplyConnectionPool(t *testing.T) {
 				tt.expectedHTTPPOpt.CommonHttpProtocolOptions.MaxRequestsPerConnection)
 			assert.Equal(t, opts.mutable.httpProtocolOptions.CommonHttpProtocolOptions.MaxConnectionDuration,
 				tt.expectedHTTPPOpt.CommonHttpProtocolOptions.MaxConnectionDuration)
+			assert.Equal(t, opts.mutable.cluster.CircuitBreakers, tt.expectedCircuitBreakers)
 		})
 	}
 }
@@ -2757,17 +3225,15 @@ func TestInsecureSkipVerify(t *testing.T) {
 	}
 
 	cases := []struct {
-		name                     string
-		cluster                  *cluster.Cluster
-		clusterMode              ClusterMode
-		service                  *model.Service
-		port                     *model.Port
-		proxyView                model.ProxyView
-		destRule                 *networking.DestinationRule
-		serviceAcct              []string // SE SAN values
-		enableAutoSni            bool
-		enableVerifyCertAtClient bool
-		expectTLSContext         *tls.UpstreamTlsContext
+		name             string
+		cluster          *cluster.Cluster
+		clusterMode      ClusterMode
+		service          *model.Service
+		port             *model.Port
+		proxyView        model.ProxyView
+		destRule         *networking.DestinationRule
+		serviceAcct      []string // SE SAN values
+		expectTLSContext *tls.UpstreamTlsContext
 	}{
 		{
 			name:        "With tls mode simple, InsecureSkipVerify is not specified and ca cert is supplied",
@@ -2787,8 +3253,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: false,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -2844,8 +3308,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: false,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -2883,39 +3345,7 @@ func TestInsecureSkipVerify(t *testing.T) {
 			},
 		},
 		{
-			name:        "With tls mode simple, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true",
-			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
-			clusterMode: DefaultClusterMode,
-			service:     service,
-			port:        servicePort[0],
-			proxyView:   model.ProxyViewAll,
-			destRule: &networking.DestinationRule{
-				Host: "foo.default.svc.cluster.local",
-				TrafficPolicy: &networking.TrafficPolicy{
-					Tls: &networking.ClientTLSSettings{
-						Mode:               networking.ClientTLSSettings_SIMPLE,
-						Sni:                "foo.default.svc.cluster.local",
-						SubjectAltNames:    []string{"foo.default.svc.cluster.local"},
-						InsecureSkipVerify: &wrappers.BoolValue{Value: true},
-					},
-				},
-			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: true,
-			expectTLSContext: &tls.UpstreamTlsContext{
-				CommonTlsContext: &tls.CommonTlsContext{
-					TlsParams: &tls.TlsParameters{
-						// if not specified, envoy use TLSv1_2 as default for client.
-						TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
-						TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
-					},
-					ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
-				},
-				Sni: "foo.default.svc.cluster.local",
-			},
-		},
-		{
-			name:        "With tls mode simple, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true and AUTO_SNI is true",
+			name:        "With tls mode simple, InsecureSkipVerify is set true",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -2931,8 +3361,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            true,
-			enableVerifyCertAtClient: true,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -2945,7 +3373,7 @@ func TestInsecureSkipVerify(t *testing.T) {
 			},
 		},
 		{
-			name:        "With tls mode simple and CredentialName, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true",
+			name:        "With tls mode simple and CredentialName, InsecureSkipVerify is set true and env",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -2964,8 +3392,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 				},
 				WorkloadSelector: &v1beta1.WorkloadSelector{},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: true,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -2997,8 +3423,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: false,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -3078,8 +3502,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: false,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -3139,63 +3561,7 @@ func TestInsecureSkipVerify(t *testing.T) {
 			},
 		},
 		{
-			name:        "With tls mode mutual, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true",
-			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
-			clusterMode: DefaultClusterMode,
-			service:     service,
-			port:        servicePort[0],
-			proxyView:   model.ProxyViewAll,
-			destRule: &networking.DestinationRule{
-				Host: "foo.default.svc.cluster.local",
-				TrafficPolicy: &networking.TrafficPolicy{
-					Tls: &networking.ClientTLSSettings{
-						Mode:               networking.ClientTLSSettings_MUTUAL,
-						ClientCertificate:  "cert",
-						PrivateKey:         "key",
-						Sni:                "foo.default.svc.cluster.local",
-						SubjectAltNames:    []string{"foo.default.svc.cluster.local"},
-						InsecureSkipVerify: &wrappers.BoolValue{Value: true},
-					},
-				},
-			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: true,
-			expectTLSContext: &tls.UpstreamTlsContext{
-				CommonTlsContext: &tls.CommonTlsContext{
-					TlsParams: &tls.TlsParameters{
-						// if not specified, envoy use TLSv1_2 as default for client.
-						TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
-						TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_2,
-					},
-					TlsCertificateSdsSecretConfigs: []*tls.SdsSecretConfig{
-						{
-							Name: "file-cert:cert~key",
-							SdsConfig: &core.ConfigSource{
-								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-									ApiConfigSource: &core.ApiConfigSource{
-										ApiType:                   core.ApiConfigSource_GRPC,
-										SetNodeOnFirstMessageOnly: true,
-										TransportApiVersion:       core.ApiVersion_V3,
-										GrpcServices: []*core.GrpcService{
-											{
-												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: "sds-grpc"},
-												},
-											},
-										},
-									},
-								},
-								ResourceApiVersion: core.ApiVersion_V3,
-							},
-						},
-					},
-					ValidationContextType: &tls.CommonTlsContext_ValidationContext{},
-				},
-				Sni: "foo.default.svc.cluster.local",
-			},
-		},
-		{
-			name:        "With tls mode mutual, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true and AUTO_SNI is true",
+			name:        "With tls mode mutual, InsecureSkipVerify is set true",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -3213,8 +3579,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            true,
-			enableVerifyCertAtClient: true,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -3249,7 +3613,7 @@ func TestInsecureSkipVerify(t *testing.T) {
 			},
 		},
 		{
-			name:        "With tls mode mutual and CredentialName, InsecureSkipVerify is set true and env VERIFY_CERTIFICATE_AT_CLIENT is true",
+			name:        "With tls mode mutual and CredentialName, InsecureSkipVerify is set true",
 			cluster:     &cluster.Cluster{Name: "foo", ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS}},
 			clusterMode: DefaultClusterMode,
 			service:     service,
@@ -3268,8 +3632,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 				},
 				WorkloadSelector: &v1beta1.WorkloadSelector{},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: true,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -3310,8 +3672,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 					},
 				},
 			},
-			enableAutoSni:            false,
-			enableVerifyCertAtClient: true,
 			expectTLSContext: &tls.UpstreamTlsContext{
 				CommonTlsContext: &tls.CommonTlsContext{
 					TlsParams: &tls.TlsParameters{
@@ -3377,9 +3737,6 @@ func TestInsecureSkipVerify(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			test.SetForTest(t, &features.EnableAutoSni, tc.enableAutoSni)
-			test.SetForTest(t, &features.VerifyCertAtClient, tc.enableVerifyCertAtClient)
-
 			targets := []model.ServiceTarget{
 				{
 					Service: tc.service,
@@ -3424,16 +3781,16 @@ func TestInsecureSkipVerify(t *testing.T) {
 				t.Errorf("got diff: `%v", diff)
 			}
 
-			if tc.enableAutoSni {
-				if tc.destRule.GetTrafficPolicy().GetTls().Sni == "" {
-					assert.Equal(t, ec.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSni, true)
-				}
+			if tc.destRule.GetTrafficPolicy().GetTls().Sni == "" {
+				assert.Equal(t, ec.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSni, true)
+			}
 
-				if tc.destRule.GetTrafficPolicy().GetTls().GetInsecureSkipVerify().GetValue() {
+			if tc.destRule.GetTrafficPolicy().GetTls().GetInsecureSkipVerify().GetValue() {
+				if ec.httpProtocolOptions != nil {
 					assert.Equal(t, ec.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSanValidation, false)
-				} else if tc.enableVerifyCertAtClient && len(tc.destRule.GetTrafficPolicy().GetTls().SubjectAltNames) == 0 {
-					assert.Equal(t, ec.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSanValidation, true)
 				}
+			} else if tc.destRule.GetTrafficPolicy().GetTls().SubjectAltNames != nil && len(tc.destRule.GetTrafficPolicy().GetTls().SubjectAltNames) == 0 {
+				assert.Equal(t, ec.httpProtocolOptions.UpstreamHttpProtocolOptions.AutoSanValidation, true)
 			}
 		})
 	}

@@ -29,10 +29,10 @@ import (
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/cluster"
 	kubecluster "istio.io/istio/pkg/test/framework/components/cluster/kube"
+	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/helm"
 	kubetest "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
-	"istio.io/istio/pkg/test/shell"
 	"istio.io/istio/pkg/test/util/retry"
 	helmtest "istio.io/istio/tests/integration/helm"
 	"istio.io/istio/tests/util/sanitycheck"
@@ -48,18 +48,9 @@ const (
 // upgradeCharts upgrades Istio using Helm charts with the provided
 // override values file to the latest charts in $ISTIO_SRC/manifests
 func upgradeCharts(ctx framework.TestContext, h *helm.Helm, overrideValuesFile string, nsConfig helmtest.NamespaceConfig, isAmbient bool) {
-	execCmd := fmt.Sprintf(
-		"kubectl apply -n %v -f %v",
-		helmtest.IstioNamespace,
-		filepath.Join(helmtest.ManifestsChartPath, helmtest.BaseChart, helmtest.CRDsFolder))
-	_, err := shell.Execute(false, execCmd)
-	if err != nil {
-		ctx.Fatalf("couldn't run kubectl apply on crds folder: %v", err)
-	}
-
 	// Upgrade base chart
-	err = h.UpgradeChart(helmtest.BaseReleaseName, filepath.Join(helmtest.ManifestsChartPath, helmtest.BaseChart),
-		nsConfig.Get(helmtest.BaseReleaseName), overrideValuesFile, helmtest.Timeout, "--skip-crds")
+	err := h.UpgradeChart(helmtest.BaseReleaseName, filepath.Join(helmtest.ManifestsChartPath, helmtest.BaseChart),
+		nsConfig.Get(helmtest.BaseReleaseName), overrideValuesFile, helmtest.Timeout)
 	if err != nil {
 		ctx.Fatalf("failed to upgrade istio %s chart", helmtest.BaseReleaseName)
 	}
@@ -149,29 +140,106 @@ func performInPlaceUpgradeFunc(previousVersion string, isAmbient bool) func(fram
 			// all versions
 			helmtest.DeleteIstio(t, h, cs, nsConfig, isAmbient)
 		})
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			if t.Settings().CIMode {
+				for _, ns := range nsConfig.AllNamespaces() {
+					namespace.Dump(t, ns)
+				}
+				namespace.Dump(t, helmtest.IstioNamespace)
+			}
+		})
 		s := t.Settings()
-		prevVariant := s.Image.Variant
-		// Istio 1.21 ambient did not support distroless, always use debug.
-		// TODO(https://github.com/istio/istio/issues/50387) remove this, always use s.Image.Variant
-		if isAmbient {
-			prevVariant = "debug"
-		}
-		overrideValuesFile := helmtest.GetValuesOverrides(t, gcrHub, "", prevVariant, "", isAmbient)
+		overrideValuesFile := helmtest.GetValuesOverrides(t, gcrHub, "", s.Image.Variant, "", isAmbient)
 		helmtest.InstallIstio(t, cs, h, overrideValuesFile, previousVersion, true, isAmbient, nsConfig)
 		helmtest.VerifyInstallation(t, cs, nsConfig, true, isAmbient, "")
 
-		_, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, t, "")
+		_, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, "")
 		sanitycheck.RunTrafficTestClientServer(t, oldClient, oldServer)
 
 		overrideValuesFile = helmtest.GetValuesOverrides(t, s.Image.Hub, s.Image.Tag, s.Image.Variant, "", isAmbient)
+
+		helmtest.AdoptPre123CRDResourcesIfNeeded()
+
 		upgradeCharts(t, h, overrideValuesFile, nsConfig, isAmbient)
 		helmtest.VerifyInstallation(t, cs, nsConfig, true, isAmbient, "")
 
-		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, t, "")
+		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, "")
 		sanitycheck.RunTrafficTestClientServer(t, newClient, newServer)
 
 		// now check that we are compatible with N-1 proxy with N proxy
 		sanitycheck.RunTrafficTestClientServer(t, oldClient, newServer)
+	}
+}
+
+// upgradeAllButZtunnel returns the provided function necessary to run inside an integration test
+// for upgrading everythying but the ztunnel
+func upgradeAllButZtunnel(previousVersion string) func(framework.TestContext) {
+	return func(t framework.TestContext) {
+		isAmbient := true
+		cs := t.Clusters().Default().(*kubecluster.Cluster)
+		h := helm.New(cs.Filename())
+		nsConfig := helmtest.DefaultNamespaceConfig
+		t.CleanupConditionally(func() {
+			// only need to do call this once as helm doesn't need to remove
+			// all versions
+			helmtest.DeleteIstio(t, h, cs, nsConfig, isAmbient)
+		})
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			if t.Settings().CIMode {
+				for _, ns := range nsConfig.AllNamespaces() {
+					namespace.Dump(t, ns)
+				}
+				namespace.Dump(t, helmtest.IstioNamespace)
+			}
+		})
+		s := t.Settings()
+		prevVariant := s.Image.Variant
+		overrideValuesFile := helmtest.GetValuesOverrides(t, gcrHub, "", prevVariant, "", isAmbient)
+		// todo tag version is not helm version
+		helmtest.InstallIstio(t, cs, h, overrideValuesFile, previousVersion, true, isAmbient, nsConfig)
+		helmtest.VerifyInstallation(t, cs, nsConfig, true, isAmbient, "")
+
+		_, oldClient, oldServer := sanitycheck.SetupTrafficTestAmbient(t, "")
+		sanitycheck.RunTrafficTestClientServer(t, oldClient, oldServer)
+
+		overrideValuesFile = helmtest.GetValuesOverrides(t, s.Image.Hub, s.Image.Tag, s.Image.Variant, "", isAmbient)
+
+		helmtest.AdoptPre123CRDResourcesIfNeeded()
+
+		// Upgrade everything but Ztunnel and CNI
+		upgradeCharts(t, h, overrideValuesFile, nsConfig, false)
+
+		// Upgrade CNI
+		err := h.UpgradeChart(helmtest.CniReleaseName, filepath.Join(helmtest.ManifestsChartPath, helmtest.CniChartsDir),
+			nsConfig.Get(helmtest.CniReleaseName), overrideValuesFile, helmtest.Timeout)
+		if err != nil {
+			t.Fatalf("failed to upgrade istio %s chart", helmtest.CniReleaseName)
+		}
+		helmtest.VerifyInstallation(t, cs, nsConfig, true, isAmbient, "")
+
+		newNS, newClient, newServer := sanitycheck.SetupTrafficTestAmbient(t, "")
+		sanitycheck.RunTrafficTestClientServer(t, newClient, newServer)
+
+		// now check that we are compatible with N-1 proxy with N proxy
+		sanitycheck.RunTrafficTestClientServer(t, oldClient, newServer)
+
+		// write policy to block sanity Check
+		sanitycheck.BlockTestWithPolicy(t, newClient, newServer)
+
+		// verify sanity check fails
+		sanitycheck.RunTrafficTestClientServerExpectFail(t, newClient, newServer)
+
+		// label pods to remove from mesh
+		newNS.RemoveLabel(label.IoIstioDataplaneMode.Name)
+
+		// verify sanity check passes
+		sanitycheck.RunTrafficTestClientServer(t, newClient, newServer)
 	}
 }
 
@@ -191,16 +259,30 @@ func performCanaryUpgradeFunc(nsConfig helmtest.NamespaceConfig, previousVersion
 				t.Fatalf("could not delete istio: %v", err)
 			}
 		})
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			if t.Settings().CIMode {
+				for _, ns := range nsConfig.AllNamespaces() {
+					namespace.Dump(t, ns)
+				}
+				namespace.Dump(t, helmtest.IstioNamespace)
+			}
+		})
 
 		s := t.Settings()
 		overrideValuesFile := helmtest.GetValuesOverrides(t, gcrHub, "", s.Image.Variant, "", false)
 		helmtest.InstallIstio(t, cs, h, overrideValuesFile, previousVersion, false, false, helmtest.DefaultNamespaceConfig)
 		helmtest.VerifyInstallation(t, cs, helmtest.DefaultNamespaceConfig, false, false, "")
 
-		_, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, t, "")
+		_, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, "")
 		sanitycheck.RunTrafficTestClientServer(t, oldClient, oldServer)
 
 		overrideValuesFile = helmtest.GetValuesOverrides(t, s.Image.Hub, s.Image.Tag, s.Image.Variant, canaryTag, false)
+
+		helmtest.AdoptPre123CRDResourcesIfNeeded()
+
 		helmtest.InstallIstioWithRevision(t, cs, h, "", canaryTag, overrideValuesFile, true, false)
 		helmtest.VerifyInstallation(t, cs, helmtest.DefaultNamespaceConfig, false, false, "")
 
@@ -210,7 +292,7 @@ func performCanaryUpgradeFunc(nsConfig helmtest.NamespaceConfig, previousVersion
 			"istio-sidecar-injector-canary",
 		})
 
-		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, t, canaryTag)
+		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, canaryTag)
 		sanitycheck.RunTrafficTestClientServer(t, newClient, newServer)
 
 		// now check that we are compatible with N-1 proxy with N proxy
@@ -239,6 +321,14 @@ func performRevisionTagsUpgradeFunc(previousVersion string) func(framework.TestC
 				t.Fatalf("could not cleanup istio: %v", err)
 			}
 		})
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
+			if t.Settings().CIMode {
+				namespace.Dump(t, helmtest.IstioNamespace)
+			}
+		})
 		s := t.Settings()
 		// install MAJOR.MINOR.PATCH charts with revision set to "MAJOR-MINOR-PATCH" name. For example,
 		// helm install istio-base istio/base --version 1.15.0 --namespace istio-system -f values.yaml
@@ -256,13 +346,16 @@ func performRevisionTagsUpgradeFunc(previousVersion string) func(framework.TestC
 		})
 
 		// setup istio.io/rev=1-15-0 for the default-1 namespace
-		oldNs, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, t, previousRevision)
+		oldNs, oldClient, oldServer := sanitycheck.SetupTrafficTest(t, previousRevision)
 		sanitycheck.RunTrafficTestClientServer(t, oldClient, oldServer)
 
 		// install the charts from this branch with revision set to "latest"
 		// helm upgrade istio-base ../manifests/charts/base --namespace istio-system -f values.yaml
 		// helm install istiod-latest ../manifests/charts/istio-control/istio-discovery -f values.yaml
 		overrideValuesFile = helmtest.GetValuesOverrides(t, s.Image.Hub, s.Image.Tag, s.Image.Variant, latestRevisionTag, false)
+
+		helmtest.AdoptPre123CRDResourcesIfNeeded()
+
 		helmtest.InstallIstioWithRevision(t, cs, h, "", latestRevisionTag, overrideValuesFile, true, false)
 		helmtest.VerifyInstallation(t, cs, helmtest.DefaultNamespaceConfig, false, false, "")
 
@@ -277,7 +370,7 @@ func performRevisionTagsUpgradeFunc(previousVersion string) func(framework.TestC
 		})
 
 		// setup istio.io/rev=latest for the default-2 namespace
-		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, t, latestRevisionTag)
+		_, newClient, newServer := sanitycheck.SetupTrafficTest(t, latestRevisionTag)
 		sanitycheck.RunTrafficTestClientServer(t, newClient, newServer)
 
 		// now check that we are compatible with N-1 proxy with N proxy between a client
