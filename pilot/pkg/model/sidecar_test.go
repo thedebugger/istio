@@ -3730,6 +3730,11 @@ func TestFilterServicesByVirtualService(t *testing.T) {
 			// Create sidecar scope
 			scope := DefaultSidecarScopeForNamespace(ps, "default")
 
+			// Initialize the scope if lazy evaluation is enabled
+			if features.EnableLazySidecarEvaluation {
+				scope.initFunc()
+			}
+
 			// Verify services
 			actualServices := scope.Services()
 			actualServiceNames := make([]string, len(actualServices))

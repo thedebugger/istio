@@ -321,9 +321,11 @@ func DefaultSidecarScopeForNamespace(ps *PushContext, configNamespace string) *S
 			out.AddConfigDependencies(delegate)
 		}
 		for _, vs := range defaultEgressListener.virtualServices {
-			for _, cfg := range VirtualServiceDependencies(vs) {
-				out.AddConfigDependencies(cfg.HashCode())
-			}
+			out.AddConfigDependencies(ConfigKey{
+				Kind:      kind.VirtualService,
+				Namespace: vs.Namespace,
+				Name:      vs.Name,
+			}.HashCode())
 		}
 
 		// Now that we have all the services that sidecars using this scope (in
