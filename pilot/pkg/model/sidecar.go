@@ -290,7 +290,16 @@ func DefaultSidecarScopeForNamespace(ps *PushContext, configNamespace string) *S
 			Hosts: []string{"*/*"},
 		},
 	}
-	services := ps.servicesExportedToNamespace(configNamespace)
+	
+	var services []*Service
+	if features.FilterServicesByVirtualService {
+		// When feature flag is enabled, only include services referenced in virtual services
+		services = ps.getServicesReferencedInVirtualServices(configNamespace)
+	} else {
+		// Default behavior: include all services exported to this namespace
+		services = ps.servicesExportedToNamespace(configNamespace)
+	}
+	
 	defaultEgressListener.virtualServices = ps.VirtualServicesForGateway(configNamespace, constants.IstioMeshGateway)
 	defaultEgressListener.mostSpecificWildcardVsIndex = computeWildcardHostVirtualServiceIndex(
 		defaultEgressListener.virtualServices, services)
